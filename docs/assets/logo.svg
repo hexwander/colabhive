@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" fill="none">
+  <defs>
+    <linearGradient id="bgSquircle" x1="16" y1="8" x2="112" y2="122" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#232220"/>
+      <stop offset="52%" stop-color="#171615"/>
+      <stop offset="100%" stop-color="#0F0F0E"/>
+    </linearGradient>
+    <linearGradient id="rimStroke" x1="20" y1="6" x2="108" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="50%" stop-color="#FFFFFF" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#10B981" stop-opacity="0.28"/>
+    </linearGradient>
+    <radialGradient id="ambientAmber" cx="64" cy="36" r="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F59E0B" stop-opacity="0.20"/>
+      <stop offset="100%" stop-color="#F59E0B" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="ambientEmerald" cx="84" cy="86" r="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#10B981" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#10B981" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Top Cell: Golden Colab Amber -->
+    <linearGradient id="cellAmber" x1="44" y1="22" x2="84" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FDE047"/>
+      <stop offset="38%" stop-color="#FBBF24"/>
+      <stop offset="100%" stop-color="#D97706"/>
+    </linearGradient>
+    <!-- Bottom-Left Cell: Crisp Warm Alabaster -->
+    <linearGradient id="cellAlabaster" x1="24" y1="58" x2="62" y2="102" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="55%" stop-color="#FAF9F5"/>
+      <stop offset="100%" stop-color="#DFDDD4"/>
+    </linearGradient>
+    <!-- Bottom-Right Cell: Live Compute Emerald -->
+    <linearGradient id="cellEmerald" x1="66" y1="58" x2="104" y2="102" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6EE7B7"/>
+      <stop offset="42%" stop-color="#34D399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Apple Superellipse Squircle Container -->
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#bgSquircle)"/>
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#ambientAmber)"/>
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#ambientEmerald)"/>
+  <rect x="6.75" y="6.75" width="114.5" height="114.5" rx="27.25" stroke="url(#rimStroke)" stroke-width="1.5"/>
+
+  <!-- Subtle Tensor Link Connectors Behind Cells -->
+  <path d="M64 44 L43 80 L85 80 Z" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="2.5" stroke-linejoin="round"/>
+
+  <!-- Top Honeycomb Prism Cell (Golden Amber: R=21 around (64, 42)) -->
+  <g>
+    <polygon points="64,20 83,31 83,53 64,64 45,53 45,31" fill="url(#cellAmber)"/>
+    <!-- Isometric Subtle Top Highlight Facet -->
+    <polygon points="64,20 83,31 64,42 45,31" fill="#FFFFFF" fill-opacity="0.22"/>
+    <!-- Isometric Right Shadow Facet -->
+    <polygon points="83,31 83,53 64,64 64,42" fill="#000000" fill-opacity="0.12"/>
+    <polygon points="64,20 83,31 83,53 64,64 45,53 45,31" stroke="#FEF3C7" stroke-opacity="0.45" stroke-width="1" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Bottom-Left Honeycomb Prism Cell (Crisp Alabaster: R=21 around (42.5, 79)) -->
+  <g>
+    <polygon points="42.5,57 61.5,68 61.5,90 42.5,101 23.5,90 23.5,68" fill="url(#cellAlabaster)"/>
+    <polygon points="42.5,57 61.5,68 42.5,79 23.5,68" fill="#FFFFFF" fill-opacity="0.45"/>
+    <polygon points="61.5,68 61.5,90 42.5,101 42.5,79" fill="#18181B" fill-opacity="0.09"/>
+    <polygon points="42.5,57 61.5,68 61.5,90 42.5,101 23.5,90 23.5,68" stroke="#FFFFFF" stroke-opacity="0.7" stroke-width="1" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Bottom-Right Honeycomb Prism Cell (Live Compute Emerald: R=21 around (85.5, 79)) -->
+  <g>
+    <polygon points="85.5,57 104.5,68 104.5,90 85.5,101 66.5,90 66.5,68" fill="url(#cellEmerald)"/>
+    <polygon points="85.5,57 104.5,68 85.5,79 66.5,68" fill="#FFFFFF" fill-opacity="0.24"/>
+    <polygon points="104.5,68 104.5,90 85.5,101 85.5,79" fill="#022C22" fill-opacity="0.18"/>
+    <polygon points="85.5,57 104.5,68 104.5,90 85.5,101 66.5,90 66.5,68" stroke="#A7F3D0" stroke-opacity="0.5" stroke-width="1" stroke-linejoin="round"/>
+  </g>
+</svg>

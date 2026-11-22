@@ -1,0 +1,117 @@
+# ==============================================================================
+# ColabHive — Production Caddy v2 Reverse Proxy (`deploy/Caddyfile`)
+# ==============================================================================
+# Features:
+#   • Automatic HTTPS (Let's Encrypt / ZeroSSL) + HTTP/2 + HTTP/3 (QUIC)
+#   • Zero-buffering Streamable HTTP & Legacy SSE MCP (`/mcp*`, `flush_interval -1`)
+#   • 1800s (30m) read/write timeouts for cold-start GPU provisioning & sweeps
+#   • Native WebSocket upgrade & long-lived streaming on `/ws/events`
+#   • Automatic `X-Forwarded-Proto` / `X-Forwarded-For` / `X-Forwarded-Host`
+#     headers (trusted when ColabHive runs with `--mode cloud --trust-proxy`)
+#
+# Environment Variables:
+#   • COLABHIVE_DOMAIN   : Public domain (e.g. `hive.lab.example.com`, default `localhost`)
+#   • COLABHIVE_UPSTREAM : Upstream control plane (`colabhive:7860` in Docker,
+#                          or `127.0.0.1:7860` on bare-metal Linux)
+# ==============================================================================
+
+{$COLABHIVE_DOMAIN:localhost} {
+	# Allow uploading datasets, checkpoints, wheels & `.chvault` bundles up to 512 MB
+	request_body {
+		max_size 512MB
+	}
+
+	# Baseline security headers (preserves SPA, Matplotlib blobs & Contributor Portal)
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# Compress static SPA assets & REST JSON, but never buffer MCP SSE or WebSockets
+	@compressible {
+		not path /mcp /mcp/* /ws/*
+	}
+	encode @compressible zstd gzip
+
+	# --------------------------------------------------------------------------
+	# 1. AI Agent MCP Endpoint (`/mcp`, `/mcp/sse`, `/mcp/messages`)
+	#    Streamable HTTP (2025-03-26 / 2025-06-18) + Legacy SSE (2024-11-05)
+	#    CRITICAL: `flush_interval -1` disables response buffering immediately,
+	#    and `1800s` timeouts prevent premature 502/504 drops during GPU assign
+	#    or multi-minute code execution.
+	# --------------------------------------------------------------------------
+	@mcp path /mcp /mcp/*
+	handle @mcp {
+		reverse_proxy {$COLABHIVE_UPSTREAM:colabhive:7860} {
+			flush_interval -1
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+			transport http {
+				dial_timeout 30s
+				response_header_timeout 1800s
+				read_timeout 1800s
+				write_timeout 1800s
+				keepalive 90s
+			}
+		}
+	}
+
+	# --------------------------------------------------------------------------
+	# 2. Real-Time Telemetry & Live Workbench Terminal WebSocket (`/ws/events`)
+	# --------------------------------------------------------------------------
+	@ws path /ws/events /ws/*
+	handle @ws {
+		reverse_proxy {$COLABHIVE_UPSTREAM:colabhive:7860} {
+			flush_interval -1
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+			transport http {
+				dial_timeout 30s
+				read_timeout 3600s
+				write_timeout 3600s
+			}
+		}
+	}
+
+	# --------------------------------------------------------------------------
+	# 3. Control-Plane REST API, Synchronous GPU Exec & Sharded Experiments
+	#    Extended `1800s` timeout accommodates cross-account GPU waterfall
+	#    provisioning (`H100 -> G4 -> A100 -> L4 -> T4`) & `colabhive run`.
+	# --------------------------------------------------------------------------
+	@long_api path /api/v1/sessions* /api/v1/exec* /api/v1/experiments* /api/v1/pool/*
+	handle @long_api {
+		reverse_proxy {$COLABHIVE_UPSTREAM:colabhive:7860} {
+			flush_interval -1
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+			transport http {
+				dial_timeout 30s
+				response_header_timeout 1800s
+				read_timeout 1800s
+				write_timeout 1800s
+			}
+		}
+	}
+
+	# --------------------------------------------------------------------------
+	# 4. Web Observatory SPA, Public Contributor Portal (`/contribute/:code`,
+	#    `/c/:code`, `/api/public/contribute/*`) & Health Checks
+	# --------------------------------------------------------------------------
+	handle {
+		reverse_proxy {$COLABHIVE_UPSTREAM:colabhive:7860} {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+			transport http {
+				dial_timeout 15s
+				response_header_timeout 120s
+				read_timeout 120s
+				write_timeout 120s
+			}
+		}
+	}
+}

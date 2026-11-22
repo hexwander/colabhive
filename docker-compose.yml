@@ -1,0 +1,77 @@
+# ==============================================================================
+# ColabHive — 1-Command Production Stack (`docker compose up -d`)
+# ==============================================================================
+# Serves:
+#   • Precision Compute Observatory Web UI : http://localhost:7860
+#   • Contributor Guest Auth Portal        : http://localhost:7860/contribute/<invite_code>
+#   • Agent MCP Streamable HTTP Endpoint   : http://localhost:7860/mcp
+#   • Control-Plane REST & WebSocket API   : http://localhost:7860/api/v1
+# ==============================================================================
+
+services:
+  colabhive:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${COLABHIVE_VERSION:-1.0.0}
+    image: ghcr.io/colabhive/colabhive:${COLABHIVE_TAG:-latest}
+    container_name: colabhive
+    restart: unless-stopped
+    command:
+      - "serve"
+      - "--mode"
+      - "${COLABHIVE_MODE:-local}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "7860"
+      - "--data-dir"
+      - "/data"
+      - "--web-dir"
+      - "/app/web/dist"
+      - "--auto-admin-token"
+    ports:
+      - "${COLABHIVE_BIND_ADDR:-127.0.0.1}:${COLABHIVE_BIND_PORT:-7860}:7860"
+    volumes:
+      - colabhive_data:/data
+    environment:
+      # Network & Storage
+      COLABHIVE_MODE: "${COLABHIVE_MODE:-local}"
+      COLABHIVE_TRUST_PROXY: "${COLABHIVE_TRUST_PROXY:-false}"
+      COLABHIVE_AUTO_ADMIN_TOKEN: "${COLABHIVE_AUTO_ADMIN_TOKEN:-true}"
+      COLABHIVE_HOST: "0.0.0.0"
+      COLABHIVE_PORT: "7860"
+      COLABHIVE_DATA_DIR: "/data"
+      COLABHIVE_DB_PATH: "/data/colabhive.db"
+      COLABHIVE_WEB_DIR: "/app/web/dist"
+      TZ: "${TZ:-UTC}"
+
+      # Security & Vault Encryption (AES-256-GCM at-rest encryption for OAuth tokens)
+      # Generate with: openssl rand -hex 32
+      # When COLABHIVE_ADMIN_TOKEN is unset, --auto-admin-token mints a random token logged at boot.
+      COLABHIVE_MASTER_KEY: "${COLABHIVE_MASTER_KEY:-}"
+      COLABHIVE_ADMIN_TOKEN: "${COLABHIVE_ADMIN_TOKEN:-}"
+
+      # Default Pool Router & Watchdog Policy
+      COLABHIVE_DEFAULT_STRATEGY: "${COLABHIVE_DEFAULT_STRATEGY:-waste-zero}"
+      COLABHIVE_KEEPALIVE_INTERVAL_SEC: "${COLABHIVE_KEEPALIVE_INTERVAL_SEC:-8}"
+      COLABHIVE_ANTI_ZOMBIE_WATCHDOG: "${COLABHIVE_ANTI_ZOMBIE_WATCHDOG:-true}"
+
+      # Optional: Public Base URL for Shareable Contributor Links (/contribute/:code)
+      COLABHIVE_PUBLIC_URL: "${COLABHIVE_PUBLIC_URL:-http://localhost:7860}"
+
+      # Optional: Custom Google OAuth Web Client for Mode B 1-Click HTTPS Callback
+      # (Leave blank to use default zero-domain Mode A copy-paste flow out-of-the-box)
+      COLABHIVE_OAUTH_CLIENT_ID: "${COLABHIVE_OAUTH_CLIENT_ID:-}"
+      COLABHIVE_OAUTH_CLIENT_SECRET: "${COLABHIVE_OAUTH_CLIENT_SECRET:-}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:7860/api/v1/health || wget -q --spider http://127.0.0.1:7860/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  colabhive_data:
+    name: colabhive_data

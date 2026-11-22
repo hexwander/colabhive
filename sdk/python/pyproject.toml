@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colabhive"
+version = "1.0.0"
+description = "Official Python SDK & Zero-Friction Contributor CLI for ColabHive — Multi-Account Google Colab GPU Pool, Sharded Runner & Agent Router"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "The ColabHive Authors" }
+]
+keywords = [
+  "google-colab",
+  "gpu-cluster",
+  "mcp",
+  "ai-agents",
+  "sharded-evaluation",
+  "colab-cli",
+  "compute-pool"
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: System :: Distributed Computing",
+  "Typing :: Typed"
+]
+dependencies = []
+
+[project.optional-dependencies]
+httpx = ["httpx>=0.27.0"]
+dev = ["httpx>=0.27.0"]
+
+[project.scripts]
+colabhive-sdk = "colabhive.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/colabhive/colabhive"
+Repository = "https://github.com/colabhive/colabhive"
+Issues = "https://github.com/colabhive/colabhive/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+colabhive = ["py.typed"]

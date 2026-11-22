@@ -1,0 +1,76 @@
+name: "🐛 Bug Report"
+description: "Report a reproducible bug in ColabHive Control Plane, Desktop Tray, Web Observatory, CLI, MCP, or Python SDK."
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue! **Never paste real Google OAuth tokens (`1//0...`, `ya29...`), `.master.key` secrets, or private proxy passwords** — use `[👁️ Privacy Mask]` when sharing screenshots.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      description: Which part of ColabHive is affected?
+      options:
+        - "Control Plane / Pool & Quota (`internal/pool`, `internal/server`)"
+        - "Colab Runtime / Jupyter ZMQ / Anti-Zombie (`internal/runtime`)"
+        - "MCP Router & 1-Click Agent Connect (`internal/mcp`, `internal/router`)"
+        - "Windows Native Desktop & System Tray (`colabhive-desktop.exe`)"
+        - "Web Observatory UI (`web/`)"
+        - "CLI (`colabhive` / `colab`) or Installers (`install.ps1` / `install.sh`)"
+        - "Contributor Portal (`/contribute/:code`)"
+        - "Python SDK (`sdk/python`)"
+        - "Docker / Cloud Deployment (`--mode cloud`)"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: ColabHive Version & Commit
+      description: Output of `colabhive --version` or release tag / Docker image digest.
+      placeholder: "v1.0.0 (amd64)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Operating System & Deployment Mode
+      options:
+        - "Windows 11 / 10 — Native Desktop (`colabhive-desktop.exe`)"
+        - "Windows + WSL2 (`--mode local`)"
+        - "macOS Apple Silicon / Intel (`--mode local`)"
+        - "Linux Workstation (`--mode local`)"
+        - "Docker / Remote Linux Server (`--mode cloud`)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal, step-by-step instructions to trigger the bug.
+      placeholder: |
+        1. Start ColabHive with `colabhive serve ...`
+        2. Run `colab run --gpu G4 ...`
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. Actual Behavior
+      description: What did you expect to happen, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized Logs / Error Output
+      description: Relevant daemon stderr, CLI output, or browser console errors (ensure all tokens/emails are redacted).
+      render: shell

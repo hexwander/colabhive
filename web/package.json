@@ -1,0 +1,34 @@
+{
+  "name": "colabhive-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "build:pages": "tsc -b && vite build --mode pages && node --input-type=module -e \"import fs from 'node:fs'; fs.copyFileSync('dist-pages/index.html','dist-pages/404.html'); fs.writeFileSync('dist-pages/.nojekyll','');\"",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview",
+    "preview:pages": "vite preview --outDir dist-pages"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.511.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.7",
+    "@types/react": "^19.1.4",
+    "@types/react-dom": "^19.1.4",
+    "@vitejs/plugin-react": "^4.4.1",
+    "tailwindcss": "^4.1.7",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
