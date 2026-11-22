@@ -1345,6 +1345,8 @@ func TestRuntimeAuditRegressionsLifecycleIsolationAndJupyterSafety(t *testing.T)
 		execRequestsSeen  atomic.Int32
 		uploadedContents  = make(map[string][]byte)
 		liveEndpoint      atomic.Value
+		firstAssignDone   = make(chan struct{})
+		firstAssignOnce   sync.Once
 	)
 	liveEndpoint.Store("gpu-g4-s-audit01")
 
@@ -1366,6 +1368,7 @@ func TestRuntimeAuditRegressionsLifecycleIsolationAndJupyterSafety(t *testing.T)
 			ep, srv.URL,
 		)
 		_, _ = w.Write([]byte(models.ColabXSSIPrefix + resp))
+		firstAssignOnce.Do(func() { close(firstAssignDone) })
 	})
 	mux.HandleFunc("/tun/m/assignments", func(w http.ResponseWriter, r *http.Request) {
 		ep, _ := liveEndpoint.Load().(string)
@@ -1502,7 +1505,7 @@ func TestRuntimeAuditRegressionsLifecycleIsolationAndJupyterSafety(t *testing.T)
 	rtr := router.NewService(st, poolSvc, hub)
 	eng := NewConcreteEngine(st, poolSvc, rtr, hub, Options{
 		TunnelBaseURL:          srv.URL,
-		PostAssignWarmup:       120 * time.Millisecond,
+		PostAssignWarmup:       350 * time.Millisecond,
 		ResourcePollInterval:   3600 * time.Second, // 1h delta for exact CU math in poll test
 		ArtifactsDir:           t.TempDir(),
 		DisableBackgroundLoops: true,
@@ -1528,18 +1531,25 @@ func TestRuntimeAuditRegressionsLifecycleIsolationAndJupyterSafety(t *testing.T)
 	seedAuditAcc("acc_a2", "a2@lab.dev")
 
 	// 1. Warmup cancellation MUST unassign committed endpoint via WithoutCancel AND SyncRemoteAssignments must skip inFlightEndpoints!
-	cancelCtx, cancelWarmup := context.WithTimeout(ctx, 45*time.Millisecond)
+	cancelCtx, cancelWarmup := context.WithCancel(ctx)
 	var syncAdoptedDuringInFlight int
 	var syncWg sync.WaitGroup
 	syncWg.Add(1)
 	go func() {
 		defer syncWg.Done()
-		time.Sleep(15 * time.Millisecond)
+		select {
+		case <-firstAssignDone:
+		case <-time.After(10 * time.Second):
+			cancelWarmup()
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
 		if syncRes, sErr := eng.SyncRemoteAssignments(ctx); sErr == nil && syncRes != nil {
 			mu.Lock()
 			syncAdoptedDuringInFlight = syncRes.AdoptedCount
 			mu.Unlock()
 		}
+		cancelWarmup()
 	}()
 	_, warmErr := eng.CreateSession(cancelCtx, models.SessionAllocRequest{Accelerator: models.AcceleratorG4})
 	cancelWarmup()
