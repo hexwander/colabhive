@@ -299,10 +299,17 @@ jobs:
           mkdir -p "${APP_STAGE}/Contents/MacOS" "${APP_STAGE}/Contents/Resources/web"
 
           # 1. Native Cocoa + WKWebView + Menu Bar NSPopover binary (CGO_ENABLED=1)
-          CGO_ENABLED=1 GOOS=darwin GOARCH="${TARGET_ARCH}" \
-            go build -trimpath -ldflags="${LDFLAGS}" \
-            -o "${APP_STAGE}/Contents/MacOS/colabhive-desktop" \
-            ./cmd/colabhive-desktop
+          if [ "${TARGET_ARCH}" = "amd64" ]; then
+            CC="clang -arch x86_64" CXX="clang++ -arch x86_64" CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
+              go build -trimpath -ldflags="${LDFLAGS}" \
+              -o "${APP_STAGE}/Contents/MacOS/colabhive-desktop" \
+              ./cmd/colabhive-desktop
+          else
+            CGO_ENABLED=1 GOOS=darwin GOARCH="${TARGET_ARCH}" \
+              go build -trimpath -ldflags="${LDFLAGS}" \
+              -o "${APP_STAGE}/Contents/MacOS/colabhive-desktop" \
+              ./cmd/colabhive-desktop
+          fi
 
           # 2. Bundled Control Plane & Drop-In CLI (`colabhive` + `colab`)
           CGO_ENABLED=0 GOOS=darwin GOARCH="${TARGET_ARCH}" \
@@ -328,40 +335,40 @@ jobs:
 
           # 5. Write macOS `Contents/Info.plist` (High-DPI Retina + Localhost WKWebView ATS)
           cat > "${APP_STAGE}/Contents/Info.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key>
-            <string>ColabHive</string>
-            <key>CFBundleDisplayName</key>
-            <string>ColabHive</string>
-            <key>CFBundleIdentifier</key>
-            <string>com.colabhive.desktop</string>
-            <key>CFBundleVersion</key>
-            <string>${CLEAN_VER}</string>
-            <key>CFBundleShortVersionString</key>
-            <string>${CLEAN_VER}</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>CFBundleExecutable</key>
-            <string>colabhive-desktop</string>
-            <key>CFBundleIconFile</key>
-            <string>AppIcon</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>11.0</string>
-            <key>NSHighResolutionCapable</key>
-            <true/>
-            <key>NSSupportsAutomaticGraphicsSwitching</key>
-            <true/>
-            <key>NSAppTransportSecurity</key>
-            <dict>
-              <key>NSAllowsLocalNetworking</key>
-              <true/>
-            </dict>
-          </dict>
-          </plist>
-          EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>ColabHive</string>
+  <key>CFBundleDisplayName</key>
+  <string>ColabHive</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.colabhive.desktop</string>
+  <key>CFBundleVersion</key>
+  <string>${CLEAN_VER}</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${CLEAN_VER}</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleExecutable</key>
+  <string>colabhive-desktop</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+</dict>
+</plist>
+EOF
 
           # 6. Ad-hoc codesign bundle (mandatory for Apple Silicon arm64 execution)
           codesign --force --deep --sign - "${APP_STAGE}"
@@ -377,7 +384,8 @@ jobs:
           mkdir -p "${DMG_ROOT}"
           cp -R "${APP_STAGE}" "${DMG_ROOT}/ColabHive.app"
           ln -s /Applications "${DMG_ROOT}/Applications"
-          hdiutil create -volname "ColabHive" -srcfolder "${DMG_ROOT}" -ov -format UDZO "dist/${DMG_NAME}"
+          hdiutil create -volname "ColabHive" -srcfolder "${DMG_ROOT}" -ov -format UDZO "dist/${DMG_NAME}" || \
+            (sleep 3 && hdiutil create -volname "ColabHive" -srcfolder "${DMG_ROOT}" -ov -format UDZO "dist/${DMG_NAME}")
           rm -rf "${DMG_ROOT}"
 
           (cd dist && shasum -a 256 "${ZIP_NAME}" > "${ZIP_NAME}.sha256")

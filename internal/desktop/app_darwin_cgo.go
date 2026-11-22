@@ -3,8 +3,8 @@
 package desktop
 
 /*
-#cgo CFLAGS: -x objective-c -fobjc-arc -Wno-deprecated-declarations
-#cgo LDFLAGS: -framework Cocoa -framework WebKit
+#cgo CFLAGS: -fobjc-arc -mmacosx-version-min=11.0 -Wno-deprecated-declarations
+#cgo LDFLAGS: -mmacosx-version-min=11.0 -framework Cocoa -framework WebKit
 
 #include <stdlib.h>
 #include <stdint.h>

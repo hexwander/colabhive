@@ -1,16 +1,13 @@
 //go:build darwin && cgo
 
-package desktop
-
-/*
-#cgo CFLAGS: -x objective-c -fobjc-arc -Wno-deprecated-declarations
-#cgo LDFLAGS: -framework Cocoa -framework WebKit
-
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include "_cgo_export.h"
+
+extern void colabhiveDarwinOnWebMessage(int isTray, const char *rawJSON);
+extern void colabhiveDarwinOnMenuCommand(int cmdID);
+extern void colabhiveDarwinOnStateChanged(int mainVisible, int trayVisible);
 
 @class ColabHiveCocoaController;
 
@@ -189,7 +186,6 @@ static inline void ch_dispatch_main(dispatch_block_t block) {
 	self.mainWindow.delegate = self;
 	[self.mainWindow setContentMinSize:NSMakeSize(860, 560)];
 	self.mainWindow.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
-	// Warm Stone `#F7F7F5`
 	self.mainWindow.backgroundColor = [NSColor colorWithSRGBRed:247.0/255.0
 	                                                      green:247.0/255.0
 	                                                       blue:245.0/255.0
@@ -727,6 +723,7 @@ void ch_cocoa_update_telemetry(const char *tooltip, const char *poolLabel, int a
 void ch_cocoa_copy_clipboard(const char *text) {
 	if (text == NULL) return;
 	NSString *nsText = [NSString stringWithUTF8String:text];
+	if (nsText == nil) return;
 	ch_dispatch_main(^{
 		NSPasteboard *pb = [NSPasteboard generalPasteboard];
 		[pb clearContents];
@@ -737,6 +734,7 @@ void ch_cocoa_copy_clipboard(const char *text) {
 void ch_cocoa_open_external(const char *urlStr) {
 	if (urlStr == NULL) return;
 	NSString *nsURL = [NSString stringWithUTF8String:urlStr];
+	if (nsURL == nil) return;
 	ch_dispatch_main(^{
 		NSURL *u = [NSURL URLWithString:nsURL];
 		if (u != nil && ([u.scheme.lowercaseString isEqualToString:@"http"] || [u.scheme.lowercaseString isEqualToString:@"https"])) {
@@ -750,5 +748,3 @@ void ch_cocoa_quit(void) {
 		[gColabHiveController performGracefulQuit];
 	});
 }
-*/
-import "C"
