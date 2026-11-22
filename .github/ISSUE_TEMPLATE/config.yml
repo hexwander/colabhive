@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "💬 GitHub Discussions — Q&A, Architecture & Showcases"
+    url: https://github.com/hexwander/colabhive/discussions
+    about: "Ask usage questions, share multi-GPU sharding setups, or discuss roadmap ideas."
+  - name: "📖 Architecture & Protocol Specifications"
+    url: https://github.com/hexwander/colabhive/tree/main/docs/architecture
+    about: "Read the normative Colab wire-protocol, official API, cc-switch, and UX specs before opening design issues."
+  - name: "🔒 Report a Security Vulnerability (Private)"
+    url: https://github.com/hexwander/colabhive/security/advisories/new
+    about: "Privately disclose vault, authentication, proxy-pinning, or contributor firewall vulnerabilities."

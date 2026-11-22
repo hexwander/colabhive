@@ -1,0 +1,47 @@
+name: "✨ Feature Request"
+description: "Propose a new capability, scheduling policy, AI Agent integration, or UX enhancement."
+title: "[Feat]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea to make multi-account Colab GPU pooling or AI Agent routing even smoother? Share the workflow and impact below!
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Feature Area
+      options:
+        - "Scheduler & Routing Policies (`waste-zero`, failover, sharding)"
+        - "AI Agent / MCP Client Integration (`colabhive connect`)"
+        - "Quota Observatory & Live Workbench UI (`web/`)"
+        - "Windows Native Desktop / Magpie System Tray"
+        - "External Contributor Portal & Team Governance"
+        - "CLI (`colab` / `colabhive`) & Python SDK"
+        - "Cloud Deployment, Proxies & Observability"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Research Workflow
+      description: What bottleneck or friction are you trying to solve?
+      placeholder: "When running 8-shard evaluations across mixed Pro+ and Free accounts..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe how the feature, CLI flag, MCP tool, or UI interaction should work.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered & Additional Context
+      description: Any workarounds, reference tools, or mockups?

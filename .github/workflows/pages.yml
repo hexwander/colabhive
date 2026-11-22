@@ -1,0 +1,63 @@
+name: Deploy GitHub Pages Live Demo
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build & Deploy Interactive Showcase (GitHub Pages)
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm --dir web install --frozen-lockfile || pnpm --dir web install
+
+      - name: Build interactive demo SPA bundle (web/dist-pages)
+        run: |
+          BASE_PATH="/${GITHUB_REPOSITORY#*/}/"
+          if ! VITE_DEMO_SITE=true VITE_BASE_PATH="${BASE_PATH}" pnpm --dir web run build:pages; then
+            echo "Falling back to direct Vite Pages build..."
+            VITE_DEMO_SITE=true VITE_BASE_PATH="${BASE_PATH}" pnpm --dir web run build -- --base="${BASE_PATH}" --outDir dist-pages
+          fi
+          cp -f web/dist-pages/index.html web/dist-pages/404.html
+          touch web/dist-pages/.nojekyll
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist-pages
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

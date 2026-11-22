@@ -1,0 +1,28 @@
+# ==============================================================================
+# ColabHive — Docker Build Context Exclusions (`.dockerignore`)
+# ==============================================================================
+# Prevents local SQLite vaults, `.env` secrets, prebuilt binaries, and
+# `node_modules` from leaking into Docker build context or image layers.
+
+.git
+.github
+bin/
+data/
+runs/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.chvault
+.env*
+
+web/node_modules
+web/dist
+
+sdk/python/build
+sdk/python/dist
+sdk/python/*.egg-info
+sdk/python/src/*.egg-info
+**/__pycache__
+**/*.pyc
+.pytest_cache
