@@ -251,7 +251,7 @@ jobs:
   # ----------------------------------------------------------------------------
   macos-desktop:
     name: macOS Desktop App (darwin/${{ matrix.goarch }})
-    runs-on: macos-14
+    runs-on: macos-latest
     needs: [frontend, backend, python-sdk]
     strategy:
       fail-fast: false
