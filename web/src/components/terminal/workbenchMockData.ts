@@ -925,7 +925,7 @@ export const DEMO_ACCOUNTS: Account[] = [
 ];
 
 export const DEMO_ROUTER_POLICY: RouterPolicy = {
-  default_strategy: 'waste-zero',
+  default_strategy: 'free-first',
   sticky_session_enabled: true,
   sticky_idle_ttl_sec: 1800,
   auto_fallback_enabled: true,
@@ -1307,6 +1307,16 @@ export const STRATEGY_METADATA: Record<
     zhDesc: '在所有可用账号之间均匀分配任务，轻松开启 4 卡或 8 卡同时并行跑评测，成倍缩短等待时间。',
     enDesc: 'Distributes concurrent GPU sessions evenly across healthy accounts to maximize parallel shard slots.',
     accentColor: 'var(--accent)',
+  },
+  'free-first': {
+    badge: 'Zero-Dollar First',
+    zhBadge: '推荐 · 零元白嫖优先',
+    enBadge: 'Recommended · $0 First',
+    zhTitle: '🎁 优先烧免费额度 · 先用满 Colab 免费卡',
+    enTitle: '🎁 Zero-Dollar Priority · Drain Free Colab First',
+    zhDesc: '第一顺位自动用满所有 Google Colab 免费显卡窗口，完全不花一分钱；免费额度占满后才顺延至付费账号。',
+    enDesc: 'Automatically uses all $0 Free Colab T4 windows first — zero credits spent until free slots are full.',
+    accentColor: 'var(--emerald)',
   },
   'free-opportunistic': {
     badge: 'Free First',

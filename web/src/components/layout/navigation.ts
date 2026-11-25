@@ -4,11 +4,14 @@ import { IS_STATIC_DEMO_BUILD, isDemoSiteMode } from '../../lib/demoSiteAdapter'
 export type AppSection =
   | 'landing'
   | 'observatory'
+  | 'chat'
+  | 'studio'
+  | 'apps'
+  | 'savings'
   | 'pool'
   | 'workbench'
   | 'router'
   | 'settings'
-  | 'contribute'
   | 'tray';
 
 export interface ParsedRoute {
@@ -17,8 +20,6 @@ export interface ParsedRoute {
   section: AppSection;
   isPublicPortal: boolean;
   experimentId?: string;
-  inviteCode?: string;
-  receiptToken?: string;
 }
 
 const NAV_EVENT = 'colabhive:navigate';
@@ -113,39 +114,39 @@ export function parseRoute(pathname: string, search = ''): ParsedRoute {
     return { pathname: clean, search, section: 'tray', isPublicPortal: false };
   }
 
-  // Self-service contributor receipt routes:
-  // `/contribute/manage/:token` or `/my-contribution/:token`
-  const manageMatch =
-    clean.match(/^\/contribute\/manage\/([^/]+)$/) ||
-    clean.match(/^\/my-contribution\/([^/]+)$/);
-  if (manageMatch) {
-    return {
-      pathname: clean,
-      search,
-      section: 'contribute',
-      isPublicPortal: true,
-      receiptToken: decodeURIComponent(manageMatch[1]),
-    };
+  if (
+    clean === '/apps/llm' ||
+    clean.startsWith('/apps/llm/') ||
+    clean === '/llm' ||
+    clean === '/apps/chat' ||
+    clean.startsWith('/apps/chat/') ||
+    clean === '/chat' ||
+    clean === '/ai-chat' ||
+    clean.startsWith('/chat/') ||
+    clean.startsWith('/ai-chat/')
+  ) {
+    return { pathname: clean, search, section: 'chat', isPublicPortal: false };
   }
 
-  // Public contributor onboarding invite route: `/contribute/:code` or `/contribute`
-  if (clean === '/contribute') {
-    return {
-      pathname: clean,
-      search,
-      section: 'contribute',
-      isPublicPortal: true,
-    };
+  if (clean === '/studio' || clean.startsWith('/studio/')) {
+    return { pathname: clean, search, section: 'studio', isPublicPortal: false };
   }
-  const inviteMatch = clean.match(/^\/contribute\/([^/]+)$/);
-  if (inviteMatch) {
-    return {
-      pathname: clean,
-      search,
-      section: 'contribute',
-      isPublicPortal: true,
-      inviteCode: decodeURIComponent(inviteMatch[1]),
-    };
+
+  if (
+    clean === '/savings' ||
+    clean === '/savings-receipt' ||
+    clean.startsWith('/savings/')
+  ) {
+    return { pathname: clean, search, section: 'savings', isPublicPortal: false };
+  }
+
+  if (
+    clean === '/apps' ||
+    clean === '/app-store' ||
+    (clean.startsWith('/apps/') && !clean.startsWith('/apps/proxy/')) ||
+    clean.startsWith('/app-store/')
+  ) {
+    return { pathname: clean, search, section: 'apps', isPublicPortal: false };
   }
 
   if (clean === '/pool' || clean.startsWith('/pool/')) {
@@ -223,7 +224,15 @@ export function useRouter(): ParsedRoute & { navigate: (to: string, replace?: bo
 
       const href = target.getAttribute('href');
       if (!href || !href.startsWith('/') || href.startsWith('//')) return;
-      if (href.startsWith('/api/') || href.startsWith('/mcp') || href.startsWith('/ws/')) return;
+      if (
+        href.startsWith('/api/') ||
+        href.startsWith('/mcp') ||
+        href.startsWith('/ws/') ||
+        href.startsWith('/v1/') ||
+        href.startsWith('/apps/proxy/')
+      ) {
+        return;
+      }
 
       e.preventDefault();
       navigate(href);

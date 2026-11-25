@@ -199,15 +199,15 @@ func SeedDemoCluster(
 			},
 			{
 				ID:                 "acc_demo_contrib04",
-				Email:              "alice.contrib@stanford.edu",
-				DisplayName:        "Alice (Contributed Pro+)",
-				Alias:              "Alice · Donated Pro+ (Reserve >= 80 CU)",
+				Email:              "research-proplus-04@colabhive.dev",
+				DisplayName:        "Secondary Pro+ #4",
+				Alias:              "Secondary Pro+ #4 (Reserve >= 80 CU)",
 				SubscriptionTier:   models.TierProPlus,
 				Health:             models.HealthActiveWorking,
 				Enabled:            true,
 				Priority:           75,
-				Groups:             []string{"lab-contributors", "research-core"},
-				Tags:               []string{"demo", "contributed"},
+				Groups:             []string{"research-core"},
+				Tags:               []string{"demo"},
 				ProxyID:            prxLAX.ID,
 				Proxy:              prxLAX,
 				MaxConcurrentVMs:   2,
@@ -216,22 +216,15 @@ func SeedDemoCluster(
 				ReferenceCycleCU:   500.00,
 				SchedulableCU:      304.92, // 384.92 - 80.0 floor
 				LiveBurnRateCUHr:   9.66,
-				IsContributor:      true,
-				InviteCode:         "ch_inv_demo2026",
+				IsContributor:      false,
 				TunnelAPISupported: true,
 				Guardrails: models.ContributorGuardrails{
-					MinReserveCU:          80.0,
-					MaxDonatedCUTotal:     250.0,
-					MaxDonatedCUDaily:     50.0,
-					DonatedCUUsedTotal:    42.6,
-					DonatedCUUsedToday:    6.4,
-					AllowPaidCUBurn:       true,
-					AllowedGPUs:           []models.AcceleratorType{models.AcceleratorT4, models.AcceleratorL4, models.AcceleratorG4, models.AcceleratorA100},
-					MaxConcurrentVMs:      2,
-					BlockDrivePropagation: true,
-					MaskEmailInDashboard:  true,
+					MinReserveCU:     80.0,
+					AllowPaidCUBurn:  true,
+					AllowedGPUs:      []models.AcceleratorType{models.AcceleratorT4, models.AcceleratorL4, models.AcceleratorG4, models.AcceleratorA100},
+					MaxConcurrentVMs: 2,
 				},
-				ActiveSessionSummary: "qwen27b_mmlu_s3 (G4 · Drive Firewall ON)",
+				ActiveSessionSummary: "qwen27b_mmlu_s3 (G4)",
 				LastPolledAt:         &now,
 				CreatedAt:            started20mAgo,
 				UpdatedAt:            now,
@@ -256,31 +249,7 @@ func SeedDemoCluster(
 			_ = st.AddSavedWaste(ctx, 20.2, true)
 		}
 
-		// 4. Seed Shareable Contributor Invite (`ch_inv_demo2026`)
-		_ = st.SaveInvite(ctx, &models.ContributorInvite{
-			Code:           "ch_inv_demo2026",
-			PoolTitle:      "ICML 2027 Shared Evaluation Cluster",
-			MaintainerName: "ColabHive Lab",
-			WelcomeNote:    "Donate expiring 90-day Compute Units safely — zero Google Drive scope, hard personal CU reserve floor, and 1-click revoke.",
-			TargetGroups:   []string{"lab-contributors"},
-			DefaultProxyID: prxLAX.ID,
-			DefaultGuardrails: models.ContributorGuardrails{
-				MinReserveCU:          50.0,
-				MaxDonatedCUTotal:     200.0,
-				AllowPaidCUBurn:       true,
-				AllowedGPUs:           []models.AcceleratorType{models.AcceleratorT4, models.AcceleratorL4, models.AcceleratorG4, models.AcceleratorA100},
-				MaxConcurrentVMs:      1,
-				BlockDrivePropagation: true,
-			},
-			MaxUses:        20,
-			UsedCount:      1,
-			SupportedModes: []models.OAuthAuthMode{models.OAuthModeRemoteCopyPaste, models.OAuthModeCLIDonate},
-			RequiredScopes: models.ContributorOAuthScopes,
-			ShareURL:       fmt.Sprintf("%s/contribute/ch_inv_demo2026", publicBaseURL),
-			CreatedAt:      started20mAgo,
-		})
-
-		// 5. Seed Active 4x G4 Sharded Experiment (`exp_qwen27b_mmlu`) + 1 Interactive A100 Session
+		// 4. Seed Active 4x G4 Sharded Experiment (`exp_qwen27b_mmlu`) + 1 Interactive A100 Session
 		pngBytes := runtime.GenerateDemoPlotPNG()
 		shardAccounts := []struct {
 			id    string

@@ -438,7 +438,7 @@ func EnsureControlPlane(ctx context.Context, cfg Config, bridge server.DesktopBr
 		cfg.Mode = "local"
 	}
 	if strings.TrimSpace(cfg.Version) == "" {
-		cfg.Version = "1.0.0"
+		cfg.Version = "1.1.0"
 	}
 	if cfg.KeepaliveSec <= 0 {
 		cfg.KeepaliveSec = 8
@@ -549,13 +549,19 @@ func EnsureControlPlane(ctx context.Context, cfg Config, bridge server.DesktopBr
 		artifactsDir = filepath.Join(os.TempDir(), "colabhive-desktop-demo-artifacts")
 	}
 
+	fallbackProbeDur := time.Duration(cfg.FallbackProbeSec) * time.Second
+	if fallbackProbeDur < 5*time.Second {
+		fallbackProbeDur = 28 * time.Second
+	}
+
 	rtEngine := runtime.NewConcreteEngine(st, poolSvc, rtr, hub, runtime.Options{
-		DemoMode:             false,
-		TunnelBaseURL:        tunnelURL,
-		PublicAPIBaseURL:     publicAPIURL,
-		KeepaliveInterval:    time.Duration(cfg.KeepaliveSec) * time.Second,
-		ResourcePollInterval: 10 * time.Second,
-		ArtifactsDir:         artifactsDir,
+		DemoMode:              false,
+		TunnelBaseURL:         tunnelURL,
+		PublicAPIBaseURL:      publicAPIURL,
+		KeepaliveInterval:     time.Duration(cfg.KeepaliveSec) * time.Second,
+		ResourcePollInterval:  10 * time.Second,
+		FallbackAssignTimeout: fallbackProbeDur,
+		ArtifactsDir:          artifactsDir,
 		HTTPClientFactory: func(proxyURL string) (*http.Client, *websocket.Dialer, error) {
 			hc, hErr := txFactory.HTTPClient(proxyURL, 15*time.Minute)
 			if hErr != nil {
@@ -589,13 +595,20 @@ func EnsureControlPlane(ctx context.Context, cfg Config, bridge server.DesktopBr
 	if strings.TrimSpace(cfg.AdminToken) != "" {
 		mcpSrv.SetAdminToken(cfg.AdminToken)
 	}
+	if !strings.EqualFold(strings.TrimSpace(cfg.Mode), "cloud") && strings.TrimSpace(cfg.MCPTrustedWorkspace) != "" {
+		mcpSrv.SetTrustedWorkspaceDir(cfg.MCPTrustedWorkspace)
+	}
 
 	srv := server.New(st, poolSvc, rtEngine, rtr, hub, mcpSrv, server.Config{
 		Version:              cfg.Version,
 		Mode:                 cfg.Mode,
 		AdminToken:           cfg.AdminToken,
+		MCPTrustedWorkspace:  cfg.MCPTrustedWorkspace,
 		WebDir:               paths.WebDir,
+		DataDir:              paths.DataDir,
 		ArtifactsDir:         artifactsDir,
+		MasterSecret:         masterKey,
+		StrictVaultKey:       strictCloudVault,
 		PublicURL:            publicURL,
 		DemoMode:             cfg.Demo,
 		KeepaliveIntervalSec: cfg.KeepaliveSec,
@@ -627,6 +640,7 @@ func EnsureControlPlane(ctx context.Context, cfg Config, bridge server.DesktopBr
 		shutCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 		defer cancel()
 		_ = httpSrv.Shutdown(shutCtx)
+		_ = srv.Close()
 		_ = rtEngine.Close()
 		if mockSrv != nil {
 			mockSrv.Close()

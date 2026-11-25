@@ -109,13 +109,7 @@ func (s *Service) StartOAuth(ctx context.Context, req models.OAuthStartRequest) 
 		mode = models.OAuthModeRemoteCopyPaste
 	}
 
-	var scopes []string
-	if req.IsContributor {
-		// HARD SECURITY INVARIANT: Contributors ONLY receive colaboratory + OIDC identity scopes.
-		scopes = append([]string(nil), models.ContributorOAuthScopes...)
-	} else {
-		scopes = append([]string(nil), models.OwnerOAuthScopes...)
-	}
+	scopes := append([]string(nil), models.OwnerOAuthScopes...)
 
 	clientID := models.OfficialColabOAuthClientID
 	redirectURI := models.OfficialRemoteRedirectURI
@@ -616,6 +610,9 @@ func (s *Service) acquireAccessTokenInternal(
 	}
 	if acc.Health == models.HealthRevokedByUser && !allowRevokedTeardown {
 		return "", "", errors.New("pool: account contribution has been revoked")
+	}
+	if acc.EffectiveProvider() != models.ProviderColab {
+		return "", "", fmt.Errorf("pool: account %s uses provider %s (skip Google Colab OAuth)", acc.ID, acc.EffectiveProvider())
 	}
 
 	proxyURL = s.resolveAccountProxyURL(ctx, acc)

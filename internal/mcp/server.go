@@ -88,6 +88,7 @@ type callContext struct {
 	clientName      string
 	transport       models.TransportType
 	apiKey          *models.AgentAPIKey
+	directLoopback  bool
 	defaultStrategy models.RoutingStrategy
 	defaultAccount  string
 }
@@ -122,11 +123,12 @@ type mcpClientMeta struct {
 }
 
 type sseSessionStream struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	apiKeyID string
-	msgCh    chan []byte
-	done     chan struct{}
+	ctx            context.Context
+	cancel         context.CancelFunc
+	apiKeyID       string
+	directLoopback bool
+	msgCh          chan []byte
+	done           chan struct{}
 }
 
 // Server exposes ColabHive's statically registered MCP Suites A, B, and C over stdio and Streamable HTTP.
@@ -139,11 +141,13 @@ type Server struct {
 	tools   []ToolDefinition
 	toolMap map[string]toolHandlerFunc
 
-	mu          sync.RWMutex
-	adminToken  string
-	cloudMode   bool
-	sessions    map[string]mcpClientMeta
-	sseChannels map[string]*sseSessionStream
+	mu                    sync.RWMutex
+	adminToken            string
+	cloudMode             bool
+	trustedWorkspaceRaw   string
+	trustedWorkspaceCanon string
+	sessions              map[string]mcpClientMeta
+	sseChannels           map[string]*sseSessionStream
 
 	inFlightMu      sync.Mutex
 	inFlightCancels map[string]context.CancelFunc
@@ -714,6 +718,7 @@ func (s *Server) handleStreamablePost(w http.ResponseWriter, r *http.Request, ap
 		clientName:      clientName,
 		transport:       models.TransportMCPHTTP,
 		apiKey:          apiKey,
+		directLoopback:  isDirectLoopbackHTTPRequest(r),
 		defaultStrategy: models.RoutingStrategy(strings.TrimSpace(r.Header.Get("X-ColabHive-Strategy"))),
 		defaultAccount:  strings.TrimSpace(r.Header.Get("X-ColabHive-Account")),
 	}
@@ -771,23 +776,19 @@ func (s *Server) handleStreamableGetSSE(w http.ResponseWriter, r *http.Request, 
 		s.touchSessionMeta(sessionID)
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Mcp-Session-Id", sessionID)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(": colabhive-mcp-stream-ready\n\n"))
-	flusher.Flush()
-
+	// Register the SSE stream in `s.sseChannels` BEFORE flushing HTTP 200 headers so a
+	// client that immediately sends `DELETE /mcp` upon receiving the stream response can
+	// never race ahead of registration and miss canceling this stream.
 	streamCtx, streamCancel := context.WithCancel(r.Context())
 	defer streamCancel()
 
 	stream := &sseSessionStream{
-		ctx:      streamCtx,
-		cancel:   streamCancel,
-		apiKeyID: callerKeyID,
-		msgCh:    make(chan []byte, 256),
-		done:     make(chan struct{}),
+		ctx:            streamCtx,
+		cancel:         streamCancel,
+		apiKeyID:       callerKeyID,
+		directLoopback: isDirectLoopbackHTTPRequest(r),
+		msgCh:          make(chan []byte, 256),
+		done:           make(chan struct{}),
 	}
 	s.mu.Lock()
 	if prev := s.sseChannels[sessionID]; prev != nil && prev.cancel != nil {
@@ -803,6 +804,14 @@ func (s *Server) handleStreamableGetSSE(w http.ResponseWriter, r *http.Request, 
 		}
 		s.mu.Unlock()
 	}()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Mcp-Session-Id", sessionID)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(": colabhive-mcp-stream-ready\n\n"))
+	flusher.Flush()
 
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -870,11 +879,12 @@ func (s *Server) handleLegacySSE(w http.ResponseWriter, r *http.Request, apiKey 
 	defer streamCancel()
 
 	stream := &sseSessionStream{
-		ctx:      streamCtx,
-		cancel:   streamCancel,
-		apiKeyID: callerKeyID,
-		msgCh:    make(chan []byte, 256),
-		done:     make(chan struct{}),
+		ctx:            streamCtx,
+		cancel:         streamCancel,
+		apiKeyID:       callerKeyID,
+		directLoopback: isDirectLoopbackHTTPRequest(r),
+		msgCh:          make(chan []byte, 256),
+		done:           make(chan struct{}),
 	}
 	s.mu.Lock()
 	s.sseChannels[sessionID] = stream
@@ -969,6 +979,7 @@ func (s *Server) handleLegacySSEMessage(w http.ResponseWriter, r *http.Request, 
 	ua := r.UserAgent()
 	hdrStrat := models.RoutingStrategy(strings.TrimSpace(r.Header.Get("X-ColabHive-Strategy")))
 	hdrAcc := strings.TrimSpace(r.Header.Get("X-ColabHive-Account"))
+	msgDirectLoopback := stream.directLoopback && isDirectLoopbackHTTPRequest(r)
 
 	// Return HTTP 202 Accepted immediately per MCP 2024-11-05 HTTP+SSE spec and process asynchronously!
 	w.WriteHeader(http.StatusAccepted)
@@ -986,6 +997,7 @@ func (s *Server) handleLegacySSEMessage(w http.ResponseWriter, r *http.Request, 
 			clientName:      s.lookupSessionClientName(sessionID, ua),
 			transport:       models.TransportMCPSSE,
 			apiKey:          apiKey,
+			directLoopback:  msgDirectLoopback,
 			defaultStrategy: hdrStrat,
 			defaultAccount:  hdrAcc,
 		}
@@ -1187,7 +1199,7 @@ func (s *Server) dispatchOne(
 				"name":    "colabhive-mcp",
 				"version": "1.0.0",
 			},
-			"instructions": "ColabHive Multi-Account Google Colab GPU Pool & Kernel Router. All tools are available immediately without opening a browser tab.",
+			"instructions": "ColabHive Multi-Account Google Colab GPU Pool & Kernel Router. All tools are available immediately without opening a browser tab. Over HTTP or API-key MCP, prefer inline transfers: pass 'content' or 'content_base64' to colab_file_upload, omit 'local_path' on colab_file_download to receive bytes inline, pass inline 'code' to colab_exec, pass 'packages'/'requirements_txt' to colab_install_packages, and pass 'script_code' to experiment_launch_sharded (host paths are only permitted over local keyless stdio or when the daemon explicitly enables --mcp-trusted-workspace for direct 127.0.0.1 loopback callers).",
 		}
 		return &jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}, initParams.ClientInfo.Name, true
 

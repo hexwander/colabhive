@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -84,16 +85,6 @@ func (s *mcpTestStore) GetProxy(_ context.Context, _ string) (*models.ProxyConfi
 }
 func (s *mcpTestStore) ListProxies(_ context.Context) ([]*models.ProxyConfig, error) { return nil, nil }
 func (s *mcpTestStore) DeleteProxy(_ context.Context, _ string) error                { return nil }
-func (s *mcpTestStore) SaveInvite(_ context.Context, _ *models.ContributorInvite) error {
-	return nil
-}
-func (s *mcpTestStore) GetInvite(_ context.Context, _ string) (*models.ContributorInvite, error) {
-	return nil, nil
-}
-func (s *mcpTestStore) ListInvites(_ context.Context) ([]*models.ContributorInvite, error) {
-	return nil, nil
-}
-func (s *mcpTestStore) DeleteInvite(_ context.Context, _ string) error { return nil }
 
 func (s *mcpTestStore) SaveSession(_ context.Context, sess *models.RuntimeSession) error {
 	s.mu.Lock()
@@ -1114,5 +1105,224 @@ func TestMCPHostFSRejectionTenantIsolationAuthAndCancellation(t *testing.T) {
 	_ = respRebind.Body.Close()
 	if respRebind.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden on DNS-rebinding Host header over keyless MCP, got %d", respRebind.StatusCode)
+	}
+}
+
+func TestMCPTrustedLocalWorkspaceSecurity(t *testing.T) {
+	ctx := context.Background()
+	st := newMCPTestStore()
+
+	ownerAcc := &models.Account{
+		ID:               "acc_tw_owner",
+		Email:            "tw-owner@example.com",
+		SubscriptionTier: models.TierAIUltra,
+		Health:           models.HealthHealthy,
+		Enabled:          true,
+		PaidCUBalance:    500,
+		SchedulableCU:    500,
+		MaxConcurrentVMs: 4,
+		Tags:             []string{"demo"},
+	}
+	_ = st.SaveAccount(ctx, ownerAcc)
+	mockPool := &mockPoolForMCPQuota{accounts: []*models.Account{ownerAcc}}
+	rtr := router.NewServiceWithDirs(st, nil, nil, t.TempDir(), "", "", "linux")
+	eng := runtime.NewConcreteEngine(st, nil, rtr, nil, runtime.Options{
+		DemoMode:               true,
+		ArtifactsDir:           t.TempDir(),
+		DisableBackgroundLoops: true,
+	})
+	defer eng.Close()
+
+	keyA, err := rtr.CreateAPIKey(ctx, models.CreateAPIKeyRequest{Name: "Desktop-Local-Agent"})
+	if err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+
+	wsDir := t.TempDir()
+	outsideDir := t.TempDir()
+	inFile := filepath.Join(wsDir, "input.txt")
+	scriptFile := filepath.Join(wsDir, "hello.py")
+	outsideSecret := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(inFile, []byte("TRUSTED_WORKSPACE_BYTES"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptFile, []byte("print('from_trusted_script')"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outsideSecret, []byte("OUTSIDE_SECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	mcpSrv := NewServer(mockPool, eng, rtr, nil)
+	mcpSrv.SetTrustedWorkspaceDir(wsDir)
+	handler := mcpSrv.Handler()
+
+	callDirect := func(remoteAddr string, rawKey string, extraHeaders map[string]string, method string, params map[string]any) (int, map[string]any, string) {
+		t.Helper()
+		payload := map[string]any{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"method":  method,
+			"params":  params,
+		}
+		body, _ := json.Marshal(payload)
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:7860/mcp", bytes.NewReader(body))
+		req.RemoteAddr = remoteAddr
+		req.Host = "127.0.0.1:7860"
+		req.Header.Set("Content-Type", "application/json")
+		if rawKey != "" {
+			req.Header.Set("Authorization", "Bearer "+rawKey)
+		}
+		for k, v := range extraHeaders {
+			req.Header.Set(k, v)
+		}
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		raw := rr.Body.String()
+		var env struct {
+			Result map[string]any `json:"result"`
+		}
+		_ = json.Unmarshal([]byte(raw), &env)
+		return rr.Code, env.Result, raw
+	}
+
+	// 1. Initialize instructions guide AI agents on inline transfer & trusted workspace.
+	code, initRes, initRaw := callDirect("127.0.0.1:51000", keyA.RawKey, nil, "initialize", map[string]any{"protocolVersion": ProtocolVersion20250326})
+	if code != http.StatusOK || !strings.Contains(fmt.Sprint(initRes["instructions"]), "content_base64") {
+		t.Fatalf("expected initialize instructions to guide inline transfers, got HTTP %d: %s", code, initRaw)
+	}
+
+	// Create session owned by keyA.
+	_, createRes, createRaw := callDirect("127.0.0.1:51001", keyA.RawKey, nil, "tools/call", map[string]any{
+		"name":      "create_runtime",
+		"arguments": map[string]any{"name": "tw-vm", "gpu": "G4"},
+	})
+	sc, _ := createRes["structuredContent"].(map[string]any)
+	sessID, _ := sc["id"].(string)
+	if sessID == "" {
+		t.Fatalf("create_runtime failed: %s", createRaw)
+	}
+
+	// 2. Direct 127.0.0.1 API-key caller CAN upload/download/exec strictly inside wsDir!
+	_, upRes, upRaw := callDirect("127.0.0.1:51002", keyA.RawKey, nil, "tools/call", map[string]any{
+		"name": "colab_file_upload",
+		"arguments": map[string]any{
+			"session":     sessID,
+			"local_path":  inFile,
+			"remote_path": "/content/tw_in.txt",
+		},
+	})
+	if upRes["isError"] == true {
+		t.Fatalf("expected direct loopback upload inside trusted workspace to succeed: %s", upRaw)
+	}
+
+	outRel := filepath.Join("nested", "downloaded.txt")
+	_, dlRes, dlRaw := callDirect("127.0.0.1:51003", keyA.RawKey, nil, "tools/call", map[string]any{
+		"name": "colab_file_download",
+		"arguments": map[string]any{
+			"session":     sessID,
+			"remote_path": "/content/tw_in.txt",
+			"local_path":  outRel,
+		},
+	})
+	if dlRes["isError"] == true {
+		t.Fatalf("expected direct loopback download inside trusted workspace to succeed: %s", dlRaw)
+	}
+	gotDownloaded, err := os.ReadFile(filepath.Join(wsDir, "nested", "downloaded.txt"))
+	if err != nil || string(gotDownloaded) != "TRUSTED_WORKSPACE_BYTES" {
+		t.Fatalf("downloaded file mismatch: got=%q err=%v", string(gotDownloaded), err)
+	}
+
+	_, execRes, execRaw := callDirect("127.0.0.1:51004", keyA.RawKey, nil, "tools/call", map[string]any{
+		"name": "colab_exec",
+		"arguments": map[string]any{
+			"session":    sessID,
+			"local_file": "hello.py",
+		},
+	})
+	if execRes["isError"] == true {
+		t.Fatalf("expected direct loopback colab_exec inside trusted workspace to succeed: %s", execRaw)
+	}
+
+	// 3. Path traversal & outside-workspace files MUST be rejected even from direct 127.0.0.1!
+	for _, badPath := range []string{outsideSecret, "../secret.txt", "..\\secret.txt"} {
+		_, badUp, badUpRaw := callDirect("127.0.0.1:51005", keyA.RawKey, nil, "tools/call", map[string]any{
+			"name": "colab_file_upload",
+			"arguments": map[string]any{
+				"session":     sessID,
+				"local_path":  badPath,
+				"remote_path": "/content/leak.txt",
+			},
+		})
+		if badUp["isError"] != true {
+			t.Fatalf("SECURITY FAILURE: trusted workspace allowed escaped upload path %q: %s", badPath, badUpRaw)
+		}
+		_, badDl, badDlRaw := callDirect("127.0.0.1:51006", keyA.RawKey, nil, "tools/call", map[string]any{
+			"name": "colab_file_download",
+			"arguments": map[string]any{
+				"session":     sessID,
+				"remote_path": "/content/tw_in.txt",
+				"local_path":  badPath,
+			},
+		})
+		if badDl["isError"] != true {
+			t.Fatalf("SECURITY FAILURE: trusted workspace allowed escaped download path %q: %s", badPath, badDlRaw)
+		}
+	}
+
+	// 4. Symlink inside wsDir pointing outside wsDir MUST be blocked by os.OpenRoot!
+	escapeLink := filepath.Join(wsDir, "escape_link.txt")
+	if symErr := os.Symlink(outsideSecret, escapeLink); symErr == nil {
+		_, symRes, symRaw := callDirect("127.0.0.1:51007", keyA.RawKey, nil, "tools/call", map[string]any{
+			"name": "colab_file_upload",
+			"arguments": map[string]any{
+				"session":     sessID,
+				"local_path":  escapeLink,
+				"remote_path": "/content/symlink_leak.txt",
+			},
+		})
+		if symRes["isError"] != true {
+			t.Fatalf("SECURITY FAILURE: trusted workspace followed escaping symlink: %s", symRaw)
+		}
+	}
+
+	// 5. Reverse-proxied request (`X-Forwarded-For` present on 127.0.0.1) MUST be blocked!
+	_, xffRes, xffRaw := callDirect("127.0.0.1:51008", keyA.RawKey, map[string]string{"X-Forwarded-For": "203.0.113.42"}, "tools/call", map[string]any{
+		"name": "colab_file_upload",
+		"arguments": map[string]any{
+			"session":     sessID,
+			"local_path":  inFile,
+			"remote_path": "/content/xff.txt",
+		},
+	})
+	if xffRes["isError"] != true {
+		t.Fatalf("SECURITY FAILURE: proxied X-Forwarded-For request accessed trusted workspace: %s", xffRaw)
+	}
+
+	// 6. Non-loopback TCP peer (`198.51.100.7`) MUST be blocked!
+	_, remRes, remRaw := callDirect("198.51.100.7:51009", keyA.RawKey, nil, "tools/call", map[string]any{
+		"name": "colab_file_upload",
+		"arguments": map[string]any{
+			"session":     sessID,
+			"local_path":  inFile,
+			"remote_path": "/content/remote.txt",
+		},
+	})
+	if remRes["isError"] != true {
+		t.Fatalf("SECURITY FAILURE: non-loopback peer accessed trusted workspace: %s", remRaw)
+	}
+
+	// 7. Cloud mode MUST ALWAYS block trusted workspace even from direct 127.0.0.1!
+	mcpSrv.SetCloudMode(true)
+	_, cloudRes, cloudRaw := callDirect("127.0.0.1:51010", keyA.RawKey, nil, "tools/call", map[string]any{
+		"name": "colab_file_upload",
+		"arguments": map[string]any{
+			"session":     sessID,
+			"local_path":  inFile,
+			"remote_path": "/content/cloud.txt",
+		},
+	})
+	if cloudRes["isError"] != true {
+		t.Fatalf("SECURITY FAILURE: cloud mode allowed trusted workspace on loopback: %s", cloudRaw)
 	}
 }

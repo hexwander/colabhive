@@ -25,8 +25,12 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/colabhive/colabhive/internal/appstore"
+	"github.com/colabhive/colabhive/internal/checkpoint"
+	"github.com/colabhive/colabhive/internal/llmgw"
 	"github.com/colabhive/colabhive/internal/mcp"
 	"github.com/colabhive/colabhive/internal/models"
+	"github.com/colabhive/colabhive/internal/pluginhost"
 	"github.com/colabhive/colabhive/internal/proxy"
 )
 
@@ -242,8 +246,12 @@ type Config struct {
 	Mode                  string // "local" (default) | "cloud"
 	TrustProxy            bool
 	AdminToken            string
+	MCPTrustedWorkspace   string
 	WebDir                string
+	DataDir               string
 	ArtifactsDir          string
+	MasterSecret          string
+	StrictVaultKey        bool
 	PublicURL             string
 	GoogleProbeURL        string
 	DemoMode              bool
@@ -475,6 +483,10 @@ type Server struct {
 	router          models.RouterService
 	hub             models.EventHub
 	mcp             *mcp.Server
+	llmgw           *llmgw.Service
+	appstore        *appstore.Manager
+	checkpoint      *checkpoint.Manager
+	pluginhost      *pluginhost.Host
 	txFactory       *proxy.TransportFactory
 	cfg             Config
 	startedAt       time.Time
@@ -517,7 +529,7 @@ func New(
 	cfg Config,
 ) *Server {
 	if cfg.Version == "" {
-		cfg.Version = "1.0.0"
+		cfg.Version = "1.1.0"
 	}
 	if cfg.KeepaliveIntervalSec <= 0 {
 		cfg.KeepaliveIntervalSec = 8
@@ -542,6 +554,9 @@ func New(
 	}
 	isCloud := strings.EqualFold(strings.TrimSpace(cfg.Mode), "cloud")
 	mcpSrv.SetCloudMode(isCloud)
+	if !isCloud && strings.TrimSpace(cfg.MCPTrustedWorkspace) != "" {
+		mcpSrv.SetTrustedWorkspaceDir(cfg.MCPTrustedWorkspace)
+	}
 
 	if pool != nil && rt != nil {
 		if ensurer, ok := any(pool).(interface {
@@ -577,6 +592,36 @@ func New(
 	_, _ = macInit.Write([]byte(cfg.AdminToken))
 	artifactKey := macInit.Sum(nil)
 
+	dataDir := strings.TrimSpace(cfg.DataDir)
+	if dataDir == "" {
+		dataDir = filepath.Dir(cfg.ArtifactsDir)
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/")
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1:7860"
+	}
+
+	llmSvc := llmgw.NewService(pool, rt, rtr, hub, llmgw.Config{
+		BaseURL:  baseURL,
+		DataDir:  dataDir,
+		DemoMode: cfg.DemoMode,
+	})
+	ckptMgr := checkpoint.NewManagerWithConfig(checkpoint.Config{
+		DataDir:  dataDir,
+		DemoMode: cfg.DemoMode,
+	}, pool, rt, hub)
+	appMgr := appstore.NewManager(pool, rt, ckptMgr, hub, appstore.Config{
+		DataDir:       dataDir,
+		CloudMode:     isCloud,
+		DemoMode:      cfg.DemoMode,
+		ProtectedMode: strings.TrimSpace(cfg.AdminToken) != "",
+	})
+	pHost := pluginhost.NewHost(appMgr, llmSvc, pluginhost.Config{
+		DataDir:     dataDir,
+		HostBaseURL: baseURL,
+		DemoMode:    cfg.DemoMode,
+	})
+
 	s := &Server{
 		st:              st,
 		pool:            pool,
@@ -584,6 +629,10 @@ func New(
 		router:          rtr,
 		hub:             hub,
 		mcp:             mcpSrv,
+		llmgw:           llmSvc,
+		appstore:        appMgr,
+		checkpoint:      ckptMgr,
+		pluginhost:      pHost,
 		txFactory:       proxy.NewTransportFactory(),
 		cfg:             cfg,
 		startedAt:       time.Now().UTC(),
@@ -597,6 +646,30 @@ func New(
 	}
 	s.registerRoutes()
 	return s
+}
+
+// Close gracefully shuts down v1.1 background watchdogs and localhost port bridges.
+func (s *Server) Close() error {
+	if s == nil {
+		return nil
+	}
+	var firstErr error
+	if s.pluginhost != nil {
+		if err := s.pluginhost.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if s.llmgw != nil {
+		if err := s.llmgw.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if s.appstore != nil {
+		if err := s.appstore.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Handler returns the root http.Handler wrapped with CORS and Bearer/API-Key authentication.
@@ -636,27 +709,6 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/import/scan-local", s.handleScanLocalCredentials)
 	s.mux.HandleFunc("POST /api/v1/pool/import", s.handleImportCredentials)
 	s.mux.HandleFunc("POST /api/v1/pool/export", s.handleExportVaultBundle)
-
-	// 6. Contributor Invites (Admin)
-	s.mux.HandleFunc("GET /api/v1/contribute/invites", s.handleListInvites)
-	s.mux.HandleFunc("POST /api/v1/contribute/invites", s.handleCreateInvite)
-	s.mux.HandleFunc("DELETE /api/v1/contribute/invites/{code}", s.handleRevokeInvite)
-
-	// 7. Public Guest Contributor Portal (`/api/public/contribute/*` + `/api/v1/contribute/portal/*` aliases)
-	s.mux.HandleFunc("GET /api/public/contribute/{code}", s.handleGetPublicInvite)
-	s.mux.HandleFunc("GET /api/v1/contribute/portal/{code}", s.handleGetPublicInvite)
-	s.mux.HandleFunc("POST /api/public/contribute/{code}/start", s.handleStartContribution)
-	s.mux.HandleFunc("POST /api/v1/contribute/portal/{code}/start", s.handleStartContribution)
-	s.mux.HandleFunc("POST /api/public/contribute/{code}/complete", s.handleCompleteContribution)
-	s.mux.HandleFunc("POST /api/public/contribute/{code}/import", s.handleCompleteContribution)
-	s.mux.HandleFunc("POST /api/v1/contribute/portal/{code}/complete", s.handleCompleteContribution)
-
-	s.mux.HandleFunc("GET /api/public/contribute/manage/{receiptToken}", s.handleGetContributionStatus)
-	s.mux.HandleFunc("GET /api/v1/contribute/manage/{receiptToken}", s.handleGetContributionStatus)
-	s.mux.HandleFunc("PATCH /api/public/contribute/manage/{receiptToken}", s.handleUpdateContributionGuardrails)
-	s.mux.HandleFunc("PATCH /api/v1/contribute/manage/{receiptToken}", s.handleUpdateContributionGuardrails)
-	s.mux.HandleFunc("POST /api/public/contribute/manage/{receiptToken}/revoke", s.handleRevokeContribution)
-	s.mux.HandleFunc("POST /api/v1/contribute/manage/{receiptToken}/revoke", s.handleRevokeContribution)
 
 	// 8. Runtime Sessions, Execution & Virtual Notebook Cells
 	s.mux.HandleFunc("GET /api/v1/sessions", s.handleListSessions)
@@ -717,6 +769,13 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("/mcp", mcpHandler)
 	s.mux.Handle("/mcp/", mcpHandler)
 
+	// 12b. v1.1 Private AI Chat & `/v1` + Ollama Gateway, 1-Click AI App Store & Checkpoints
+	RegisterV11LLMRoutes(s.mux, s.llmgw)
+	RegisterV11AppsAndCheckpointRoutes(s.mux, s.appstore, s.checkpoint, s.st, s.pool, s.runtime, s.isCloudMode())
+
+	// 12c. Plugin Platform v2 Host SDK (`/sdk/v1/*`): Asset Vault, Capability Bus, Media Orchestrator & UI Sandbox
+	RegisterPluginPlatformV2Routes(s.mux, s.pluginhost, s.appstore)
+
 	// 13. Real-Time Telemetry WebSocket (`/ws/events`)
 	s.mux.HandleFunc("GET /ws/events", s.handleWSEvents)
 
@@ -750,23 +809,140 @@ func isAllowedLoopbackHost(rawHost string) bool {
 	return false
 }
 
-func isAllowedLoopbackOrigin(origin string) bool {
-	trimmed := strings.TrimSpace(origin)
-	if trimmed == "" {
-		return true
+func parseLoopbackHostAndPort(rawHost string, defaultPort int) (host string, port int, ok bool) {
+	h := strings.TrimSpace(rawHost)
+	if h == "" {
+		return "", 0, false
 	}
-	u, err := url.Parse(trimmed)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+	var portStr string
+	if parsedHost, parsedPort, err := net.SplitHostPort(h); err == nil {
+		host = parsedHost
+		portStr = parsedPort
+	} else if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		host = strings.Trim(h, "[]")
+	} else if ip := net.ParseIP(h); ip != nil {
+		host = h
+	} else if !strings.Contains(h, ":") {
+		host = h
+	} else {
+		return "", 0, false
+	}
+
+	host = strings.Trim(host, "[]")
+	if !strings.EqualFold(host, "localhost") {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return "", 0, false
+		}
+	}
+
+	if portStr == "" {
+		if defaultPort < 1 || defaultPort > 65535 {
+			return "", 0, false
+		}
+		return host, defaultPort, true
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil || p < 1 || p > 65535 {
+		return "", 0, false
+	}
+	return host, p, true
+}
+
+func isSameOriginLoopbackWithDefaultPort(origin, reqHost string, reqDefaultPort int) bool {
+	trimmedOrigin := strings.TrimSpace(origin)
+	if trimmedOrigin == "" {
 		return false
 	}
-	h := u.Hostname()
-	if strings.EqualFold(h, "localhost") {
+	u, err := url.Parse(trimmedOrigin)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return false
+	}
+	var originDefaultPort int
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		originDefaultPort = 80
+	case "https":
+		originDefaultPort = 443
+	default:
+		return false
+	}
+	_, originPort, okOrigin := parseLoopbackHostAndPort(u.Host, originDefaultPort)
+	if !okOrigin {
+		return false
+	}
+	_, reqPort, okReq := parseLoopbackHostAndPort(reqHost, reqDefaultPort)
+	if !okReq {
+		return false
+	}
+	return originPort == reqPort
+}
+
+// isSameOriginLoopback verifies that origin is a valid http/https loopback Origin whose
+// effective port matches reqHost's effective port so untrusted apps on other loopback ports
+// (e.g. a local Studio on 127.0.0.1:8188) cannot call or open WebSockets to the keyless daemon.
+func isSameOriginLoopback(origin, reqHost string) bool {
+	return isSameOriginLoopbackWithDefaultPort(origin, reqHost, 80)
+}
+
+func isSameOriginLoopbackForRequest(origin string, r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	defPort := 80
+	if r.TLS != nil {
+		defPort = 443
+	}
+	return isSameOriginLoopbackWithDefaultPort(origin, r.Host, defPort)
+}
+
+func isStateChangingHTTPMethod(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
 		return true
 	}
-	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+}
+
+// isTrustedLocalLLMClientOrigin permits local desktop AI clients (Cherry Studio, Chatbox, Jan,
+// SillyTavern, Open WebUI, LobeChat, Cursor, VS Code webviews, browser extensions) on standard
+// local LLM wire endpoints while still blocking arbitrary public internet origins.
+func isTrustedLocalLLMClientOrigin(origin string) bool {
+	trimmed := strings.TrimSpace(origin)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if lower == "null" {
 		return true
 	}
-	return false
+	for _, prefix := range []string{
+		"file://",
+		"app://",
+		"tauri://",
+		"vscode-webview://",
+		"vscode-file://",
+		"chrome-extension://",
+		"moz-extension://",
+		"safari-web-extension://",
+		"capacitor://",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if u.Path != "" && u.Path != "/" {
+		return false
+	}
+	return isAllowedLoopbackHost(u.Host)
 }
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
@@ -777,13 +953,44 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 				writeJSONError(w, http.StatusForbidden, "forbidden: non-loopback Host header blocked in keyless local mode")
 				return
 			}
-			if origin != "" && !isAllowedLoopbackOrigin(origin) {
-				writeJSONError(w, http.StatusForbidden, "forbidden: cross-origin request blocked in keyless local mode")
-				return
-			}
-			if origin != "" {
+			secFetchSite := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
+			if isLocalKeylessLLMProtocolRoute(r.URL.Path) {
+				// Standard OpenAI/Anthropic/Ollama wire routes allow local desktop & loopback AI clients
+				// (Cherry Studio Electron, SillyTavern, Open WebUI, Cursor, browser extensions) while
+				// still blocking public internet websites from calling localhost GPUs.
+				if origin != "" {
+					if !isTrustedLocalLLMClientOrigin(origin) {
+						writeJSONError(w, http.StatusForbidden, "forbidden: untrusted external origin blocked on local LLM gateway")
+						return
+					}
+					if strings.EqualFold(origin, "null") {
+						w.Header().Set("Access-Control-Allow-Origin", "*")
+					} else {
+						w.Header().Set("Access-Control-Allow-Origin", origin)
+						w.Header().Add("Vary", "Origin")
+					}
+				}
+			} else if strings.HasPrefix(r.URL.Path, "/sdk/v1/") && origin != "" && s.pluginhost != nil && s.pluginhost.Sandbox().IsRegisteredOrigin(origin) {
+				// Sandboxed third-party UI plugins run on their own isolated loopback origin (`127.a.b.c:<port>`)
+				// and MUST present a valid scoped `ch_plug_...` token in `withAuth`!
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Add("Vary", "Origin")
+			} else {
+				if secFetchSite == "cross-site" && isStateChangingHTTPMethod(r.Method) {
+					writeJSONError(w, http.StatusForbidden, "forbidden: cross-site state-changing request blocked in keyless local mode")
+					return
+				}
+				if origin != "" {
+					if !isSameOriginLoopbackForRequest(origin, r) {
+						writeJSONError(w, http.StatusForbidden, "forbidden: cross-origin or cross-port request blocked in keyless local mode")
+						return
+					}
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Add("Vary", "Origin")
+				} else if secFetchSite == "same-site" && isStateChangingHTTPMethod(r.Method) {
+					writeJSONError(w, http.StatusForbidden, "forbidden: cross-port state-changing request without same-origin header blocked in keyless local mode")
+					return
+				}
 			}
 		} else {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -792,7 +999,7 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set(
 			"Access-Control-Allow-Headers",
-			"Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID, X-ColabHive-Key, X-ColabHive-Session-Id, X-ColabHive-Strategy, X-ColabHive-Account",
+			"Authorization, Content-Type, Accept, x-api-key, anthropic-version, anthropic-dangerous-direct-browser-access, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID, X-ColabHive-Key, X-ColabHive-Plugin-Token, X-ColabHive-Session-Id, X-ColabHive-Strategy, X-ColabHive-Account",
 		)
 		w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version")
 
@@ -805,14 +1012,16 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 }
 
 func isPublicPortalRateLimitedPath(p string) bool {
-	return strings.HasPrefix(p, "/api/public/contribute/") ||
-		p == "/api/public/contribute" ||
-		strings.HasPrefix(p, "/api/v1/contribute/portal/") ||
-		strings.HasPrefix(p, "/api/v1/contribute/manage/")
+	return strings.HasPrefix(p, "/api/public/")
 }
 
 func isProtectedControlPlanePath(p string) bool {
 	return strings.HasPrefix(p, "/api/") ||
+		strings.HasPrefix(p, "/sdk/") ||
+		strings.HasPrefix(p, "/v1/") ||
+		p == "/v1" ||
+		strings.HasPrefix(p, "/apps/proxy/") ||
+		p == "/apps/proxy" ||
 		p == "/ws/events" ||
 		p == "/mcp" ||
 		strings.HasPrefix(p, "/mcp/")
@@ -824,10 +1033,7 @@ func isPublicUnauthenticatedPath(p string) bool {
 	}
 	switch {
 	case p == "/api/v1/health",
-		p == "/api/v1/hardware",
-		strings.HasPrefix(p, "/api/public/"),
-		strings.HasPrefix(p, "/api/v1/contribute/portal/"),
-		strings.HasPrefix(p, "/api/v1/contribute/manage/"):
+		p == "/api/v1/hardware":
 		return true
 	default:
 		return false
@@ -922,9 +1128,32 @@ func (s *Server) verifyArtifactSignature(sessID, fileName string, q url.Values) 
 	return hmac.Equal(providedSig, expectedSig)
 }
 
+// isLocalKeylessLLMProtocolRoute matches standard OpenAI/Anthropic/Ollama wire endpoints where
+// third-party SDKs (Cursor, Cherry Studio, Claude Code, OpenAI/Anthropic SDKs) always send a
+// placeholder API key such as "ollama" or "sk-local" when talking to keyless localhost gateways.
+func isLocalKeylessLLMProtocolRoute(p string) bool {
+	clean := strings.TrimRight(p, "/")
+	switch {
+	case clean == "/v1/models" || strings.HasPrefix(clean, "/v1/models/"),
+		clean == "/v1/chat/completions",
+		clean == "/v1/responses",
+		clean == "/v1/messages" || strings.HasPrefix(clean, "/v1/messages/"),
+		clean == "/api/tags",
+		clean == "/api/ps",
+		clean == "/api/show",
+		clean == "/api/version",
+		clean == "/api/chat",
+		clean == "/api/generate":
+		return true
+	default:
+		return false
+	}
+}
+
 // isAgentKeyAllowedRoute enforces strict least-privilege separation for scoped `ch_sk_...` keys.
-// Scoped agent keys may ONLY invoke MCP, read quota/health/hardware, mint WS tickets, execute code, and manage
-// their own runtime sessions/experiments/artifacts — NEVER admin/account/vault/proxy/key/policy/injector/desktop routes.
+// Scoped agent keys may ONLY invoke MCP, read quota/health/hardware, read-only LLM model discovery,
+// mint WS tickets, execute code, and manage their own runtime sessions/experiments/artifacts —
+// NEVER LLM inference/unload, admin/account/vault/proxy/key/policy/injector/desktop routes.
 func isAgentKeyAllowedRoute(p string) bool {
 	clean := strings.TrimRight(p, "/")
 	if clean == "" {
@@ -949,6 +1178,12 @@ func isAgentKeyAllowedRoute(p string) bool {
 	case clean == "/api/v1/experiments" || strings.HasPrefix(clean, "/api/v1/experiments/"):
 		return true
 	case strings.HasPrefix(clean, "/api/v1/artifacts/"):
+		return true
+	case clean == "/v1/models" || strings.HasPrefix(clean, "/v1/models/"),
+		clean == "/api/tags",
+		clean == "/api/version",
+		clean == "/api/v1/llm/catalog",
+		clean == "/api/v1/llm/status":
 		return true
 	default:
 		return false
@@ -976,6 +1211,8 @@ func extractRequestToken(r *http.Request) string {
 		}
 	} else if xk := strings.TrimSpace(r.Header.Get("X-ColabHive-Key")); xk != "" {
 		raw = xk
+	} else if ak := strings.TrimSpace(r.Header.Get("x-api-key")); ak != "" {
+		raw = ak
 	} else if qTok := strings.TrimSpace(r.URL.Query().Get("token")); qTok != "" {
 		raw = qTok
 	} else if qKey := strings.TrimSpace(r.URL.Query().Get("key")); qKey != "" {
@@ -1223,6 +1460,31 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			return
 		}
 
+		// 2b. Scoped `ch_plug_...` isolated UI plugin sandbox tokens — strictly confined to `/sdk/v1/*`.
+		if plugTok := extractPluginToken(r); plugTok != "" {
+			if !strings.HasPrefix(r.URL.Path, "/sdk/v1/") {
+				writeJSONError(w, http.StatusForbidden, "forbidden: plugin sandbox token is restricted to /sdk/v1/*")
+				return
+			}
+			if s.pluginhost == nil {
+				writeJSONError(w, http.StatusServiceUnavailable, "plugin host unavailable")
+				return
+			}
+			ps, ok := s.pluginhost.Sandbox().AuthenticateToken(plugTok, r.Header.Get("Origin"), "")
+			if !ok {
+				s.authFailLimiter.record(ip)
+				writeJSONError(w, http.StatusUnauthorized, "unauthorized: invalid plugin sandbox token or mismatched origin")
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(withPluginSandbox(r.Context(), ps)))
+			return
+		}
+		// Reject requests originating from an isolated UI plugin sandbox if they omit their scoped token.
+		if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && s.pluginhost != nil && s.pluginhost.Sandbox().IsRegisteredOrigin(origin) {
+			writeJSONError(w, http.StatusUnauthorized, "unauthorized: sandboxed UI plugin must provide X-ColabHive-Plugin-Token")
+			return
+		}
+
 		// 2. Scoped `ch_sk_...` Agent API keys are strictly confined to runtime/MCP/read-quota routes.
 		if strings.HasPrefix(tok, "ch_sk_") {
 			if s.router == nil {
@@ -1246,7 +1508,15 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			return
 		}
 
-		// 3. Reject unrecognized non-empty tokens even in local mode, and require auth in cloud/protected mode.
+		// 3. In keyless local loopback mode, standard OpenAI/Anthropic/Ollama SDKs require non-empty
+		//    placeholder keys (e.g. `x-api-key: ollama` or `Bearer sk-local`). Accept non-`ch_sk_`
+		//    placeholders ONLY on standard LLM protocol routes when auth is disabled; everywhere else
+		//    (and always in cloud/protected mode), reject unrecognized tokens with 401!
+		if !s.isAuthRequired() && isLocalKeylessLLMProtocolRoute(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		if tok != "" || s.isAuthRequired() {
 			s.authFailLimiter.record(ip)
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized: valid admin token or ch_sk_... API key required")
@@ -1301,7 +1571,18 @@ func (s *Server) handleWSEvents(w http.ResponseWriter, r *http.Request) {
 		WriteBufferSize: 16384,
 		CheckOrigin: func(req *http.Request) bool {
 			if !s.isAuthRequired() {
-				return isAllowedLoopbackHost(req.Host) && isAllowedLoopbackOrigin(req.Header.Get("Origin"))
+				if !isAllowedLoopbackHost(req.Host) {
+					return false
+				}
+				origin := strings.TrimSpace(req.Header.Get("Origin"))
+				if origin != "" {
+					return isSameOriginLoopbackForRequest(origin, req)
+				}
+				secFetchSite := strings.ToLower(strings.TrimSpace(req.Header.Get("Sec-Fetch-Site")))
+				if secFetchSite == "cross-site" || secFetchSite == "same-site" {
+					return false
+				}
+				return true
 			}
 			return true
 		},
@@ -1335,19 +1616,20 @@ func (s *Server) handleWSEvents(w http.ResponseWriter, r *http.Request) {
 		return conn.WriteJSON(ev)
 	}
 
-	// Emit immediate initial heartbeat so UI measures RTT right on connect.
-	_ = sendEvent(models.WSEvent{
-		Type:      models.WSEventHeartbeat,
-		Timestamp: time.Now().UTC(),
-		Payload:   map[string]any{"status": "connected", "version": s.cfg.Version},
-	})
-
 	var subCh <-chan models.WSEvent
 	var unsub func()
 	if s.hub != nil {
 		subCh, unsub = s.hub.Subscribe(ctx)
 		defer unsub()
 	}
+
+	// Emit immediate initial heartbeat AFTER subscribing so clients that publish or rely on
+	// live events upon seeing the connected heartbeat never hit a subscribe-after-send race.
+	_ = sendEvent(models.WSEvent{
+		Type:      models.WSEventHeartbeat,
+		Timestamp: time.Now().UTC(),
+		Payload:   map[string]any{"status": "connected", "version": s.cfg.Version},
+	})
 
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -1422,6 +1704,28 @@ func (s *Server) handleWSEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func isStaticAssetRequestPath(urlPath string) bool {
+	p := strings.ToLower(strings.TrimSpace(urlPath))
+	if strings.HasPrefix(p, "/assets/") {
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(p)) {
+	case ".js", ".mjs", ".cjs", ".css", ".map", ".wasm",
+		".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+		".woff", ".woff2", ".ttf", ".eot", ".otf",
+		".json", ".webmanifest", ".txt", ".xml":
+		return true
+	default:
+		return false
+	}
+}
+
+func setNoCacheHTMLHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+}
+
 func (s *Server) handleSPAOrNotFound(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/api/") {
 		writeJSONError(w, http.StatusNotFound, "API endpoint not found: "+r.URL.Path)
@@ -1445,14 +1749,26 @@ func (s *Server) handleSPAOrNotFound(w http.ResponseWriter, r *http.Request) {
 	if cleanRel != "." && cleanRel != "" && !strings.Contains(cleanRel, "..") {
 		candidate := filepath.Join(webDir, cleanRel)
 		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			if strings.EqualFold(filepath.Base(candidate), "index.html") {
+				setNoCacheHTMLHeaders(w)
+			} else if strings.HasPrefix(strings.ToLower(r.URL.Path), "/assets/") {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			}
 			http.ServeFile(w, r, candidate)
+			return
+		}
+		// Never fall back to index.html for missing JS/CSS/font/image assets: returning text/html
+		// for a stale hashed ES module breaks WebView2/browser dynamic imports with a white screen!
+		if isStaticAssetRequestPath(r.URL.Path) {
+			http.NotFound(w, r)
 			return
 		}
 	}
 
-	// SPA Fallback for `/`, `/pool`, `/exp`, `/exp/:id`, `/router`, `/cfg`, `/contribute/*`, `/c/*`
+	// SPA Fallback for `/`, `/apps`, `/savings`, `/pool`, `/exp`, `/router`, `/cfg`, `/contribute/*`, `/tray`
 	indexPath := filepath.Join(webDir, "index.html")
 	if _, err := os.Stat(indexPath); err == nil {
+		setNoCacheHTMLHeaders(w)
 		http.ServeFile(w, r, indexPath)
 		return
 	}

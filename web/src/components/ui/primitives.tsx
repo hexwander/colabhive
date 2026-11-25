@@ -541,7 +541,9 @@ export function SegmentedTabs<T extends string = string>({
             )}
             <span className="truncate">{item.label}</span>
             {item.count != null && (
-              <span className="ch-num text-[10.5px] text-fg-muted">{item.count}</span>
+              <span className="ml-0.5 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1.5 rounded-full bg-surface-1 text-[10.5px] font-semibold text-fg-muted ch-num leading-none shrink-0">
+                {item.count}
+              </span>
             )}
             {item.badge}
           </button>

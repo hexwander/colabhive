@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,7 +71,6 @@ type srvMemStore struct {
 	mu          sync.RWMutex
 	accounts    map[string]*models.Account
 	proxies     map[string]*models.ProxyConfig
-	invites     map[string]*models.ContributorInvite
 	sessions    map[string]*models.RuntimeSession
 	experiments map[string]*models.Experiment
 	keys        map[string]*models.AgentAPIKey
@@ -82,7 +83,6 @@ func newSrvMemStore() *srvMemStore {
 	return &srvMemStore{
 		accounts:    make(map[string]*models.Account),
 		proxies:     make(map[string]*models.ProxyConfig),
-		invites:     make(map[string]*models.ContributorInvite),
 		sessions:    make(map[string]*models.RuntimeSession),
 		experiments: make(map[string]*models.Experiment),
 		keys:        make(map[string]*models.AgentAPIKey),
@@ -165,38 +165,6 @@ func (s *srvMemStore) ListProxies(_ context.Context) ([]*models.ProxyConfig, err
 func (s *srvMemStore) DeleteProxy(_ context.Context, id string) error {
 	s.mu.Lock()
 	delete(s.proxies, id)
-	s.mu.Unlock()
-	return nil
-}
-func (s *srvMemStore) SaveInvite(_ context.Context, inv *models.ContributorInvite) error {
-	s.mu.Lock()
-	cp := *inv
-	s.invites[inv.Code] = &cp
-	s.mu.Unlock()
-	return nil
-}
-func (s *srvMemStore) GetInvite(_ context.Context, code string) (*models.ContributorInvite, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if inv, ok := s.invites[code]; ok {
-		cp := *inv
-		return &cp, nil
-	}
-	return nil, nil
-}
-func (s *srvMemStore) ListInvites(_ context.Context) ([]*models.ContributorInvite, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var out []*models.ContributorInvite
-	for _, inv := range s.invites {
-		cp := *inv
-		out = append(out, &cp)
-	}
-	return out, nil
-}
-func (s *srvMemStore) DeleteInvite(_ context.Context, code string) error {
-	s.mu.Lock()
-	delete(s.invites, code)
 	s.mu.Unlock()
 	return nil
 }
@@ -430,15 +398,8 @@ func TestServerRESTWebSocketSPAAndDaemonCLI(t *testing.T) {
 		t.Fatalf("unexpected demo QuotaSummary: %+v", sum)
 	}
 
-	// 2. Public Contributor Portal (`/api/public/contribute/ch_inv_demo2026`)
-	respInv, err := http.Get(ts.URL + "/api/public/contribute/ch_inv_demo2026")
-	if err != nil || respInv.StatusCode != 200 {
-		t.Fatalf("public invite failed: err=%v", err)
-	}
-	_ = respInv.Body.Close()
-
-	// 3. SPA fallback for `/pool`, `/exp`, `/router`, `/cfg`, `/contribute/ch_inv_demo2026`
-	for _, route := range []string{"/", "/pool", "/exp", "/router", "/cfg", "/contribute/ch_inv_demo2026"} {
+	// 2. SPA fallback for `/`, `/pool`, `/exp`, `/router`, `/cfg`
+	for _, route := range []string{"/", "/pool", "/exp", "/router", "/cfg"} {
 		r, gErr := http.Get(ts.URL + route)
 		if gErr != nil || r.StatusCode != 200 {
 			t.Fatalf("SPA fallback failed for %s: err=%v", route, gErr)
@@ -1453,22 +1414,6 @@ func TestCloudModeSecurityPrivilegeSeparationTrustProxyRateLimitAndLocalConnectC
 		t.Fatalf("expected independent IP 203.0.113.99 to succeed (200), got %d", otherIPResp.StatusCode)
 	}
 
-	// Public Contributor Portal rate limit (`PortalRateLimitPerMin: 3`)
-	for i := 1; i <= 3; i++ {
-		pResp, _ := doReq(tsTrusted.URL, http.MethodGet, "/api/public/contribute/ch_inv_demo2026", "", "", map[string]string{
-			"X-Forwarded-For": "192.0.2.88",
-		})
-		if pResp.StatusCode != http.StatusOK {
-			t.Fatalf("portal req %d: expected 200, got %d", i, pResp.StatusCode)
-		}
-	}
-	pRateResp, _ := doReq(tsTrusted.URL, http.MethodGet, "/api/public/contribute/ch_inv_demo2026", "", "", map[string]string{
-		"X-Forwarded-For": "192.0.2.88",
-	})
-	if pRateResp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("expected 429 Too Many Requests on public portal burst, got %d", pRateResp.StatusCode)
-	}
-
 	// 6. Laptop-to-Cloud `colabhive connect` & `colabhive disconnect` CLI writes locally against a temp home dir
 	//    WITHOUT hitting the remote server's disabled `/api/v1/agents/inject` endpoint!
 	laptopHome := t.TempDir()
@@ -1771,52 +1716,7 @@ func TestArtifactTraversalRESTHostFSPortalInviteWSTicketOriginAndInjectorTOML(t 
 		t.Fatalf("expected 403 Forbidden when KeyB inspects KeyA's experiment, got %d", bGetExpResp.StatusCode)
 	}
 
-	// 3. [P0-4 / P0-3] Public Contributor `/complete` & `/import` Invite Validation & Owner Account Protection!
-	pastTime := time.Now().UTC().Add(-1 * time.Hour)
-	_ = st.SaveInvite(ctx, &models.ContributorInvite{
-		Code:      "ch_inv_revoked",
-		PoolTitle: "Revoked Invite",
-		Revoked:   true,
-		CreatedAt: time.Now().UTC(),
-	})
-	_ = st.SaveInvite(ctx, &models.ContributorInvite{
-		Code:      "ch_inv_expired",
-		PoolTitle: "Expired Invite",
-		ExpiresAt: &pastTime,
-		CreatedAt: time.Now().UTC().Add(-2 * time.Hour),
-	})
-	_ = st.SaveInvite(ctx, &models.ContributorInvite{
-		Code:      "ch_inv_exhausted",
-		PoolTitle: "Exhausted Invite",
-		MaxUses:   2,
-		UsedCount: 2,
-		CreatedAt: time.Now().UTC(),
-	})
-
-	ownerBefore, _ := st.GetAccountByEmail(ctx, "lab-ultra-01@colabhive.dev")
-	attackCredPayload := `{"credential":{"email":"lab-ultra-01@colabhive.dev","client_id":"764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com","client_secret":"d-FL95Q19q7MQmFpd7hHD0Ty","refresh_token":"1//evil_attacker_token"}}`
-
-	respMissingInv, _ := rawReq(tsCloud.URL, http.MethodPost, "/api/public/contribute/ch_inv_does_not_exist/complete", "", attackCredPayload, nil)
-	if respMissingInv.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected 404 on fake contributor invite code, got %d", respMissingInv.StatusCode)
-	}
-	for _, deadCode := range []string{"ch_inv_revoked", "ch_inv_expired", "ch_inv_exhausted"} {
-		rDead, rawDead := rawReq(tsCloud.URL, http.MethodPost, "/api/public/contribute/"+deadCode+"/complete", "", attackCredPayload, nil)
-		if rDead.StatusCode != http.StatusGone && rDead.StatusCode != http.StatusNotFound {
-			t.Fatalf("expected 410/404 on inactive invite %s, got %d: %s", deadCode, rDead.StatusCode, rawDead)
-		}
-	}
-	// Even on an active invite (`ch_inv_demo2026`), attempting to overwrite an existing owner account MUST be rejected!
-	respOverwriteOwner, rawOverwrite := rawReq(tsCloud.URL, http.MethodPost, "/api/public/contribute/ch_inv_demo2026/complete", "", attackCredPayload, nil)
-	if respOverwriteOwner.StatusCode == http.StatusOK {
-		t.Fatalf("CRITICAL: public /complete allowed overwriting owner account: %s", rawOverwrite)
-	}
-	ownerAfter, _ := st.GetAccountByEmail(ctx, "lab-ultra-01@colabhive.dev")
-	if ownerBefore != nil && ownerAfter != nil && ownerAfter.IsContributor {
-		t.Fatalf("CRITICAL: owner account IsContributor mutated to true!")
-	}
-
-	// 4. [P1-17] Single-Use 60s WebSocket Ticket (`POST /api/v1/ws-ticket` -> `/ws/events?ticket=...`)!
+	// 3. [P1-17] Single-Use 60s WebSocket Ticket (`POST /api/v1/ws-ticket` -> `/ws/events?ticket=...`)!
 	unauthTicketResp, _ := rawReq(tsCloud.URL, http.MethodPost, "/api/v1/ws-ticket", "", `{}`, map[string]string{
 		"X-Forwarded-For": "198.51.100.12",
 	})
@@ -1893,12 +1793,21 @@ func TestArtifactTraversalRESTHostFSPortalInviteWSTicketOriginAndInjectorTOML(t 
 	if evilCORS.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden on cross-origin drive-by request in keyless local mode, got %d", evilCORS.StatusCode)
 	}
-	loopCORS, _ := rawReq(tsLocal.URL, http.MethodGet, "/api/v1/health", "", "", map[string]string{
+	crossPortCORS, _ := rawReq(tsLocal.URL, http.MethodGet, "/api/v1/health", "", "", map[string]string{
 		"Origin": "http://localhost:5173",
 	})
-	if loopCORS.StatusCode != http.StatusOK || loopCORS.Header.Get("Access-Control-Allow-Origin") != "http://localhost:5173" {
-		t.Fatalf("expected loopback Origin http://localhost:5173 allowed, got status=%d hdr=%q",
-			loopCORS.StatusCode, loopCORS.Header.Get("Access-Control-Allow-Origin"))
+	if crossPortCORS.StatusCode != http.StatusForbidden || crossPortCORS.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("expected cross-port loopback Origin http://localhost:5173 blocked with 403 and no ACAO, got status=%d hdr=%q",
+			crossPortCORS.StatusCode, crossPortCORS.Header.Get("Access-Control-Allow-Origin"))
+	}
+	parsedLocalURL, _ := url.Parse(tsLocal.URL)
+	samePortOrigin := "http://localhost:" + parsedLocalURL.Port()
+	loopCORS, _ := rawReq(tsLocal.URL, http.MethodGet, "/api/v1/health", "", "", map[string]string{
+		"Origin": samePortOrigin,
+	})
+	if loopCORS.StatusCode != http.StatusOK || loopCORS.Header.Get("Access-Control-Allow-Origin") != samePortOrigin {
+		t.Fatalf("expected same-port loopback Origin %s allowed, got status=%d hdr=%q",
+			samePortOrigin, loopCORS.StatusCode, loopCORS.Header.Get("Access-Control-Allow-Origin"))
 	}
 
 	evilWSHdr := http.Header{}
@@ -2046,5 +1955,75 @@ url = "http://127.0.0.1:9999/mcp"
 	_ = rebindResp.Body.Close()
 	if rebindResp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden on DNS rebinding Host header in keyless local mode, got %d", rebindResp.StatusCode)
+	}
+}
+
+func TestSPAIndexNoCacheAndMissingAssets404(t *testing.T) {
+	webDir := t.TempDir()
+	assetsDir := filepath.Join(webDir, "assets")
+	if err := os.MkdirAll(assetsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte("<!doctype html><div id='root'></div>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(assetsDir, "app-CURRENT.js"), []byte("console.log('ok');"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st := newSrvMemStore()
+	hub := newSrvTestHub()
+	rtr := router.NewService(st, nil, hub)
+	eng := runtime.NewConcreteEngine(st, nil, rtr, hub, runtime.Options{
+		DemoMode:               true,
+		ArtifactsDir:           t.TempDir(),
+		DisableBackgroundLoops: true,
+	})
+	defer eng.Close()
+
+	srv := New(st, nil, eng, rtr, hub, mcp.NewServer(nil, eng, rtr, hub), Config{
+		Mode:         "local",
+		WebDir:       webDir,
+		ArtifactsDir: t.TempDir(),
+		DemoMode:     true,
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Root & SPA route return index.html with strict no-store cache headers (preventing stale WebView2 white screen).
+	for _, route := range []string{"/", "/apps", "/pool"} {
+		resp, err := http.Get(ts.URL + route)
+		if err != nil {
+			t.Fatalf("GET %s: %v", route, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "id='root'") {
+			t.Fatalf("GET %s expected index.html 200, got %d %q", route, resp.StatusCode, string(body))
+		}
+		if cc := resp.Header.Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+			t.Fatalf("GET %s expected Cache-Control no-store on index.html, got %q", route, cc)
+		}
+	}
+
+	// 2. Existing hashed asset returns 200 with immutable cache header.
+	okAsset, err := http.Get(ts.URL + "/assets/app-CURRENT.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = okAsset.Body.Close()
+	if okAsset.StatusCode != http.StatusOK || !strings.Contains(okAsset.Header.Get("Cache-Control"), "immutable") {
+		t.Fatalf("expected 200 immutable for existing asset, got %d cc=%q", okAsset.StatusCode, okAsset.Header.Get("Cache-Control"))
+	}
+
+	// 3. Stale/missing hashed JS asset MUST return 404 (NEVER index.html text/html!).
+	missingAsset, err := http.Get(ts.URL + "/assets/app-OLDSTALE.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingBody, _ := io.ReadAll(missingAsset.Body)
+	_ = missingAsset.Body.Close()
+	if missingAsset.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for missing /assets/app-OLDSTALE.js, got %d body=%q", missingAsset.StatusCode, string(missingBody))
 	}
 }

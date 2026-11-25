@@ -12,7 +12,7 @@ import {
   FileJson,
   Flame,
   FolderSearch,
-  HeartHandshake,
+  Gift,
   Info,
   Loader2,
   Lock,
@@ -22,6 +22,7 @@ import {
   SearchX,
   Settings2,
   ShieldCheck,
+  Sparkles,
   Terminal,
   Trash2,
   Upload,
@@ -34,29 +35,30 @@ import type {
   Account,
   AccountVerifyResult,
   ContributorGuardrails,
-  ContributorInvite,
   DiscoveredLocalCredential,
   GPUEntitlementStatus,
   ImportConflictStrategy,
   OAuthPendingSession,
   ProxyConfig,
   ProxyProbeResult,
+  RouterPolicy,
   SubscriptionTier,
   SystemSelfTestResult,
   VerifyStepResult,
 } from '../types';
 import { ALL_ACCELERATORS } from '../types';
-import { api, APIError, formatCU, formatHours } from '../lib/api';
+import { api, formatCU, formatHours } from '../lib/api';
 import { useI18n } from '../i18n';
 import {
   AccountHealthBadge,
   CopyButton,
-  DEMO_INVITES,
   DEMO_PROXIES,
   formatRelativeCountdown,
   HardwareTierBadge,
+  PlatformProviderBadge,
   SubscriptionTierBadge,
 } from '../components/layout/telemetryUi';
+import { DEMO_ROUTER_POLICY } from '../components/terminal/workbenchMockData';
 import {
   ActionButton,
   AnimatedNumber,
@@ -151,6 +153,31 @@ function defaultCycleCuForTier(tier: SubscriptionTier): number {
 
 /** Dual-segment quota geometry shared by the list rows and the drawer. */
 function computeQuota(account: Account) {
+  const hasIssue =
+    account.health === 'AUTH_EXPIRED' ||
+    account.health === 'PROXY_ERROR' ||
+    account.health === 'QUARANTINED_DENYLIST';
+
+  if (account.subscription_tier === 'FREE' && account.paid_cu_balance <= 0) {
+    const freeCu = Math.max(0, account.free_quota?.remaining_free_cu ?? 0);
+    const pct = Math.min(100, (freeCu / 15) * 100);
+    return {
+      isColabFreeOnly: true,
+      reserveCu: 0,
+      cycleTotalCu: 15,
+      cycleMax: 15,
+      schedulableCu: freeCu,
+      reservePct: 0,
+      schedulablePct: pct,
+      remainingPct: pct,
+      ringValue: pct,
+      ringTone: (hasIssue ? 'coral' : 'sky') as QuotaRingTone,
+      barTone: (hasIssue ? 'coral' : 'sky') as 'emerald' | 'coral' | 'amber' | 'sky',
+      barValue: pct,
+      g4Hours: freeCu / 1.96,
+    };
+  }
+
   const reserveCu = Math.max(0, account.guardrails?.min_reserve_cu || 0);
   const baseCycleCu =
     account.reference_cycle_cu > 0
@@ -164,11 +191,6 @@ function computeQuota(account: Account) {
   const remainingPct = Math.min(100, (account.paid_cu_balance / cycleMax) * 100);
   const ringValue = account.is_contributor ? schedulablePct : remainingPct;
   const g4Rate = account.gpu_entitlements?.G4?.calibrated_burn_rate || 9.66;
-
-  const hasIssue =
-    account.health === 'AUTH_EXPIRED' ||
-    account.health === 'PROXY_ERROR' ||
-    account.health === 'QUARANTINED_DENYLIST';
 
   let ringTone: QuotaRingTone = 'emerald';
   let barTone: 'emerald' | 'coral' | 'amber' | 'sky' = 'emerald';
@@ -188,6 +210,7 @@ function computeQuota(account: Account) {
   }
 
   return {
+    isColabFreeOnly: false,
     reserveCu,
     cycleTotalCu,
     cycleMax,
@@ -494,12 +517,14 @@ export function AccountPoolPage({
 
   // Active overlays
   const [oauthWizardOpen, setOauthWizardOpen] = useState(false);
+  const [routerPolicy, setRouterPolicy] = useState<RouterPolicy>(DEMO_ROUTER_POLICY);
+  const [policyLoaded, setPolicyLoaded] = useState<boolean>(false);
+  const [togglingFreeFirst, setTogglingFreeFirst] = useState(false);
   const [transferHubOpen, setTransferHubOpen] = useState(false);
   const [transferInitialTab, setTransferInitialTab] = useState<TransferTab>('scan');
   const [transferInitialVaultMode, setTransferInitialVaultMode] = useState<'export' | 'import'>(
     'export',
   );
-  const [inviteModalOpen, setInviteModalOpen] = useState(false);
   const [selfTestOpen, setSelfTestOpen] = useState(false);
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [focusQuotaSection, setFocusQuotaSection] = useState(false);
@@ -538,25 +563,118 @@ export function AccountPoolPage({
       });
   }, [propProxies]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const syncPolicy = () => {
+      api
+        .getRouterPolicy()
+        .then((pol) => {
+          if (!cancelled && pol) {
+            setRouterPolicy(pol);
+            setPolicyLoaded(true);
+          }
+        })
+        .catch(() => {
+          // Keep Free-First switch disabled until real router policy loads
+        });
+    };
+    syncPolicy();
+    window.addEventListener('colabhive:router-policy-changed', syncPolicy);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('colabhive:router-policy-changed', syncPolicy);
+    };
+  }, []);
+
+  const isFreeFirstActive = routerPolicy.default_strategy === 'free-first';
+
+  const freePoolStats = useMemo(() => {
+    let colabFreeCount = 0;
+    for (const a of accounts) {
+      if (!a.enabled) continue;
+      const prov = (a.provider || 'colab').toLowerCase();
+      if (
+        prov === 'colab' &&
+        ((a.free_quota?.remaining_free_cu ?? 0) > 0 || a.subscription_tier === 'FREE')
+      ) {
+        colabFreeCount += 1;
+      }
+    }
+    return { colabFreeCount };
+  }, [accounts]);
+
+  const handleToggleFreeFirst = useCallback(
+    async (nextOn: boolean) => {
+      if (!policyLoaded) return;
+      const prevPolicy = routerPolicy;
+      const nextStrategy = nextOn ? 'free-first' : 'waste-zero';
+      const nextPolicy: RouterPolicy = {
+        ...routerPolicy,
+        default_strategy: nextStrategy,
+      };
+      setRouterPolicy(nextPolicy);
+      setTogglingFreeFirst(true);
+      try {
+        const saved = await api.updateRouterPolicy(nextPolicy);
+        setRouterPolicy(saved ?? nextPolicy);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('colabhive:router-policy-changed', {
+              detail: { strategy: (saved ?? nextPolicy).default_strategy },
+            }),
+          );
+        }
+        setBanner({
+          kind: 'ok',
+          text: nextOn
+            ? zh
+              ? '已开启「🎁 优先烧免费额度」：Colab 交互任务优先使用池内免费 Colab T4 窗口，零元优先！'
+              : 'Enabled Free-First: interactive Colab sessions prioritize $0 free Colab T4 windows first!'
+            : zh
+              ? '已切换为「防过期优先 (Waste-Zero)」调度策略'
+              : 'Switched to Waste-Zero expiring-quota routing strategy',
+        });
+      } catch (err) {
+        // Revert optimistic toggle back to last confirmed policy on failure
+        setRouterPolicy(prevPolicy);
+        setBanner({
+          kind: 'err',
+          text: zh
+            ? `切换路由策略失败，已恢复原设置：${err instanceof Error ? err.message : String(err)}`
+            : `Failed to update routing policy (reverted): ${err instanceof Error ? err.message : String(err)}`,
+        });
+      } finally {
+        setTogglingFreeFirst(false);
+      }
+    },
+    [policyLoaded, routerPolicy, zh],
+  );
+
+  const colabAccounts = useMemo(
+    () => accounts.filter((a) => !a.provider || String(a.provider) === 'colab'),
+    [accounts],
+  );
+  const activeTabAccounts = colabAccounts;
+
   const allGroups = useMemo(() => {
     const s = new Set<string>();
-    for (const a of accounts) {
+    for (const a of activeTabAccounts) {
       for (const g of a.groups || []) s.add(g);
     }
     return Array.from(s);
-  }, [accounts]);
+  }, [activeTabAccounts]);
 
   const filtered = useMemo(() => {
-    return accounts.filter((a) => {
+    return activeTabAccounts.filter((a) => {
       if (groupFilter !== 'all' && !(a.groups || []).includes(groupFilter)) return false;
       if (search.trim()) {
         const q = search.toLowerCase();
-        const hay = `${a.email} ${a.alias || ''} ${(a.groups || []).join(' ')} ${a.notes || ''}`.toLowerCase();
+        const hay = `${a.email} ${a.alias || ''} ${a.provider || 'colab'} ${(a.groups || []).join(' ')} ${a.notes || ''}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
-  }, [accounts, groupFilter, search]);
+  }, [activeTabAccounts, groupFilter, search]);
 
   const handleRefreshOne = useCallback(
     async (id: string) => {
@@ -631,7 +749,7 @@ export function AccountPoolPage({
     [onAccountsChanged, zh],
   );
 
-  // The three ways to add compute, adapted automatically for Local Desktop vs Cloud Server mode.
+  // The three Colab onboarding ways (external read-only monitors live cleanly in Tab 2).
   const onboardingWays: {
     key: string;
     primary?: boolean;
@@ -667,16 +785,6 @@ export function AccountPoolPage({
             setTransferHubOpen(true);
           },
         },
-        {
-          key: 'invite',
-          tint: 'emerald',
-          icon: <HeartHandshake />,
-          title: zh ? '共享贡献邀请链接 (/contribute/:code)' : 'Shareable Contributor Link (/contribute/:code)',
-          body: zh
-            ? '生成零云盘权限的安全贡献链接，团队成员无需管理员口令即可自助贡献闲置算力'
-            : 'Generate a zero-Drive-access public /contribute/:code link so teammates can self-onboard safely.',
-          onClick: () => setInviteModalOpen(true),
-        },
       ]
     : [
         {
@@ -684,10 +792,10 @@ export function AccountPoolPage({
           primary: true,
           tint: 'accent',
           icon: <Plus />,
-          title: zh ? '添加我的账号' : 'Add My Account',
+          title: zh ? '添加我的 Colab 账号' : 'Add My Colab Account',
           body: zh
-            ? '复制链接登录 Google，粘贴授权码即可（无需填密码）'
-            : 'Copy a Google sign-in link and paste the auth code — no password needed.',
+            ? '走 Google 官方登录粘贴授权码即可（不碰密码，随时可收回）'
+            : 'Sign in with Google OAuth and paste the auth code — no password needed.',
           onClick: () => setOauthWizardOpen(true),
         },
         {
@@ -696,41 +804,35 @@ export function AccountPoolPage({
           icon: <FolderSearch />,
           title: zh ? '导入本机已有登录' : 'Import Local Login',
           body: zh
-            ? '一键扫描本机/WSL2 已登录的 Colab CLI 凭证'
-            : '1-click scan for Colab CLI credentials already signed in on this PC or WSL2.',
+            ? '一键扫描本机 / WSL2 已登录的 Colab CLI 或 Google Cloud 账号'
+            : '1-click scan for Colab CLI or Google Cloud accounts already signed in on this PC.',
           onClick: () => {
             setTransferInitialTab('scan');
             setTransferInitialVaultMode('export');
             setTransferHubOpen(true);
           },
         },
-        {
-          key: 'invite',
-          tint: 'emerald',
-          icon: <HeartHandshake />,
-          title: zh ? '邀请朋友共享算力' : 'Invite Friend to Share',
-          body: zh
-            ? '生成零云盘权限的安全链接，朋友闲置的即将过期算力可安全借给你跑实验'
-            : 'Generate a zero-Drive-access safety link so friends can safely lend idle expiring compute.',
-          onClick: () => setInviteModalOpen(true),
-        },
       ];
 
   return (
     <div className="space-y-5">
       <PageHeader
-        title={t('pool.title')}
+        title={zh ? '账号与算力池' : 'Accounts & Compute Pool'}
         subtitle={
-          isCloudMode
-            ? zh
-              ? '云端多账号算力池管理：支持远程 PKCE 网页授权、AES-256-GCM 加密 .chvault 跨服迁移与团队安全贡献链接'
-              : 'Cloud multi-account pool: remote PKCE browser sign-in, encrypted .chvault migration, and public contributor links.'
-            : zh
-              ? '把你自己的 Google 账号与朋友借出的闲置算力安全汇成一池，全程不碰密码，登录凭证仅加密保存在本机'
-              : 'Safely pool your own Google accounts and idle compute shared by friends — zero passwords, locally encrypted.'
+          zh
+            ? '集中管理多个 Google Colab 免费与 Pro / Ultra 账号，自动统计余额、分配空闲显卡并支持无缝跨账号接力。'
+            : 'Manage your pooled Google Colab Free, Pro, and Ultra accounts with unified quota telemetry and automatic failover.'
         }
         actions={
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <ActionButton
+              variant="primary"
+              size="md"
+              icon={<Plus />}
+              onClick={() => setOauthWizardOpen(true)}
+            >
+              {zh ? '添加 Colab 账号' : 'Add Colab Account'}
+            </ActionButton>
             {isCloudMode && (
               <ActionButton
                 variant="secondary"
@@ -762,54 +864,143 @@ export function AccountPoolPage({
         }
       />
 
-      {/* Guided onboarding: the three ways to add compute */}
-      <LayeredCard padding="sm" staggerIndex={0}>
-        <div className="mb-3 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 px-0.5">
-          <h2 className="text-[13.5px] font-semibold text-fg">
-            {zh ? '3 种方式把算力加进来' : '3 ways to add compute'}
-          </h2>
-          <span className="inline-flex items-center gap-1.5 text-[11.5px] text-fg-muted">
-            <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-[var(--emerald-text)]" />
-            {zh
-              ? '全程走 Google 官方登录页，ColabHive 不经手你的密码'
-              : 'Always Google’s official sign-in — your password never touches ColabHive'}
-          </span>
-        </div>
-
-        <div className="ui-stagger grid grid-cols-1 md:grid-cols-3 gap-3.5">
-          {onboardingWays.map((way) => (
-            <button
-              key={way.key}
-              type="button"
-              onClick={way.onClick}
-              className="ui-bento-tile group items-stretch gap-3 text-left cursor-pointer"
-            >
-              <span className="flex items-start justify-between gap-3">
-                <span
-                  className={cn(
-                    'flex items-center justify-center w-9 h-9 shrink-0 rounded-xl [&>svg]:w-[18px] [&>svg]:h-[18px]',
-                    way.primary && 'ui-glow-badge',
-                  )}
-                  style={
-                    way.primary
-                      ? undefined
-                      : { color: `var(--${way.tint}-text)`, backgroundColor: `var(--${way.tint}-soft)` }
+      {/* Google Colab Free-First Toggle + 3-Way Onboarding */}
+      <>
+          <LayeredCard
+            padding="sm"
+            staggerIndex={0}
+            className="rounded-[20px]"
+            style={
+              isFreeFirstActive
+                ? {
+                    borderColor: 'var(--emerald-border)',
+                    backgroundImage:
+                      'linear-gradient(135deg, var(--emerald-soft) 0%, var(--surface-2) 62%)',
                   }
+                : undefined
+            }
+          >
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 px-1 py-0.5">
+              <div className="flex items-start gap-3.5 min-w-0">
+                <span
+                  className="flex items-center justify-center w-10 h-10 shrink-0 rounded-2xl border"
+                  style={{
+                    backgroundColor: isFreeFirstActive ? 'var(--emerald)' : 'var(--surface-1)',
+                    borderColor: isFreeFirstActive ? 'var(--emerald)' : 'var(--border-subtle)',
+                    color: isFreeFirstActive ? '#FFFFFF' : 'var(--text-secondary)',
+                    boxShadow: isFreeFirstActive ? '0 6px 16px -4px rgba(22, 163, 74, 0.35)' : undefined,
+                  }}
                 >
-                  {way.icon}
+                  <Gift className="w-5 h-5" />
                 </span>
-                <ArrowRight className="w-4 h-4 mt-1 shrink-0 text-fg-muted transition-transform duration-200 group-hover:translate-x-0.5 group-hover:text-accent-text" />
+
+                <div className="min-w-0 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-[15px] font-bold tracking-tight text-fg">
+                      {t('pool.free_first_title')}
+                    </h2>
+                    <StatusPill
+                      tone={isFreeFirstActive ? 'emerald' : 'neutral'}
+                      size="xs"
+                      dot
+                      pulse={isFreeFirstActive}
+                    >
+                      {isFreeFirstActive ? t('pool.free_first_on') : t('pool.free_first_off')}
+                    </StatusPill>
+                    {freePoolStats.colabFreeCount > 0 && (
+                      <StatusPill tone="sky" size="xs" mono>
+                        {zh
+                          ? `Colab 免费窗口：${freePoolStats.colabFreeCount} 个`
+                          : `Colab free windows: ${freePoolStats.colabFreeCount}`}
+                      </StatusPill>
+                    )}
+                  </div>
+
+                  <p className="text-[12.5px] leading-relaxed text-fg-secondary">
+                    {t('pool.free_first_desc')}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5 shrink-0 lg:pl-3">
+                <label className="inline-flex items-center gap-2.5 px-3 py-1.5 rounded-full border bg-surface-2 border-line cursor-pointer select-none shadow-[var(--shadow-control)] hover:border-line-strong transition-colors">
+                  <span className="text-[12px] font-semibold text-fg">
+                    {!policyLoaded
+                      ? zh
+                        ? '策略加载中…'
+                        : 'Loading policy…'
+                      : isFreeFirstActive
+                        ? zh
+                          ? '零元优先调度中'
+                          : '$0 Priority ON'
+                        : zh
+                          ? '点击开启零元优先'
+                          : 'Turn ON $0 Priority'}
+                  </span>
+                  <Switch
+                    checked={isFreeFirstActive}
+                    disabled={!policyLoaded || togglingFreeFirst}
+                    onChange={(next) => void handleToggleFreeFirst(next)}
+                    label={t('pool.free_first_title')}
+                  />
+                </label>
+              </div>
+            </div>
+          </LayeredCard>
+
+          <LayeredCard padding="sm" staggerIndex={0}>
+            <div className="mb-3 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 px-0.5">
+              <h2 className="text-[13.5px] font-semibold text-fg">
+                {zh ? '添加 Google Colab 算力账号' : 'Add Google Colab Accounts'}
+              </h2>
+              <span className="inline-flex items-center gap-1.5 text-[11.5px] text-fg-muted">
+                <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-[var(--emerald-text)]" />
+                {zh
+                  ? '凭证经 AES-256-GCM 加密保存在本机，绝不经手密码'
+                  : 'Encrypted locally with AES-256-GCM — zero password exposure'}
               </span>
-              <span className="block min-w-0 space-y-1">
-                <span className="block text-[13.5px] font-semibold text-fg">{way.title}</span>
-                <span className="block text-[12px] leading-relaxed text-fg-secondary">
-                  {way.body}
-                </span>
-              </span>
-            </button>
-          ))}
-        </div>
-      </LayeredCard>
+            </div>
+
+            <div
+              className={cn(
+                'ui-stagger grid grid-cols-1 gap-3.5',
+                onboardingWays.length === 2 ? 'sm:grid-cols-2' : 'sm:grid-cols-3',
+              )}
+            >
+              {onboardingWays.map((way) => (
+                <button
+                  key={way.key}
+                  type="button"
+                  onClick={way.onClick}
+                  className="ui-bento-tile group items-stretch gap-3 text-left cursor-pointer"
+                >
+                  <span className="flex items-start justify-between gap-3">
+                    <span
+                      className={cn(
+                        'flex items-center justify-center w-9 h-9 shrink-0 rounded-xl [&>svg]:w-[18px] [&>svg]:h-[18px]',
+                        way.primary && 'ui-glow-badge',
+                      )}
+                      style={
+                        way.primary
+                          ? undefined
+                          : { color: `var(--${way.tint}-text)`, backgroundColor: `var(--${way.tint}-soft)` }
+                      }
+                    >
+                      {way.icon}
+                    </span>
+                    <ArrowRight className="w-4 h-4 mt-1 shrink-0 text-fg-muted transition-transform duration-200 group-hover:translate-x-0.5 group-hover:text-accent-text" />
+                  </span>
+                  <span className="block min-w-0 space-y-1">
+                    <span className="block text-[13.5px] font-semibold text-fg">{way.title}</span>
+                    <span className="block text-[12px] leading-relaxed text-fg-secondary">
+                      {way.body}
+                    </span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </LayeredCard>
+        </>
 
       {banner && (
         <Notice
@@ -835,7 +1026,7 @@ export function AccountPoolPage({
       )}
 
       {/* Filters */}
-      {accounts.length > 0 && (
+      {activeTabAccounts.length > 0 && (
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <SegmentedTabs
             size="sm"
@@ -844,11 +1035,15 @@ export function AccountPoolPage({
             value={groupFilter}
             onChange={setGroupFilter}
             options={[
-              { value: 'all', label: zh ? '全部账号' : 'All accounts', count: accounts.length },
+              {
+                value: 'all',
+                label: zh ? '全部 Colab 账号' : 'All Colab Accounts',
+                count: activeTabAccounts.length,
+              },
               ...allGroups.map((g) => ({
                 value: g,
                 label: `#${g}`,
-                count: accounts.filter((a) => (a.groups || []).includes(g)).length,
+                count: activeTabAccounts.filter((a) => (a.groups || []).includes(g)).length,
               })),
             ]}
           />
@@ -869,32 +1064,31 @@ export function AccountPoolPage({
       {/* Airy account cards — a card opens the inspector drawer */}
       {filtered.length === 0 ? (
         <LayeredCard padding="none" staggerIndex={1}>
-          {accounts.length === 0 ? (
+          {activeTabAccounts.length === 0 ? (
             <EmptyState
               icon={<ShieldCheck />}
-              title={zh ? '还没有账号，先添加第一个吧' : 'No accounts yet — add your first one'}
-              description={
-                zh
-                  ? '最快的方式是用 Google 登录添加自己的账号，大约 1 分钟，全程不用填密码。添加后这里会显示每个账号的余额，以及还能跑多久显卡。'
-                  : 'The fastest way is signing in with Google — about a minute, no password needed. Each account’s balance and remaining GPU runtime will show up here.'
-              }
-              action={
-                <div className="flex flex-wrap items-center justify-center gap-2">
-                  <ActionButton
-                    variant="primary"
-                    icon={<Plus />}
-                    onClick={() => setOauthWizardOpen(true)}
-                  >
-                    {isCloudMode
-                      ? zh
-                        ? '远程 PKCE 浏览器授权'
-                        : 'Remote PKCE Sign-In'
-                      : zh
-                        ? '添加我的账号'
-                        : 'Add My Account'}
-                  </ActionButton>
-                  {isCloudMode ? (
-                    <>
+              title={zh ? '还没有 Google Colab 账号，先添加第一个吧' : 'No Colab accounts yet — add your first one'}
+                description={
+                  zh
+                    ? '最快的方式是用 Google 登录添加自己的账号，大约 1 分钟，全程不用填密码。添加后即可在 AI 聊天与应用商店中直接调用云端显卡。'
+                    : 'Sign in with Google OAuth (no password needed) to unlock cloud GPUs for AI Chat, ComfyUI, and JupyterLab.'
+                }
+                action={
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <ActionButton
+                      variant="primary"
+                      icon={<Plus />}
+                      onClick={() => setOauthWizardOpen(true)}
+                    >
+                      {isCloudMode
+                        ? zh
+                          ? '远程 PKCE 浏览器授权'
+                          : 'Remote PKCE Sign-In'
+                        : zh
+                          ? '添加我的 Colab 账号'
+                          : 'Add My Colab Account'}
+                    </ActionButton>
+                    {isCloudMode ? (
                       <ActionButton
                         variant="secondary"
                         icon={<Lock />}
@@ -906,37 +1100,29 @@ export function AccountPoolPage({
                       >
                         {zh ? '导入 .chvault 迁移包' : 'Import .chvault'}
                       </ActionButton>
+                    ) : (
                       <ActionButton
                         variant="secondary"
-                        icon={<HeartHandshake />}
-                        onClick={() => setInviteModalOpen(true)}
+                        icon={<FolderSearch />}
+                        onClick={() => {
+                          setTransferInitialTab('scan');
+                          setTransferInitialVaultMode('export');
+                          setTransferHubOpen(true);
+                        }}
                       >
-                        {zh ? '共享贡献邀请链接' : 'Contributor Link'}
+                        {zh ? '导入本机已有登录' : 'Import Local Login'}
                       </ActionButton>
-                    </>
-                  ) : (
+                    )}
                     <ActionButton
                       variant="secondary"
-                      icon={<FolderSearch />}
-                      onClick={() => {
-                        setTransferInitialTab('scan');
-                        setTransferInitialVaultMode('export');
-                        setTransferHubOpen(true);
-                      }}
+                      icon={<Activity />}
+                      onClick={() => setSelfTestOpen(true)}
                     >
-                      {zh ? '导入本机已有登录' : 'Import Local Login'}
+                      {zh ? '系统自检' : 'Self-Test'}
                     </ActionButton>
-                  )}
-                  <ActionButton
-                    variant="secondary"
-                    icon={<Activity />}
-                    onClick={() => setSelfTestOpen(true)}
-                  >
-                    {zh ? '系统自检' : 'Self-Test'}
-                  </ActionButton>
-                </div>
-              }
-            />
+                  </div>
+                }
+              />
           ) : (
             <EmptyState
               icon={<SearchX />}
@@ -999,15 +1185,15 @@ export function AccountPoolPage({
                     <div className="min-w-0 flex-1 space-y-1.5">
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
                         <span className="ch-num text-[14px] font-bold text-fg truncate max-w-full">
-                          {displayEmail(acct.email)}
+                          {acct.provider && acct.provider !== 'colab'
+                            ? acct.display_name || acct.alias || displayEmail(acct.email)
+                            : displayEmail(acct.email)}
                         </span>
-                        <SubscriptionTierBadge tier={acct.subscription_tier} />
-                        <AccountHealthBadge health={acct.health} />
-                        {acct.is_contributor && (
-                          <StatusPill tone="sky" size="xs" icon={<HeartHandshake />}>
-                            {zh ? '好友共享' : 'Shared by friend'}
-                          </StatusPill>
+                        <PlatformProviderBadge account={acct} />
+                        {(!acct.provider || acct.provider === 'colab') && (
+                          <SubscriptionTierBadge tier={acct.subscription_tier} />
                         )}
+                        <AccountHealthBadge health={acct.health} />
                         {acct.expiring_soon_cu > 0 && (
                           <StatusPill tone="coral" size="xs" mono>
                             {zh
@@ -1057,31 +1243,47 @@ export function AccountPoolPage({
                     )}
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <span className="ch-num text-[14.5px] leading-5 font-bold text-fg">
-                        <AnimatedNumber
-                          value={acct.is_contributor ? quota.schedulableCu : acct.paid_cu_balance}
-                          format={fmtCU}
-                        />
-                        <span className="mx-1 text-[12px] font-medium text-fg-muted">/</span>
-                        <span className="text-[13px] font-semibold text-fg-secondary">
-                          {fmtSmartCU(quota.cycleTotalCu)} CU
-                        </span>
-                        <span className="ml-1.5 text-[11px] font-semibold text-fg-muted">
-                          · {Math.round(quota.ringValue)}%
-                        </span>
-                      </span>
-                      <StatusPill
-                        tone={acct.expiring_soon_cu > 0 ? 'coral' : live ? 'accent' : 'emerald'}
-                        size="xs"
-                        mono
-                        title={
-                          zh
-                            ? '这个账号可自由支配的额度，大约能跑这么久的 G4 显卡'
-                            : 'Roughly how long this account’s ready-to-use quota runs a G4'
-                        }
-                      >
-                        ≈ <AnimatedNumber value={quota.g4Hours} format={fmtHours} /> G4
-                      </StatusPill>
+                      {quota.isColabFreeOnly ? (
+                        <>
+                          <span className="ch-num text-[14px] leading-5 font-bold text-fg">
+                            {zh ? 'Colab 免费动态窗口' : 'Colab Free Window'}
+                            <span className="ml-1.5 text-[11px] font-semibold text-fg-muted">
+                              · {Math.round(quota.ringValue)}%
+                            </span>
+                          </span>
+                          <StatusPill tone="sky" size="xs" mono>
+                            T4 16GB · $0
+                          </StatusPill>
+                        </>
+                      ) : (
+                        <>
+                          <span className="ch-num text-[14.5px] leading-5 font-bold text-fg">
+                            <AnimatedNumber
+                              value={acct.is_contributor ? quota.schedulableCu : acct.paid_cu_balance}
+                              format={fmtCU}
+                            />
+                            <span className="mx-1 text-[12px] font-medium text-fg-muted">/</span>
+                            <span className="text-[13px] font-semibold text-fg-secondary">
+                              {fmtSmartCU(quota.cycleTotalCu)} CU
+                            </span>
+                            <span className="ml-1.5 text-[11px] font-semibold text-fg-muted">
+                              · {Math.round(quota.ringValue)}%
+                            </span>
+                          </span>
+                          <StatusPill
+                            tone={acct.expiring_soon_cu > 0 ? 'coral' : live ? 'accent' : 'emerald'}
+                            size="xs"
+                            mono
+                            title={
+                              zh
+                                ? '这个账号可自由支配的额度，大约能跑这么久的 G4 显卡'
+                                : 'Roughly how long this account’s ready-to-use quota runs a G4'
+                            }
+                          >
+                            ≈ <AnimatedNumber value={quota.g4Hours} format={fmtHours} /> G4
+                          </StatusPill>
+                        </>
+                      )}
                     </div>
 
                     <SegmentedQuotaBar
@@ -1282,11 +1484,6 @@ export function AccountPoolPage({
             });
           }}
         />
-      )}
-
-      {/* Modal C: shareable contributor invite manager */}
-      {inviteModalOpen && (
-        <ContributorInviteModal proxies={proxies} onClose={() => setInviteModalOpen(false)} />
       )}
 
       {/* Modal D: System & Environment Self-Test */}
@@ -1506,7 +1703,10 @@ function AccountInspectorDrawer({
       title={<span className="ch-num">{displayEmail(account.email)}</span>}
       subtitle={
         <span className="inline-flex flex-wrap items-center gap-1.5 align-middle">
-          <SubscriptionTierBadge tier={subscriptionTier} />
+          <PlatformProviderBadge account={account} />
+          {(!account.provider || account.provider === 'colab') && (
+            <SubscriptionTierBadge tier={subscriptionTier} />
+          )}
           <AccountHealthBadge health={account.health} />
           {account.is_contributor && (
             <StatusPill tone="emerald" size="xs">
@@ -2604,6 +2804,8 @@ function CredentialTransferModal({
   const [discovered, setDiscovered] = useState<DiscoveredLocalCredential[] | null>(null);
   const [selectedDiscoveredIds, setSelectedDiscoveredIds] = useState<string[]>([]);
   const [rawIniFallback, setRawIniFallback] = useState('');
+  const [showManualIni, setShowManualIni] = useState(false);
+  const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
 
   // Tab 2: ADC / JSON Dropzone
   const [jsonPayload, setJsonPayload] = useState('');
@@ -2626,13 +2828,18 @@ function CredentialTransferModal({
     try {
       const list = await api.scanLocalCredentials();
       setDiscovered(list);
-      setSelectedDiscoveredIds(list.map((d) => d.id));
+      // Auto-select only actionable new credentials (skip already-in-pool duplicates and expired tokens).
+      setSelectedDiscoveredIds(
+        list
+          .filter((d) => !d.already_in_pool && d.status !== 'in_pool' && d.status !== 'expired')
+          .map((d) => d.id),
+      );
     } catch (err) {
       setMsg({
         kind: 'err',
         text: err instanceof Error ? err.message : 'Scan failed',
       });
-      setDiscovered([]);
+      setDiscovered(null);
     } finally {
       setScanning(false);
     }
@@ -2775,19 +2982,88 @@ function CredentialTransferModal({
     );
   };
 
+  const selectedProxyName =
+    proxies.find((p) => p.id === defaultProxyId)?.name || (zh ? '本机直连' : 'Direct');
+  const conflictLabel =
+    conflictStrategy === 'update'
+      ? zh
+        ? '重复时更新令牌'
+        : 'Update existing'
+      : conflictStrategy === 'merge_groups'
+        ? zh
+          ? '重复时合并分组'
+          : 'Merge groups'
+        : zh
+          ? '跳过已有账号'
+          : 'Skip existing';
+
   const importOptions = (
-    <InsetWell label={zh ? '导入选项' : 'Import Options'}>
-      <CommonImportOptions
-        proxies={proxies}
-        defaultProxyId={defaultProxyId}
-        setDefaultProxyId={setDefaultProxyId}
-        defaultGroups={defaultGroups}
-        setDefaultGroups={setDefaultGroups}
-        conflictStrategy={conflictStrategy}
-        setConflictStrategy={setConflictStrategy}
-      />
-    </InsetWell>
+    <div className="rounded-[12px] border border-line bg-surface-1/60 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setShowAdvancedOptions((v) => !v)}
+        className="w-full flex items-center justify-between gap-3 px-3.5 py-2.5 text-left hover:bg-surface-2/60 transition-colors cursor-pointer"
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <Settings2 className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+          <span className="text-[12px] font-medium text-fg-secondary shrink-0">
+            {zh ? '高级导入选项' : 'Advanced Options'}
+          </span>
+          <span className="text-[11.5px] text-fg-muted truncate">
+            {selectedProxyName} · {zh ? '分组' : 'Group'} {defaultGroups.trim() || 'imported'} ·{' '}
+            {conflictLabel}
+          </span>
+        </div>
+        <ChevronRight
+          className={cn(
+            'w-3.5 h-3.5 text-fg-muted shrink-0 transition-transform duration-150',
+            showAdvancedOptions && 'rotate-90',
+          )}
+        />
+      </button>
+      {showAdvancedOptions && (
+        <div className="px-3.5 pb-3.5 pt-2 border-t border-line">
+          <CommonImportOptions
+            proxies={proxies}
+            defaultProxyId={defaultProxyId}
+            setDefaultProxyId={setDefaultProxyId}
+            defaultGroups={defaultGroups}
+            setDefaultGroups={setDefaultGroups}
+            conflictStrategy={conflictStrategy}
+            setConflictStrategy={setConflictStrategy}
+          />
+        </div>
+      )}
+    </div>
   );
+
+  const selectedItems = (discovered ?? []).filter((d) => selectedDiscoveredIds.includes(d.id));
+  const selectedAllInPool =
+    selectedItems.length > 0 &&
+    selectedItems.every((d) => d.already_in_pool || d.status === 'in_pool');
+
+  const scanPrimaryLabel = (() => {
+    if (rawIniFallback.trim()) {
+      return zh ? '导入粘贴的登录配置' : 'Import Pasted Config';
+    }
+    if (selectedDiscoveredIds.length === 0) {
+      return zh ? '一键导入并校准额度' : 'Import & Verify Quotas';
+    }
+    if (selectedAllInPool) {
+      return zh
+        ? `更新选中的 ${selectedDiscoveredIds.length} 个账号令牌`
+        : `Refresh ${selectedDiscoveredIds.length} Selected Account(s)`;
+    }
+    return zh
+      ? `一键导入选中的 ${selectedDiscoveredIds.length} 个账号`
+      : `Import ${selectedDiscoveredIds.length} Selected Account(s)`;
+  })();
+
+  const formatSourceTool = (sourceType: DiscoveredLocalCredential['source_type']) => {
+    if (sourceType === 'keyring_plaintext') return zh ? 'Colab CLI 钥匙串' : 'Colab CLI Keyring';
+    if (sourceType === 'colab_token_json') return zh ? 'Colab CLI 登录凭证' : 'Colab CLI Token';
+    return zh ? 'Google Cloud CLI' : 'Google Cloud CLI';
+  };
 
   // One primary action per tab state
   const primaryAction =
@@ -2798,7 +3074,7 @@ function CredentialTransferModal({
         disabled={selectedDiscoveredIds.length === 0 && !rawIniFallback.trim()}
         onClick={handleImportDiscovered}
       >
-        {zh ? '一键导入并校准额度' : 'Import & Hydrate Quotas'}
+        {scanPrimaryLabel}
       </ActionButton>
     ) : tab === 'json' ? (
       <ActionButton
@@ -2811,7 +3087,7 @@ function CredentialTransferModal({
       </ActionButton>
     ) : vaultMode === 'export' ? (
       <ActionButton variant="primary" icon={<Download />} loading={busy} onClick={handleExportVault}>
-        {zh ? '导出 .chvault 文件' : 'Download .chvault'}
+        {zh ? '导出备份文件 (.chvault)' : 'Download .chvault'}
       </ActionButton>
     ) : (
       <ActionButton
@@ -2834,11 +3110,11 @@ function CredentialTransferModal({
       subtitle={
         isCloudMode
           ? zh
-            ? '云端模式：导入/导出 AES-256-GCM 加密迁移包 (.chvault) 或上传 gcloud ADC / JSON 凭证'
-            : 'Cloud mode: import/export AES-256-GCM encrypted .chvault bundles or upload gcloud ADC / JSON credentials'
+            ? '上传加密备份包 (.chvault) 或 JSON 凭证文件，快速恢复算力池账号'
+            : 'Upload an encrypted .chvault backup or JSON credential file to restore your pool'
           : zh
-            ? '零摩擦迁移本机 / WSL2 colab CLI 钥匙串、gcloud ADC 或跨服务器加密包 (.chvault)'
-            : 'Migrate from a local / WSL2 colab CLI keyring, gcloud ADC, or an encrypted .chvault bundle'
+            ? '自动发现本机已登录的 Google Colab 账号，或通过备份文件快速迁入'
+            : 'Automatically detect signed-in Google Colab accounts on this device, or import from backup'
       }
       footer={
         <div className="flex justify-end gap-2">
@@ -2866,14 +3142,18 @@ function CredentialTransferModal({
                   icon: <Lock />,
                   label: (
                     <span title={t('pool.vault_tab')}>
-                      {zh ? '加密迁移包 .chvault' : 'Encrypted .chvault'}
+                      {zh ? '备份与迁移 (.chvault)' : 'Backup (.chvault)'}
                     </span>
                   ),
                 },
                 {
                   value: 'json',
                   icon: <FileJson />,
-                  label: <span title={t('pool.adc_json_tab')}>gcloud ADC / JSON</span>,
+                  label: (
+                    <span title={t('pool.adc_json_tab')}>
+                      {zh ? '导入凭证文件 (JSON)' : 'JSON Credentials'}
+                    </span>
+                  ),
                 },
               ]
             : [
@@ -2882,21 +3162,25 @@ function CredentialTransferModal({
                   icon: <FolderSearch />,
                   label: (
                     <span title={t('pool.auto_detect_cli')}>
-                      {zh ? '本机 / WSL2 扫描' : 'Local / WSL2 Scan'}
+                      {zh ? '自动扫描本机' : 'Auto-Scan Device'}
                     </span>
                   ),
                 },
                 {
                   value: 'json',
                   icon: <FileJson />,
-                  label: <span title={t('pool.adc_json_tab')}>gcloud ADC / JSON</span>,
+                  label: (
+                    <span title={t('pool.adc_json_tab')}>
+                      {zh ? '导入凭证文件' : 'JSON File'}
+                    </span>
+                  ),
                 },
                 {
                   value: 'vault',
                   icon: <Lock />,
                   label: (
                     <span title={t('pool.vault_tab')}>
-                      {zh ? '加密包 .chvault' : 'Vault .chvault'}
+                      {zh ? '备份与迁移' : 'Backup & Restore'}
                     </span>
                   ),
                 },
@@ -2913,109 +3197,211 @@ function CredentialTransferModal({
         </Notice>
       )}
 
-      {/* TAB 1: local / WSL2 `keyringrc.cfg` scanner */}
+      {/* TAB 1: Automatic local / WSL2 Google account scanner */}
       {tab === 'scan' && (
         <>
           <InsetWell padding="sm">
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
               <div className="min-w-0 space-y-0.5">
-                <div className="text-[12.5px] font-medium text-fg">{t('pool.auto_detect_cli')}</div>
-                <div className="ch-num text-[11px] leading-relaxed text-fg-muted break-all">
-                  ~/.config/python_keyring/keyringrc.cfg · \\wsl.localhost\*\home\*\.config\python_keyring\keyringrc.cfg
+                <div className="text-[13px] font-medium text-fg">{t('pool.auto_detect_cli')}</div>
+                <div className="text-[12px] leading-relaxed text-fg-muted">
+                  {zh
+                    ? '仅只读检测本机与 WSL2 的 Colab CLI / Google Cloud 登录记录，绝不修改原文件'
+                    : 'Read-only check of local & WSL2 Colab CLI / Google Cloud logins. Original files are never modified.'}
                 </div>
               </div>
               <ActionButton
                 variant="secondary"
-                icon={<FolderSearch />}
+                icon={<RefreshCw />}
                 loading={scanning}
                 onClick={handleScanLocal}
                 className="shrink-0"
               >
-                {zh ? '只读扫描' : 'Scan (read-only)'}
+                {zh ? '重新扫描' : 'Rescan'}
               </ActionButton>
             </div>
           </InsetWell>
 
-          {discovered !== null &&
-            (discovered.length === 0 ? (
-              <p className="text-[12px] leading-relaxed text-fg-secondary">
+          {scanning && discovered === null ? (
+            <InsetWell padding="sm" className="flex items-center gap-2.5 text-[12.5px] text-fg-secondary">
+              <Loader2 className="w-4 h-4 animate-spin text-fg-muted shrink-0" />
+              <span>
                 {zh
-                  ? '本机默认路径未发现未导入的明文 keyringrc.cfg。你也可以直接在下方粘贴 keyringrc.cfg 内容导入。'
-                  : 'No unimported local keyringrc.cfg files were found. You can paste the keyringrc.cfg INI content below instead.'}
+                  ? '正在扫描本机与 WSL2 登录记录并识别 Google 账号…'
+                  : 'Scanning local & WSL2 logins and identifying Google accounts…'}
+              </span>
+            </InsetWell>
+          ) : discovered !== null && discovered.length === 0 ? (
+            <InsetWell padding="sm" className="space-y-1">
+              <div className="text-[12.5px] font-medium text-fg">
+                {zh ? '未在本机或 WSL2 发现已登录的 CLI 账号' : 'No local CLI logins found'}
+              </div>
+              <p className="text-[12px] leading-relaxed text-fg-muted">
+                {zh
+                  ? '你可以直接关闭此窗口，点击「添加我的 Colab 账号」用浏览器一键登录 Google；或者在下方展开手动粘贴远程服务器的登录配置。'
+                  : 'Close this window and click "Add Colab Account" to sign in with your browser, or expand the manual config box below.'}
               </p>
-            ) : (
-              <div className="space-y-2">
+            </InsetWell>
+          ) : (
+            discovered !== null && (
+              <div className="space-y-2.5">
+                {discovered.every((d) => d.already_in_pool || d.status === 'in_pool') && (
+                  <Notice tone="emerald" icon={<CheckCircle2 />}>
+                    {zh
+                      ? `扫描到的 ${discovered.length} 个账号均已在你的算力池中，无需重复导入。如需用本地最新令牌刷新它，可手动勾选后点击更新。`
+                      : `All ${discovered.length} discovered account(s) are already in your pool. Select manually only if you want to refresh their saved tokens.`}
+                  </Notice>
+                )}
                 {discovered.map((item) => {
+                  const isInPool = Boolean(item.already_in_pool || item.status === 'in_pool');
+                  const isExpired = item.status === 'expired';
+                  const isUnverified = item.status === 'unverified';
+                  const resolvedEmail = item.email || item.email_preview || '';
                   const checked = selectedDiscoveredIds.includes(item.id);
+                  const envLabel =
+                    item.source_label ||
+                    (item.environment === 'wsl2' ? 'WSL2' : zh ? '本机' : 'This device');
+                  const toolLabel = formatSourceTool(item.source_type);
+
                   return (
                     <InsetWell
                       key={item.id}
                       padding="sm"
                       role="checkbox"
                       aria-checked={checked}
-                      tabIndex={0}
-                      onClick={() => toggleDiscovered(item.id)}
+                      aria-disabled={isExpired}
+                      tabIndex={isExpired ? -1 : 0}
+                      onClick={() => {
+                        if (!isExpired) toggleDiscovered(item.id);
+                      }}
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
+                        if (!isExpired && (e.key === 'Enter' || e.key === ' ')) {
                           e.preventDefault();
                           toggleDiscovered(item.id);
                         }
                       }}
                       className={cn(
-                        'flex items-center gap-3 cursor-pointer transition-colors hover:border-line-strong',
-                        checked && 'border-[var(--accent-border)] bg-accent-soft/20',
+                        'flex items-start gap-3 transition-colors',
+                        isExpired
+                          ? 'opacity-75 cursor-not-allowed border-[var(--rose-border)] bg-rose-soft/15'
+                          : 'cursor-pointer hover:border-line-strong',
+                        checked && !isExpired && 'border-[var(--accent-border)] bg-accent-soft/20',
                       )}
                     >
                       <span
                         aria-hidden="true"
                         className={cn(
-                          'flex items-center justify-center w-4 h-4 rounded-[5px] border shrink-0 transition-colors',
-                          checked
-                            ? 'bg-accent border-[var(--accent)] text-[var(--accent-fg)]'
-                            : 'border-line-strong bg-surface-2',
+                          'mt-0.5 flex items-center justify-center w-4 h-4 rounded-[5px] border shrink-0 transition-colors',
+                          isExpired
+                            ? 'border-line bg-surface-1 text-fg-muted'
+                            : checked
+                              ? 'bg-accent border-[var(--accent)] text-[var(--accent-fg)]'
+                              : 'border-line-strong bg-surface-2',
                         )}
                       >
-                        {checked && <Check className="w-3 h-3" />}
+                        {checked && !isExpired && <Check className="w-3 h-3" />}
                       </span>
-                      <div className="min-w-0 flex-1">
+                      <div className="min-w-0 flex-1 space-y-1">
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="ch-num text-[12.5px] font-semibold text-fg">
-                            {displayEmail(item.email_preview || 'colab-cli-token')}
+                          <span className="text-[13px] font-semibold text-fg break-all">
+                            {resolvedEmail
+                              ? displayEmail(resolvedEmail)
+                              : isExpired
+                                ? zh
+                                  ? '已失效的本地登录记录'
+                                  : 'Expired local login'
+                                : zh
+                                  ? '待识别的 Google 账号'
+                                  : 'Unverified Google account'}
                           </span>
-                          <StatusPill tone="sky" size="xs" mono>
-                            {item.environment.toUpperCase()}
-                          </StatusPill>
-                          <StatusPill tone="neutral" size="xs" mono>
-                            {item.source_type}
-                          </StatusPill>
+                          {item.display_name && (
+                            <span className="text-[12px] text-fg-muted">({item.display_name})</span>
+                          )}
+                          {isInPool ? (
+                            <StatusPill tone="emerald" size="xs">
+                              {zh ? '已在算力池中' : 'Already in pool'}
+                            </StatusPill>
+                          ) : isExpired ? (
+                            <StatusPill tone="rose" size="xs">
+                              {zh ? '凭证已失效' : 'Expired'}
+                            </StatusPill>
+                          ) : isUnverified ? (
+                            <StatusPill tone="amber" size="xs">
+                              {zh ? '待联网识别' : 'Unverified'}
+                            </StatusPill>
+                          ) : (
+                            <StatusPill tone="sky" size="xs">
+                              {zh ? '可一键导入' : 'Ready to import'}
+                            </StatusPill>
+                          )}
                         </div>
-                        <div className="ch-num text-[11px] text-fg-muted truncate">
-                          {item.source_path} · {item.token_preview}
+                        <div
+                          className="text-[11.5px] text-fg-muted truncate"
+                          title={item.source_path}
+                        >
+                          {zh ? '来源：' : 'Source: '}
+                          {envLabel} · {toolLabel}
                         </div>
+                        {isExpired && (
+                          <div className="text-[11.5px] text-[var(--rose-text)]">
+                            {zh
+                              ? '该登录令牌已过期或被撤销，请关闭此窗口并通过「添加我的 Colab 账号」重新用浏览器登录。'
+                              : 'This saved token has expired or been revoked. Please sign in again via "Add Colab Account".'}
+                          </div>
+                        )}
+                        {isUnverified && !resolvedEmail && (
+                          <div className="text-[11.5px] text-fg-secondary">
+                            {zh
+                              ? '当前暂未连上 Google 无法预览邮箱，可在下方「高级导入选项」配置代理，或直接点击导入由后端自动识别。'
+                              : 'Could not reach Google to preview the email. Configure a proxy under Advanced Options or import directly.'}
+                          </div>
+                        )}
                       </div>
                     </InsetWell>
                   );
                 })}
               </div>
-            ))}
+            )
+          )}
 
-          <Field
-            label={
-              zh
-                ? '或直接粘贴远程服务器 keyringrc.cfg 内容 (可选)'
-                : 'Or paste remote keyringrc.cfg INI content (optional)'
-            }
-            htmlFor="transfer-ini"
-          >
-            <textarea
-              id="transfer-ini"
-              rows={3}
-              value={rawIniFallback}
-              onChange={(e) => setRawIniFallback(e.target.value)}
-              placeholder={'[google_2Dcolab_2Dcli]\noauth_5ftoken = eyJ...'}
-              className="ui-input h-auto py-2.5 ch-num resize-y"
-            />
-          </Field>
+          {/* Collapsible manual keyringrc.cfg paste for remote-server power users */}
+          <div className="rounded-[12px] border border-line bg-surface-1/60 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowManualIni((v) => !v)}
+              className="w-full flex items-center justify-between gap-3 px-3.5 py-2.5 text-left hover:bg-surface-2/60 transition-colors cursor-pointer"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <Terminal className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+                <span className="text-[12px] font-medium text-fg-secondary">
+                  {zh ? '手动粘贴远程服务器的 CLI 登录配置（可选）' : 'Paste remote server CLI config manually (optional)'}
+                </span>
+              </div>
+              <ChevronRight
+                className={cn(
+                  'w-3.5 h-3.5 text-fg-muted shrink-0 transition-transform duration-150',
+                  showManualIni && 'rotate-90',
+                )}
+              />
+            </button>
+            {showManualIni && (
+              <div className="px-3.5 pb-3.5 pt-2 border-t border-line space-y-2">
+                <p className="text-[11.5px] text-fg-muted">
+                  {zh
+                    ? '仅用于从其他 Linux 服务器迁移 Python keyring_pass.cfg 文件内容，一般桌面用户无需填写。'
+                    : 'Only needed when migrating a Python keyring_pass.cfg file from another Linux server.'}
+                </p>
+                <textarea
+                  id="transfer-ini"
+                  rows={3}
+                  value={rawIniFallback}
+                  onChange={(e) => setRawIniFallback(e.target.value)}
+                  placeholder={'[google_2Dcolab_2Dcli]\noauth_5ftoken = eyJ...'}
+                  className="ui-input h-auto py-2.5 ch-num resize-y"
+                />
+              </div>
+            )}
+          </div>
 
           {importOptions}
         </>
@@ -3030,12 +3416,12 @@ function CredentialTransferModal({
             onChange={(e) => handleFileDrop(e, setJsonPayload)}
           >
             {zh
-              ? '点击选择 application_default_credentials.json 或批量凭证 JSON'
-              : 'Click to load application_default_credentials.json or a batch JSON'}
+              ? '点击选择 Google Cloud 凭证文件 (JSON) 或拖入批量凭证'
+              : 'Click to load a Google Cloud ADC JSON or batch credential file'}
           </FilePickerWell>
 
           <textarea
-            rows={6}
+            rows={5}
             value={jsonPayload}
             aria-label={zh ? '凭证 JSON' : 'Credential JSON'}
             onChange={(e) => setJsonPayload(e.target.value)}
@@ -3222,351 +3608,6 @@ function CommonImportOptions({
         </select>
       </Field>
     </div>
-  );
-}
-
-// ============================================================================
-// Modal C — shareable contributor invite manager
-// ============================================================================
-
-function ContributorInviteModal({
-  proxies,
-  onClose,
-}: {
-  proxies: ProxyConfig[];
-  onClose: () => void;
-}) {
-  const { locale, t } = useI18n();
-  const zh = locale === 'zh-CN';
-
-  const [invites, setInvites] = useState<ContributorInvite[]>(DEMO_INVITES);
-  const [poolTitle, setPoolTitle] = useState('Open Reasoning Sharded Compute Pool');
-  const [maintainerName, setMaintainerName] = useState('Research Systems Lab');
-  const [welcomeNote, setWelcomeNote] = useState(
-    zh
-      ? '欢迎贡献闲置 Colab 算力！你的保底自留水位与云盘隔离防火墙由调度器硬性保障，可随时一键撤回。'
-      : 'Donate idle expiring Colab CUs with hard personal safety floors & zero Drive access.',
-  );
-  const [minReserveCu, setMinReserveCu] = useState<number>(50);
-  const [maxTotalCu, setMaxTotalCu] = useState<number>(200);
-  const [maxUses, setMaxUses] = useState<number>(10);
-  const [defaultProxyId, setDefaultProxyId] = useState<string>('');
-  const [allowedGpus, setAllowedGpus] = useState<AcceleratorType[]>([
-    'G4',
-    'A100',
-    'L4',
-    'T4',
-  ]);
-  const [creating, setCreating] = useState(false);
-  const [revokingCode, setRevokingCode] = useState<string | null>(null);
-  const [inviteError, setInviteError] = useState<string | null>(null);
-
-  useEffect(() => {
-    api
-      .listInvites()
-      .then((list) => {
-        if (list && list.length > 0) setInvites(list);
-      })
-      .catch(() => {});
-  }, []);
-
-  const toggleGpu = (g: AcceleratorType) => {
-    setAllowedGpus((prev) =>
-      prev.includes(g) ? prev.filter((x) => x !== g) : [...prev, g],
-    );
-  };
-
-  const handleCreateInvite = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setCreating(true);
-    setInviteError(null);
-    const guardrails: ContributorGuardrails = {
-      min_reserve_cu: minReserveCu,
-      max_donated_cu_total: maxTotalCu,
-      max_donated_cu_daily: 50,
-      donated_cu_used_total: 0,
-      donated_cu_used_today: 0,
-      allow_paid_cu_burn: true,
-      allowed_gpus: allowedGpus,
-      max_concurrent_vms: 2,
-      block_drive_propagation: true,
-      mask_email_in_dashboard: false,
-      paused: false,
-    };
-    try {
-      const created = await api.createInvite({
-        pool_title: poolTitle,
-        maintainer_name: maintainerName,
-        welcome_note: welcomeNote,
-        target_groups: ['lab-contributors'],
-        default_proxy_id: defaultProxyId || undefined,
-        default_guardrails: guardrails,
-        max_uses: maxUses,
-        ttl_hours: 168,
-      });
-      setInvites((prev) => [created, ...prev]);
-    } catch (err) {
-      if (err instanceof APIError) {
-        setInviteError(err.message);
-        return;
-      }
-      const mockCode = `demo_inv_${Math.random().toString(36).slice(2, 8)}`;
-      setInvites((prev) => [
-        {
-          code: mockCode,
-          pool_title: poolTitle,
-          maintainer_name: maintainerName,
-          welcome_note: welcomeNote,
-          target_groups: ['lab-contributors'],
-          default_guardrails: guardrails,
-          max_uses: maxUses,
-          used_count: 0,
-          supported_modes: ['remote_copy_paste'],
-          required_scopes: ['openid', 'email', 'colaboratory'],
-          revoked: false,
-          created_at: new Date().toISOString(),
-        },
-        ...prev,
-      ]);
-    } finally {
-      setCreating(false);
-    }
-  };
-
-  const handleRevoke = async (code: string) => {
-    setInviteError(null);
-    setRevokingCode(code);
-    try {
-      await api.revokeInvite(code);
-      setInvites((prev) => prev.filter((i) => i.code !== code));
-    } catch (err) {
-      setInviteError(
-        err instanceof Error
-          ? err.message
-          : zh
-            ? '撤销邀请链接失败，请检查网络连接后重试'
-            : 'Failed to revoke invite link. Please check your connection and retry.',
-      );
-    } finally {
-      setRevokingCode(null);
-    }
-  };
-
-  const origin = typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:7860';
-
-  return (
-    <DialogModal
-      open
-      onClose={onClose}
-      size="xl"
-      icon={<HeartHandshake />}
-      title={t('pool.create_invite')}
-      subtitle={
-        zh
-          ? '队友打开链接即可免登录自助授权，保底水位与撤回权始终在贡献者手中'
-          : 'Teammates self-onboard from the link; the reserve floor and revoke stay in their hands'
-      }
-      className="space-y-5"
-    >
-      {inviteError && (
-        <div
-          data-tone="coral"
-          role="alert"
-          className="flex items-center justify-between gap-2 rounded-xl border px-3.5 py-2.5 text-[12.5px]"
-          style={{
-            color: 'var(--tone-fg)',
-            backgroundColor: 'var(--tone-soft)',
-            borderColor: 'var(--tone-border)',
-          }}
-        >
-          <div className="flex items-center gap-2 min-w-0">
-            <AlertCircle className="w-4 h-4 shrink-0" />
-            <span className="min-w-0 break-words">{inviteError}</span>
-          </div>
-          <button
-            type="button"
-            onClick={() => setInviteError(null)}
-            aria-label={zh ? '关闭提示' : 'Dismiss'}
-            className="shrink-0 inline-flex items-center justify-center w-5 h-5 rounded-md cursor-pointer opacity-70 hover:opacity-100"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      )}
-      <InsetWell label={zh ? '新建邀请链接' : 'New Invite Link'}>
-        <form onSubmit={handleCreateInvite} className="space-y-3.5">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <Field label={zh ? '算力池展示名称' : 'Pool Display Title'} htmlFor="invite-title">
-              <input
-                id="invite-title"
-                type="text"
-                required
-                value={poolTitle}
-                onChange={(e) => setPoolTitle(e.target.value)}
-                className="ui-input"
-              />
-            </Field>
-            <Field label={zh ? '维护团队 / 负责人署名' : 'Maintainer / Lab Name'} htmlFor="invite-maintainer">
-              <input
-                id="invite-maintainer"
-                type="text"
-                required
-                value={maintainerName}
-                onChange={(e) => setMaintainerName(e.target.value)}
-                className="ui-input"
-              />
-            </Field>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <Field
-              label={zh ? '贡献者欢迎说明' : 'Contributor Welcome Note'}
-              htmlFor="invite-note"
-              className="sm:col-span-2"
-            >
-              <input
-                id="invite-note"
-                type="text"
-                value={welcomeNote}
-                onChange={(e) => setWelcomeNote(e.target.value)}
-                className="ui-input"
-              />
-            </Field>
-            <Field label={zh ? '自动绑定出口代理' : 'Auto-Assign Proxy'} htmlFor="invite-proxy">
-              <select
-                id="invite-proxy"
-                value={defaultProxyId}
-                onChange={(e) => setDefaultProxyId(e.target.value)}
-                className="ui-input ch-num"
-              >
-                <option value="">{zh ? '本机直连 (Direct)' : 'Direct'}</option>
-                {proxies.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-            </Field>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <Field
-              label={zh ? '默认保底自留' : 'Default Reserve Floor'}
-              htmlFor="invite-reserve"
-              hint={<span className="ch-num font-medium text-fg">{minReserveCu} CU</span>}
-            >
-              <div className="flex items-center h-8">
-                <input
-                  id="invite-reserve"
-                  type="range"
-                  min={0}
-                  max={300}
-                  step={10}
-                  value={minReserveCu}
-                  onChange={(e) => setMinReserveCu(Number(e.target.value))}
-                  className="w-full accent-[var(--accent)] cursor-pointer"
-                />
-              </div>
-            </Field>
-            <Field label={zh ? '默认贡献上限 (CU)' : 'Default Max Total CU'} htmlFor="invite-max-total">
-              <input
-                id="invite-max-total"
-                type="number"
-                min={10}
-                value={maxTotalCu}
-                onChange={(e) => setMaxTotalCu(Number(e.target.value))}
-                className="ui-input ch-num"
-              />
-            </Field>
-            <Field label={zh ? '链接最大兑换次数' : 'Max Redemptions'} htmlFor="invite-max-uses">
-              <input
-                id="invite-max-uses"
-                type="number"
-                min={1}
-                max={500}
-                value={maxUses}
-                onChange={(e) => setMaxUses(Number(e.target.value))}
-                className="ui-input ch-num"
-              />
-            </Field>
-          </div>
-
-          <Field label={zh ? '默认允许卡型' : 'Allowed GPUs'}>
-            <div className="flex flex-wrap gap-1.5">
-              {ALL_ACCELERATORS.map((g) => (
-                <GpuPillToggle
-                  key={g}
-                  accelerator={g}
-                  active={allowedGpus.includes(g)}
-                  onToggle={() => toggleGpu(g)}
-                />
-              ))}
-            </div>
-          </Field>
-
-          <div className="flex justify-end pt-1">
-            <ActionButton variant="primary" type="submit" icon={<Plus />} loading={creating}>
-              {zh ? '生成分享邀请链接' : 'Generate Invite Link'}
-            </ActionButton>
-          </div>
-        </form>
-      </InsetWell>
-
-      {/* Existing invites */}
-      <div className="space-y-2">
-        <div className="text-[12px] font-medium text-fg-secondary">
-          {zh ? '活跃邀请链接' : 'Active shareable links'}{' '}
-          <span className="ch-num text-fg-muted">({invites.length})</span>
-        </div>
-
-        {invites.length === 0 ? (
-          <p className="text-[12px] text-fg-muted">
-            {zh ? '暂无活跃邀请链接。' : 'No active invite links yet.'}
-          </p>
-        ) : (
-          <InsetWell padding="none" className="divide-y divide-line-faint">
-            {invites.map((inv) => {
-              const link = inv.share_url || `${origin}/contribute/${inv.code}`;
-              return (
-                <div
-                  key={inv.code}
-                  className="px-3.5 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5"
-                >
-                  <div className="min-w-0 space-y-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-[12.5px] font-semibold text-fg">{inv.pool_title}</span>
-                      <StatusPill tone={inv.used_count > 0 ? 'emerald' : 'neutral'} size="xs" mono>
-                        {inv.used_count}/{inv.max_uses} {zh ? '已接入' : 'redeemed'}
-                      </StatusPill>
-                    </div>
-                    <div className="ch-num text-[11.5px] text-fg-secondary truncate" title={link}>
-                      {link}
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <CopyButton text={link} label={zh ? '复制链接' : 'Copy URL'} />
-                    <a href={`/contribute/${inv.code}`} className="ui-btn ui-btn-secondary ui-btn-xs">
-                      <ExternalLink className="w-3 h-3 shrink-0" />
-                      {zh ? '预览' : 'Preview'}
-                    </a>
-                    <IconButton
-                      label={zh ? '撤销邀请链接' : 'Revoke invite'}
-                      size="sm"
-                      disabled={revokingCode === inv.code}
-                      onClick={() => void handleRevoke(inv.code)}
-                      className="hover:text-[var(--rose-text)]"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </IconButton>
-                  </div>
-                </div>
-              );
-            })}
-          </InsetWell>
-        )}
-      </div>
-    </DialogModal>
   );
 }
 

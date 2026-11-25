@@ -176,7 +176,9 @@ func (e *Engine) executeDemoCode(
 			"account_id": acc.ID,
 			"reason":     msg,
 		})
-		e.publishStreamChunk(sess, "stderr", msg+"\n", nil)
+		if !req.SuppressOutputBroadcast {
+			e.publishStreamChunk(sess, "stderr", msg+"\n", nil)
+		}
 		return &models.KernelExecResult{
 			Session:        sess.Name,
 			ExecutionID:    uuid.NewString(),
@@ -213,7 +215,9 @@ func (e *Engine) executeDemoCode(
 	// 3. Explicit exception / division-by-zero simulation.
 	if strings.Contains(code, "1/0") || strings.Contains(code, "1 / 0") {
 		tb := "Traceback (most recent call last):\n  File \"<ipython-input>\", line 1, in <module>\nZeroDivisionError: division by zero"
-		e.publishStreamChunk(sess, "stderr", tb+"\n", nil)
+		if !req.SuppressOutputBroadcast {
+			e.publishStreamChunk(sess, "stderr", tb+"\n", nil)
+		}
 		return &models.KernelExecResult{
 			Session:        sess.Name,
 			ExecutionID:    uuid.NewString(),
@@ -232,7 +236,9 @@ func (e *Engine) executeDemoCode(
 		errName := m[1]
 		errVal := strings.Trim(strings.TrimSpace(m[2]), "'\"")
 		tb := fmt.Sprintf("Traceback (most recent call last):\n  %s: %s", errName, errVal)
-		e.publishStreamChunk(sess, "stderr", tb+"\n", nil)
+		if !req.SuppressOutputBroadcast {
+			e.publishStreamChunk(sess, "stderr", tb+"\n", nil)
+		}
 		return &models.KernelExecResult{
 			Session:        sess.Name,
 			ExecutionID:    uuid.NewString(),
@@ -310,7 +316,9 @@ func (e *Engine) executeDemoCode(
 			ro.InlineBase64 = base64.StdEncoding.EncodeToString(pngBytes)
 		}
 		richOutputs = append(richOutputs, ro)
-		e.publishStreamChunk(sess, "colab", fmt.Sprintf("[artifact] %s\n", ro.ArtifactURL), &ro)
+		if !req.SuppressOutputBroadcast {
+			e.publishStreamChunk(sess, "colab", fmt.Sprintf("[artifact] %s\n", ro.ArtifactURL), &ro)
+		}
 	}
 
 	// 7. Print statements & shard launcher output.
@@ -340,7 +348,10 @@ func (e *Engine) executeDemoCode(
 	}
 
 	outStr := stdoutBuf.String()
-	if !req.Silent && outStr != "" {
+	if req.OnStdout != nil && outStr != "" {
+		req.OnStdout(outStr)
+	}
+	if !req.Silent && !req.SuppressOutputBroadcast && outStr != "" {
 		e.publishStreamChunk(sess, "stdout", outStr, nil)
 	}
 

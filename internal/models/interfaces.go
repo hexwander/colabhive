@@ -35,12 +35,6 @@ type Store interface {
 	ListProxies(ctx context.Context) ([]*ProxyConfig, error)
 	DeleteProxy(ctx context.Context, id string) error
 
-	// Contributor Invites
-	SaveInvite(ctx context.Context, invite *ContributorInvite) error
-	GetInvite(ctx context.Context, code string) (*ContributorInvite, error)
-	ListInvites(ctx context.Context) ([]*ContributorInvite, error)
-	DeleteInvite(ctx context.Context, code string) error
-
 	// Runtime Sessions
 	SaveSession(ctx context.Context, sess *RuntimeSession) error
 	GetSession(ctx context.Context, id string) (*RuntimeSession, error)
@@ -110,17 +104,6 @@ type AccountPoolService interface {
 	ScanLocalCredentials(ctx context.Context) ([]DiscoveredLocalCredential, error)
 	ImportCredentials(ctx context.Context, req CredentialImportRequest) ([]*Account, error)
 	ExportVaultBundle(ctx context.Context, req CredentialExportRequest) (*CredentialBundle, error)
-
-	// External Contributor Guest Portal (`/contribute/:code` & `/contribute/manage/:receipt_token`)
-	CreateInvite(ctx context.Context, req CreateInviteRequest) (*ContributorInvite, error)
-	ListInvites(ctx context.Context) ([]*ContributorInvite, error)
-	RevokeInvite(ctx context.Context, code string) error
-	GetPublicInvite(ctx context.Context, code string) (*ContributorInvite, error)
-	StartContribution(ctx context.Context, inviteCode string, guardrails ContributorGuardrails, mode OAuthAuthMode) (*OAuthPendingSession, error)
-	CompleteContribution(ctx context.Context, inviteCode string, state string, rawCodeOrURL string) (*ContributionReceipt, error)
-	GetContributionByReceipt(ctx context.Context, receiptToken string) (*ContributorReceiptStatus, error)
-	UpdateContributionGuardrails(ctx context.Context, receiptToken string, patch ContributorGuardrailsPatch) (*ContributorReceiptStatus, error)
-	RevokeContribution(ctx context.Context, receiptToken string) error
 }
 
 // RuntimeEngine manages Google Colab VM provisioning (Public API + Tunnel API fallback),

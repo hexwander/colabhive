@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   DEFAULT_HARDWARE_CATALOG,
   type Account,
@@ -17,6 +17,7 @@ import {
   UNAUTHORIZED_EVENT,
   useColabHiveEvents,
 } from './lib/api';
+import { WS_V11_EVENT } from './lib/apiV11';
 import { useI18n } from './i18n';
 import { AppShell } from './components/layout/AppShell';
 import { useRouter } from './components/layout/navigation';
@@ -37,12 +38,16 @@ import { ObservatoryPage } from './pages/ObservatoryPage';
 import { TrayPopoverPage } from './pages/TrayPopoverPage';
 import { LandingPage } from './pages/LandingPage';
 import { getDemoSnapshot, isDemoSiteMode } from './lib/demoSiteAdapter';
+import { AppErrorBoundary, lazyWithRetry } from './components/ui/ErrorBoundary';
 
-const AccountPoolPage = lazy(() => import('./pages/AccountPoolPage'));
-const ContributePortalPage = lazy(() => import('./pages/ContributePortalPage'));
-const SettingsPage = lazy(() => import('./pages/SettingsPage'));
-const WorkbenchPage = lazy(() => import('./pages/WorkbenchPage'));
-const AgentRouterPage = lazy(() => import('./pages/AgentRouterPage'));
+const AccountPoolPage = lazyWithRetry(() => import('./pages/AccountPoolPage'));
+const SettingsPage = lazyWithRetry(() => import('./pages/SettingsPage'));
+const WorkbenchPage = lazyWithRetry(() => import('./pages/WorkbenchPage'));
+const AgentRouterPage = lazyWithRetry(() => import('./pages/AgentRouterPage'));
+const LLMDeployPage = lazyWithRetry(() => import('./pages/LLMDeployPage'));
+const MediaStudioPage = lazyWithRetry(() => import('./pages/MediaStudioPage'));
+const AppStorePage = lazyWithRetry(() => import('./pages/AppStorePage'));
+const SavingsPage = lazyWithRetry(() => import('./pages/SavingsPage'));
 
 /** Calm layered placeholder shown while a lazy route chunk loads. */
 function RouteSkeleton() {
@@ -104,7 +109,7 @@ export default function App() {
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [authLocked, setAuthLocked] = useState<boolean>(false);
 
-  // Global 1-Click Agent Connect Drawer state
+  // Global 1-Click Agent Connect Drawer
   const [connectDrawerOpen, setConnectDrawerOpen] = useState<boolean>(false);
   const [connectInitialKey, setConnectInitialKey] = useState<string | undefined>(undefined);
 
@@ -133,11 +138,13 @@ export default function App() {
           api.listExperiments().catch(() => [] as Experiment[]),
           api.listSessions().catch(() => [] as RuntimeSession[]),
         ]);
-        setSummary(s);
-        setAccounts(accts);
-        setExperiments(exps);
-        setSessions(sess);
-        if (hw && hw.length > 0) {
+        if (s && typeof s === 'object') {
+          setSummary(s);
+        }
+        setAccounts(Array.isArray(accts) ? accts : []);
+        setExperiments(Array.isArray(exps) ? exps : []);
+        setSessions(Array.isArray(sess) ? sess : []);
+        if (Array.isArray(hw) && hw.length > 0) {
           setHardwareCatalog(hw);
         }
         setAuthLocked(false);
@@ -196,19 +203,24 @@ export default function App() {
 
   // Real-time WebSocket updates (`/ws/events`)
   const handleWsEvent = useCallback((evt: WSEvent) => {
-    if (evt.type === 'quota_updated' && evt.payload) {
-      setSummary(evt.payload as QuotaSummary);
-      setOfflineSnapshot(false);
-    } else if (evt.type === 'account_updated' && evt.payload) {
+    if (evt.type === 'quota_updated' && evt.payload && typeof evt.payload === 'object') {
+      const nextSum = evt.payload as QuotaSummary;
+      if (typeof nextSum.total_available_cu === 'number') {
+        setSummary(nextSum);
+        setOfflineSnapshot(false);
+      }
+    } else if (evt.type === 'account_updated' && evt.payload && typeof evt.payload === 'object') {
       const updated = evt.payload as Account;
+      if (!updated.id) return;
       setAccounts((prev) => {
         const exists = prev.some((a) => a.id === updated.id);
         return exists
           ? prev.map((a) => (a.id === updated.id ? updated : a))
           : [updated, ...prev];
       });
-    } else if (evt.type === 'session_updated' && evt.payload) {
+    } else if (evt.type === 'session_updated' && evt.payload && typeof evt.payload === 'object') {
       const updated = evt.payload as RuntimeSession;
+      if (!updated.id) return;
       setSessions((prev) => {
         const exists = prev.some((s) => s.id === updated.id);
         return exists
@@ -217,26 +229,41 @@ export default function App() {
       });
       api
         .getQuotaSummary(false)
-        .then((s) => setSummary(s))
+        .then((s) => {
+          if (s && typeof s === 'object') setSummary(s);
+        })
         .catch(() => {});
     } else if (
       evt.type === 'experiment_updated' ||
       evt.type === 'guardrail_preempt' ||
       evt.type === 'zombie_alert'
     ) {
-      if (evt.type === 'experiment_updated' && evt.payload) {
+      if (evt.type === 'experiment_updated' && evt.payload && typeof evt.payload === 'object') {
         const updatedExp = evt.payload as Experiment;
-        setExperiments((prev) => {
-          const exists = prev.some((e) => e.id === updatedExp.id);
-          return exists
-            ? prev.map((e) => (e.id === updatedExp.id ? updatedExp : e))
-            : [updatedExp, ...prev];
-        });
+        if (updatedExp.id) {
+          setExperiments((prev) => {
+            const exists = prev.some((e) => e.id === updatedExp.id);
+            return exists
+              ? prev.map((e) => (e.id === updatedExp.id ? updatedExp : e))
+              : [updatedExp, ...prev];
+          });
+        }
       }
       api
         .getQuotaSummary(false)
-        .then((s) => setSummary(s))
+        .then((s) => {
+          if (s && typeof s === 'object') setSummary(s);
+        })
         .catch(() => {});
+    } else if (
+      evt.type === 'llm_gateway_updated' ||
+      evt.type === 'app_instance_updated' ||
+      evt.type === 'checkpoint_relay' ||
+      evt.type === 'provider_updated'
+    ) {
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent<WSEvent>(WS_V11_EVENT, { detail: evt }));
+      }
     }
   }, []);
 
@@ -287,12 +314,46 @@ export default function App() {
         offlineSnapshot={offlineSnapshot}
         onRefreshTelemetry={() => syncTelemetry(true)}
         onOpenConnectDrawer={openConnectDrawer}
+        onOpenSavingsReceipt={() => route.navigate('/savings')}
       >
-        <Suspense fallback={<RouteSkeleton />}>
-          {route.section === 'contribute' && (
-            <ContributePortalPage
-              inviteCode={route.inviteCode}
-              receiptToken={route.receiptToken}
+        <AppErrorBoundary
+          scope="route"
+          resetKey={`${route.section}:${route.pathname}`}
+          onResetHome={() => route.navigate('/')}
+        >
+          <Suspense fallback={<RouteSkeleton />}>
+          {route.section === 'chat' && (
+            <LLMDeployPage
+              accounts={accounts}
+              summary={summary}
+              authRequired={Boolean(health.auth_required)}
+              publicUrl={health.public_url}
+              onNavigate={(path) => route.navigate(path)}
+            />
+          )}
+
+          {route.section === 'studio' && (
+            <MediaStudioPage
+              accounts={accounts}
+              summary={summary}
+              onNavigate={(path) => route.navigate(path)}
+            />
+          )}
+
+          {route.section === 'apps' && (
+            <AppStorePage
+              accounts={accounts}
+              summary={summary}
+              deploymentMode={health.deployment_mode}
+              onNavigate={(path) => route.navigate(path)}
+            />
+          )}
+
+          {route.section === 'savings' && (
+            <SavingsPage
+              accounts={accounts}
+              summary={summary}
+              onNavigate={(path) => route.navigate(path)}
             />
           )}
 
@@ -343,7 +404,8 @@ export default function App() {
               onOpenConnectWithKey={(keyVal) => openConnectDrawer(keyVal)}
             />
           )}
-        </Suspense>
+          </Suspense>
+        </AppErrorBoundary>
       </AppShell>
 
       <AgentConnectDrawer

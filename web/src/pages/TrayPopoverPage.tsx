@@ -1,10 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
+  AppWindow,
   ArrowUpRight,
   Box,
+  Check,
   CheckCircle2,
+  ChevronRight,
   Cloud,
+  Copy,
   Cpu,
   ExternalLink,
   Eye,
@@ -12,6 +16,7 @@ import {
   Loader2,
   Lock,
   LogOut,
+  PanelBottomOpen,
   Power,
   RefreshCw,
   Settings,
@@ -42,8 +47,14 @@ import {
   useColabHiveEvents,
 } from '../lib/api';
 import { isDemoSiteMode } from '../lib/demoSiteAdapter';
+import {
+  buildSmartColabWebUrl,
+  canOpenColabWebForSession,
+  findSessionAccount,
+} from '../lib/colabUrl';
 import { useI18n } from '../i18n';
 import { getObservatoryHomePath, navigate, withBasePath } from '../components/layout/navigation';
+import { AgentBrandIcon } from '../components/ui/AgentBrandIcon';
 import {
   buildFallbackClientConfigs,
   DEMO_ACCOUNTS,
@@ -73,6 +84,9 @@ import { BrandMark, postNativeDesktopMessage } from '../components/ui/BrandLogo'
 export type DesktopBridgeAction =
   | 'open-main'
   | 'open-route'
+  | 'show-tray'
+  | 'sync-now'
+  | 'copy-mcp'
   | 'quit'
   | 'hide-tray'
   | 'toggle-autostart';
@@ -477,6 +491,14 @@ export function TrayPopoverPage({
   const [openingColabId, setOpeningColabId] = useState<string | null>(null);
 
   const [autostart, setAutostart] = useState<boolean | null>(null);
+  const [trayMode, setTrayMode] = useState<'panel' | 'menu'>(() => {
+    if (embedded || typeof window === 'undefined') return 'panel';
+    const qs = new URLSearchParams(window.location.search);
+    if (qs.get('mode') === 'menu') return 'menu';
+    const winMode = (window as Window & { __COLABHIVE_TRAY_MODE__?: string }).__COLABHIVE_TRAY_MODE__;
+    return winMode === 'menu' ? 'menu' : 'panel';
+  });
+  const [menuCopiedMcp, setMenuCopiedMcp] = useState(false);
   const [health, setHealth] = useState<DaemonHealthStatus | null>(null);
   const [authGateLocked, setAuthGateLocked] = useState<boolean>(false);
   const [gateTokenInput, setGateTokenInput] = useState('');
@@ -486,6 +508,37 @@ export function TrayPopoverPage({
   const [toast, setToast] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<number>(() => Date.now());
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
+
+  // Listen for native WebView2 tray mode switches (`panel` <-> `menu`) and autostart updates
+  useEffect(() => {
+    if (embedded || typeof window === 'undefined') return;
+    const win = window as Window & {
+      __COLABHIVE_SET_TRAY_MODE__?: (mode: string) => void;
+    };
+    const applyMode = (raw: string) => {
+      const next = raw === 'menu' ? 'menu' : 'panel';
+      setTrayMode(next);
+      if (next === 'menu') setMenuCopiedMcp(false);
+    };
+    win.__COLABHIVE_SET_TRAY_MODE__ = applyMode;
+    const onTrayModeEvent = (evt: Event) => {
+      const detail = (evt as CustomEvent<{ mode?: string }>).detail;
+      if (detail?.mode) applyMode(detail.mode);
+    };
+    const onAutostartEvent = (evt: Event) => {
+      const detail = (evt as CustomEvent<{ autostart?: boolean }>).detail;
+      if (typeof detail?.autostart === 'boolean') {
+        setAutostart(detail.autostart);
+      }
+    };
+    window.addEventListener('colabhive:tray-mode', onTrayModeEvent);
+    window.addEventListener('colabhive:autostart-state', onAutostartEvent);
+    return () => {
+      delete win.__COLABHIVE_SET_TRAY_MODE__;
+      window.removeEventListener('colabhive:tray-mode', onTrayModeEvent);
+      window.removeEventListener('colabhive:autostart-state', onAutostartEvent);
+    };
+  }, [embedded]);
 
   // Detect whether we are inside the 396x580 native flyout or a wide browser preview tab
   const [isCompactViewport, setIsCompactViewport] = useState<boolean>(() => {
@@ -821,7 +874,8 @@ export function TrayPopoverPage({
       setOpeningColabId(sess.id);
       try {
         const res = await api.getSessionWebUrl(sess.id).catch(() => null);
-        const target = res?.url || sess.colab_web_url;
+        const rawTarget = res?.url || sess.colab_web_url;
+        const target = buildSmartColabWebUrl(rawTarget, sess.account_email);
         if (target && typeof window !== 'undefined') {
           window.open(target, '_blank', 'noopener,noreferrer');
         }
@@ -872,6 +926,34 @@ export function TrayPopoverPage({
       });
     } else if (res.nativeHandled) {
       setAutostart((prev) => (prev === null ? true : !prev));
+    }
+  }, []);
+
+  const handleMenuCopyMCP = useCallback(async () => {
+    const origin =
+      typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:7860';
+    const mcpUrl = `${origin.replace(/\/$/, '')}/mcp`;
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(mcpUrl);
+      }
+    } catch {
+      // Native desktop shell also copies via Win32 clipboard in `copy-mcp`.
+    }
+    setMenuCopiedMcp(true);
+    window.setTimeout(() => setMenuCopiedMcp(false), 1600);
+    await triggerDesktopAction('copy-mcp');
+  }, []);
+
+  const handleMenuSyncNow = useCallback(async () => {
+    void syncAll(true);
+    await triggerDesktopAction('sync-now');
+  }, [syncAll]);
+
+  const handleMenuOpenPanel = useCallback(async () => {
+    const res = await triggerDesktopAction('show-tray');
+    if (!res.nativeHandled || !getWebView2Bridge()) {
+      setTrayMode('panel');
     }
   }, []);
 
@@ -1256,13 +1338,13 @@ export function TrayPopoverPage({
                   >
                     <div className="flex items-center gap-2.5 min-w-0">
                       <span
-                        className="ch-num inline-flex items-center justify-center w-7 h-7 rounded-[8px] text-[10.5px] font-bold shrink-0"
+                        className="inline-flex items-center justify-center w-7 h-7 rounded-[8px] border shrink-0 bg-[#FFFFFF] dark:bg-[#262624] text-fg"
                         style={{
-                          backgroundColor: item.toneBg,
-                          color: item.toneText,
+                          borderColor: 'var(--border-subtle)',
+                          boxShadow: 'var(--shadow-control)',
                         }}
                       >
-                        {item.monogram}
+                        <AgentBrandIcon id={item.id} size={17} />
                       </span>
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
@@ -1386,10 +1468,11 @@ export function TrayPopoverPage({
               </div>
             </section>
 
-            {/* Per-Account Sections (Modeled 1:1 on Magpie Screenshot 1) */}
+            {/* Per-Account Sections */}
             {accounts.map((acc) => {
               const maskedMail = displayEmail(acc.email);
               const tag = shortAccountTag(acc, maskedMail);
+
               const cap = resolveAccountCycleCap(acc);
               const usable = acc.is_contributor ? acc.schedulable_cu : acc.paid_cu_balance;
               const isFreeOnly = acc.subscription_tier === 'FREE' && acc.paid_cu_balance <= 0;
@@ -1397,7 +1480,7 @@ export function TrayPopoverPage({
               const quotaPct = isFreeOnly
                 ? Math.min(100, Math.round((freeCu / 15) * 100))
                 : Math.max(0, Math.min(100, Math.round((usable / cap) * 100)));
-              const ringTone = deriveRingTone(acc, quotaPct);
+              const ringTone: QuotaRingTone = deriveRingTone(acc, quotaPct);
 
               const maxSlots = Math.max(1, acc.max_concurrent_vms || 2);
               const activeSlots = Math.max(0, acc.active_assignments || 0);
@@ -1447,10 +1530,12 @@ export function TrayPopoverPage({
                     <div className="flex items-center gap-1.5 min-w-0">
                       <span
                         className="w-2.5 h-2.5 rounded-[3px] shrink-0"
-                        style={{ backgroundColor: tierDotColor(acc.subscription_tier) }}
+                        style={{
+                          backgroundColor: tierDotColor(acc.subscription_tier),
+                        }}
                       />
                       <span className="text-[11px] font-semibold tracking-[0.04em] uppercase text-fg-muted truncate">
-                        {tierEyebrowLabel(acc.subscription_tier)} · {tag}
+                        {`${tierEyebrowLabel(acc.subscription_tier)} · ${tag}`}
                       </span>
                     </div>
 
@@ -1788,70 +1873,100 @@ export function TrayPopoverPage({
                       </div>
                     </div>
 
-                    {/* 1-Click Action Footer: `Colab 打开` · `工作台查看` · `释放` */}
-                    <div
-                      className="pt-2 border-t flex items-center justify-between gap-2 text-[11.5px]"
-                      style={{ borderColor: 'var(--border-faint)' }}
-                    >
-                      <div className="flex items-center gap-2.5">
-                        <button
-                          type="button"
-                          disabled={openingColabId === sess.id}
-                          onClick={() => void handleOpenColab(sess)}
-                          className="inline-flex items-center gap-1 font-medium text-fg-secondary hover:text-fg cursor-pointer disabled:opacity-50"
+                    {/* 1-Click Action Footer: `工作台免登录查看` · `Colab 打开 (仅本人 Colab 号)` · `释放` */}
+                    {(() => {
+                      const sessAccount = findSessionAccount(sess, accounts);
+                      const colabAccess = canOpenColabWebForSession(sess, sessAccount);
+                      return (
+                        <div
+                          className="pt-2 border-t flex items-center justify-between gap-2 text-[11.5px]"
+                          style={{ borderColor: 'var(--border-faint)' }}
                         >
-                          <ExternalLink className="w-3 h-3" />
-                          <span>{zh ? 'Colab 打开' : 'Open Colab'}</span>
-                        </button>
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void triggerDesktopAction(
+                                  'open-route',
+                                  sess.experiment_id
+                                    ? `/exp/${encodeURIComponent(sess.experiment_id)}`
+                                    : `/exp/${encodeURIComponent(sess.id)}`,
+                                )
+                              }
+                              title={
+                                zh
+                                  ? '在内置实验工作台免登录查看实时日志、执行代码与管理文件'
+                                  : 'Open in built-in Workbench (cookie-free logs, code & files)'
+                              }
+                              className="inline-flex items-center gap-1 font-medium text-fg-secondary hover:text-fg cursor-pointer shrink-0"
+                            >
+                              <ArrowUpRight className="w-3 h-3" />
+                              <span>{zh ? '工作台查看' : 'Workbench'}</span>
+                            </button>
 
-                        <button
-                          type="button"
-                          onClick={() =>
-                            void triggerDesktopAction(
-                              'open-route',
-                              sess.experiment_id
-                                ? `/exp/${encodeURIComponent(sess.experiment_id)}`
-                                : '/exp',
-                            )
-                          }
-                          className="inline-flex items-center gap-1 font-medium text-fg-secondary hover:text-fg cursor-pointer"
-                        >
-                          <ArrowUpRight className="w-3 h-3" />
-                          <span>{zh ? '工作台查看' : 'Workbench'}</span>
-                        </button>
-                      </div>
+                            {colabAccess.allowed ? (
+                              <button
+                                type="button"
+                                disabled={openingColabId === sess.id}
+                                onClick={() => void handleOpenColab(sess)}
+                                title={
+                                  zh
+                                    ? `需本机浏览器已登录 ${displayEmail(sess.account_email)}（自动附带 authuser）；未登录请点「工作台查看」免登录操作`
+                                    : `Requires browser signed into ${displayEmail(sess.account_email)} (auto-appends authuser); otherwise use Workbench`
+                                }
+                                className="inline-flex items-center gap-1 font-medium text-fg-muted hover:text-fg cursor-pointer disabled:opacity-50 shrink-0"
+                              >
+                                <ExternalLink className="w-3 h-3" />
+                                <span>{zh ? 'Colab 网页' : 'Colab Web'}</span>
+                              </button>
+                            ) : colabAccess.reason === 'contributor' ? (
+                              <span
+                                title={
+                                  zh
+                                    ? '好友授权共享账号不支持外部 Colab 网页登录，请点左侧「工作台查看」免登录操作'
+                                    : 'Friend-shared OAuth account — use Workbench for cookie-free access'
+                                }
+                                className="inline-flex items-center gap-1 text-[10.5px] text-fg-muted truncate"
+                              >
+                                <ShieldCheck className="w-3 h-3 shrink-0" />
+                                <span className="truncate">{zh ? '共享免登录' : 'Shared'}</span>
+                              </span>
+                            ) : null}
+                          </div>
 
-                      <button
-                        type="button"
-                        disabled={stopping}
-                        onClick={() => void handleReleaseSession(sess)}
-                        onBlur={() => {
-                          if (confirmingStop) setConfirmExternalStopId(null);
-                        }}
-                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer disabled:opacity-50"
-                        style={{
-                          backgroundColor: confirmingStop
-                            ? 'var(--coral)'
-                            : 'var(--coral-soft)',
-                          color: confirmingStop ? '#ffffff' : 'var(--coral-text)',
-                        }}
-                      >
-                        <Power className="w-3 h-3" />
-                        <span>
-                          {stopping
-                            ? zh
-                              ? '释放中…'
-                              : 'Stopping…'
-                            : confirmingStop
-                              ? zh
-                                ? '确认释放?'
-                                : 'Confirm?'
-                              : zh
-                                ? '释放'
-                                : 'Release'}
-                        </span>
-                      </button>
-                    </div>
+                          <button
+                            type="button"
+                            disabled={stopping}
+                            onClick={() => void handleReleaseSession(sess)}
+                            onBlur={() => {
+                              if (confirmingStop) setConfirmExternalStopId(null);
+                            }}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer disabled:opacity-50 shrink-0"
+                            style={{
+                              backgroundColor: confirmingStop
+                                ? 'var(--coral)'
+                                : 'var(--coral-soft)',
+                              color: confirmingStop ? '#ffffff' : 'var(--coral-text)',
+                            }}
+                          >
+                            <Power className="w-3 h-3" />
+                            <span>
+                              {stopping
+                                ? zh
+                                  ? '释放中…'
+                                  : 'Stopping…'
+                                : confirmingStop
+                                  ? zh
+                                    ? '确认释放?'
+                                    : 'Confirm?'
+                                  : zh
+                                    ? '释放'
+                                    : 'Release'}
+                            </span>
+                          </button>
+                        </div>
+                      );
+                    })()}
                   </div>
                 );
               })
@@ -2104,6 +2219,197 @@ export function TrayPopoverPage({
       </footer>
     </div>
   );
+
+  // ============================================================================
+  // Sleek Stardust System Tray Right-Click Context Menu (`240×324`)
+  // ============================================================================
+  if (!embedded && trayMode === 'menu') {
+    const contextMenuCard = (
+      <div
+        role="menu"
+        aria-label={zh ? 'ColabHive 托盘菜单' : 'ColabHive Tray Menu'}
+        className={cn(
+          'flex flex-col justify-between select-none overflow-hidden text-fg p-2',
+          isCompactViewport
+            ? 'w-full h-screen'
+            : 'w-[256px] rounded-[14px] border',
+        )}
+        style={{
+          backgroundColor: 'var(--surface-0)',
+          borderColor: isCompactViewport ? 'transparent' : 'var(--border-float)',
+          boxShadow: isCompactViewport
+            ? 'none'
+            : '0 20px 48px -12px rgba(0, 0, 0, 0.18), 0 4px 12px -2px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(24, 24, 27, 0.06)',
+        }}
+      >
+        {/* Top Live Pool Status Pill */}
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => void triggerDesktopAction('open-route', '/pool')}
+          className="w-full px-2.5 py-2 mb-1.5 rounded-[10px] border bg-[#FFFFFF] dark:bg-[#1E1E1C] hover:border-line-strong transition-colors flex items-center justify-between gap-2 text-left cursor-pointer"
+          style={{
+            borderColor: 'var(--glass-card-border)',
+            boxShadow: '0 1px 2px rgba(0, 0, 0, 0.03)',
+          }}
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <TrayBrandMark size={18} />
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className="text-[12.5px] font-semibold tracking-[-0.015em] text-fg leading-none">
+                  ColabHive
+                </span>
+                <span
+                  className="w-1.5 h-1.5 rounded-full shrink-0"
+                  style={{
+                    backgroundColor: isTrayGateRequired ? 'var(--amber)' : 'var(--emerald)',
+                  }}
+                />
+              </div>
+              <div className="ch-num text-[11px] text-fg-muted mt-1 truncate leading-none">
+                {isTrayGateRequired
+                  ? zh
+                    ? '等待管理员解锁'
+                    : 'Admin unlock required'
+                  : zh
+                    ? `剩余 ${formatCU(totalCU)} CU · ${activeSessions.length} 台运行`
+                    : `${formatCU(totalCU)} CU · ${activeSessions.length} active`}
+              </div>
+            </div>
+          </div>
+          <ChevronRight className="w-3.5 h-3.5 text-fg-muted shrink-0" />
+        </button>
+
+        {/* Primary Window Controls */}
+        <div className="space-y-0.5">
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => void triggerDesktopAction('open-main', '/')}
+            className="w-full h-[33px] px-2.5 rounded-[9px] flex items-center gap-2.5 text-[12.5px] font-semibold text-fg hover:bg-[var(--hover-fill)] transition-colors cursor-pointer text-left"
+          >
+            <AppWindow className="w-[15px] h-[15px] text-fg-secondary shrink-0" />
+            <span className="truncate">{zh ? '打开 ColabHive 主窗口' : 'Open ColabHive'}</span>
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => void handleMenuOpenPanel()}
+            className="w-full h-[33px] px-2.5 rounded-[9px] flex items-center gap-2.5 text-[12.5px] font-medium text-fg-secondary hover:text-fg hover:bg-[var(--hover-fill)] transition-colors cursor-pointer text-left"
+          >
+            <PanelBottomOpen className="w-[15px] h-[15px] text-fg-muted shrink-0" />
+            <span className="truncate">{zh ? '打开快捷悬浮面板' : 'Open Quick Panel'}</span>
+          </button>
+        </div>
+
+        <div className="my-1.5 h-px bg-[var(--border-faint)] mx-1" />
+
+        {/* Utility Actions */}
+        <div className="space-y-0.5">
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => void handleMenuSyncNow()}
+            className="w-full h-[33px] px-2.5 rounded-[9px] flex items-center gap-2.5 text-[12.5px] font-medium text-fg-secondary hover:text-fg hover:bg-[var(--hover-fill)] transition-colors cursor-pointer text-left"
+          >
+            <RefreshCw
+              className={cn('w-[14px] h-[14px] text-fg-muted shrink-0', syncing && 'animate-spin')}
+            />
+            <span className="truncate">
+              {syncing
+                ? zh
+                  ? '正在同步云端算力…'
+                  : 'Syncing cloud pool…'
+                : zh
+                  ? '立即同步云端算力'
+                  : 'Sync Cloud Quotas'}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => void handleMenuCopyMCP()}
+            className="w-full h-[33px] px-2.5 rounded-[9px] flex items-center gap-2.5 text-[12.5px] font-medium text-fg-secondary hover:text-fg hover:bg-[var(--hover-fill)] transition-colors cursor-pointer text-left"
+          >
+            {menuCopiedMcp ? (
+              <Check className="w-[14px] h-[14px] text-[var(--emerald-text)] shrink-0" />
+            ) : (
+              <Copy className="w-[14px] h-[14px] text-fg-muted shrink-0" />
+            )}
+            <span className="truncate">
+              {menuCopiedMcp
+                ? zh
+                  ? '已复制 MCP 接口地址'
+                  : 'Copied MCP Endpoint'
+                : zh
+                  ? '复制本机 MCP 接口地址'
+                  : 'Copy Local MCP URL'}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            role="menuitemcheckbox"
+            aria-checked={Boolean(autostart)}
+            onClick={() => void handleToggleAutostart()}
+            className="w-full h-[33px] px-2.5 rounded-[9px] flex items-center justify-between gap-2 text-[12.5px] font-medium text-fg-secondary hover:text-fg hover:bg-[var(--hover-fill)] transition-colors cursor-pointer text-left"
+          >
+            <span className="flex items-center gap-2.5 min-w-0">
+              <Power className="w-[14px] h-[14px] text-fg-muted shrink-0" />
+              <span className="truncate">{zh ? '开机自动启动' : 'Launch at Login'}</span>
+            </span>
+            <span
+              className="px-1.5 py-0.5 rounded-full text-[10px] font-semibold shrink-0 transition-colors"
+              style={
+                autostart
+                  ? {
+                      backgroundColor: 'var(--emerald-soft)',
+                      color: 'var(--emerald-text)',
+                    }
+                  : {
+                      backgroundColor: 'var(--surface-2)',
+                      color: 'var(--text-muted)',
+                    }
+              }
+            >
+              {autostart ? (zh ? '已开启' : 'ON') : zh ? '关闭' : 'OFF'}
+            </span>
+          </button>
+        </div>
+
+        <div className="my-1.5 h-px bg-[var(--border-faint)] mx-1" />
+
+        {/* Quit */}
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => {
+            if (isDemoSiteMode()) {
+              setTrayMode('panel');
+              return;
+            }
+            void triggerDesktopAction('quit');
+          }}
+          className="w-full h-[33px] px-2.5 rounded-[9px] flex items-center gap-2.5 text-[12.5px] font-medium text-fg-secondary hover:bg-[var(--coral-soft)] hover:text-[var(--coral-text)] transition-colors cursor-pointer text-left"
+        >
+          <LogOut className="w-[14px] h-[14px] shrink-0 opacity-80" />
+          <span className="truncate">{zh ? '退出 ColabHive' : 'Quit ColabHive'}</span>
+        </button>
+      </div>
+    );
+
+    if (isCompactViewport) {
+      return contextMenuCard;
+    }
+    return (
+      <div className="min-h-screen w-full flex items-center justify-center p-3">
+        {contextMenuCard}
+      </div>
+    );
+  }
 
   if (embedded || isCompactViewport) {
     return popoverSurface;

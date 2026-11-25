@@ -99,6 +99,11 @@ func parseFreeQuotaWire(w *freeWire) *models.FreeQuotaInfo {
 // and `colab.pa.googleapis.com/v1/user-info?get_ccu_consumption_info=true`), updates
 // EWMA empirical burn calibration when `assignmentsCount == 1`, and persists updated telemetry.
 func (s *Service) RefreshAccountQuota(ctx context.Context, id string) (*models.Account, error) {
+	if existing, gErr := s.st.GetAccount(ctx, id); gErr == nil && existing != nil && existing.EffectiveProvider() != models.ProviderColab {
+		// Legacy non-Colab rows (if present in an older SQLite DB) are skipped strictly read-only.
+		return s.GetAccount(ctx, id)
+	}
+
 	accessToken, proxyURL, err := s.AcquireAccessToken(ctx, id)
 	if err != nil {
 		return nil, err
@@ -313,7 +318,7 @@ func (s *Service) RefreshAllQuotas(ctx context.Context) (*models.QuotaSummary, e
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 6)
 	for _, acc := range accts {
-		if !acc.Enabled || acc.Health == models.HealthRevokedByUser {
+		if !acc.Enabled || acc.Health == models.HealthRevokedByUser || acc.EffectiveProvider() != models.ProviderColab {
 			continue
 		}
 		if acc.EncryptedRefreshToken == "" && acc.EncryptedAccessToken == "" {
@@ -392,6 +397,10 @@ func (s *Service) GetQuotaSummary(ctx context.Context) (*models.QuotaSummary, er
 	}
 
 	for _, acc := range accts {
+		if acc == nil || acc.EffectiveProvider() != models.ProviderColab {
+			// Legacy non-Colab rows (if present in an older DB) must not inflate Colab pool capacity counts.
+			continue
+		}
 		s.recomputeAccountDerivedFields(ctx, acc)
 		if acc.Health == models.HealthRevokedByUser {
 			continue
@@ -464,7 +473,7 @@ func (s *Service) GetQuotaSummary(ctx context.Context) (*models.QuotaSummary, er
 		)
 
 		for _, acc := range accts {
-			if !acc.Enabled || acc.Health == models.HealthRevokedByUser {
+			if acc == nil || acc.EffectiveProvider() != models.ProviderColab || !acc.Enabled || acc.Health == models.HealthRevokedByUser {
 				continue
 			}
 			if !isAccountEntitledToGPU(acc, spec.Accelerator, now) {
@@ -528,9 +537,10 @@ func (s *Service) recomputeAccountDerivedFields(ctx context.Context, acc *models
 		return
 	}
 	now := s.now()
+	isNonColab := acc.EffectiveProvider() != models.ProviderColab
 
 	// Heal tunnel-polled accounts persisted earlier with FREE tier before RefreshAccountQuota re-runs.
-	if !acc.CustomSubscriptionTier &&
+	if !isNonColab && !acc.CustomSubscriptionTier &&
 		(acc.SubscriptionTier == "" || acc.SubscriptionTier == models.TierFree) &&
 		acc.TunnelAPISupported && (acc.PaidCUBalance > 0 || acc.ActiveAssignments >= 2 || acc.LiveBurnRateCUHr > 0) {
 		var eligGPUs []string
@@ -549,7 +559,7 @@ func (s *Service) recomputeAccountDerivedFields(ctx context.Context, acc *models
 
 	// Ensure ReferenceCycleCU reflects standard cycle quota (2,500 CU for AI Ultra, 500 CU for Pro+, 100 CU for Pro/PAYG)
 	// unless the user manually customized ReferenceCycleCU via PATCH /api/v1/accounts/{id}.
-	if !acc.CustomCycleCU {
+	if !isNonColab && !acc.CustomCycleCU {
 		std := TierStandardCycleCU(acc.SubscriptionTier)
 		if acc.ReferenceCycleCU < std {
 			acc.ReferenceCycleCU = std
@@ -623,6 +633,15 @@ func (s *Service) recomputeAccountDerivedFields(ctx context.Context, acc *models
 	// Synchronize non-terminal Health state with live telemetry & guardrails.
 	hasActiveCooldown := acc.CooldownUntil != nil && now.Before(*acc.CooldownUntil)
 	switch {
+	case isNonColab:
+		// Never flip or mutate non-Colab provider health during read-only derived computation;
+		// only reflect explicit administrative pause when disabled.
+		if !acc.Enabled && acc.Health != models.HealthRevokedByUser && acc.Health != models.HealthAuthExpired {
+			acc.Health = models.HealthPausedManual
+			if acc.HealthReason == "" {
+				acc.HealthReason = "Paused"
+			}
+		}
 	case acc.Health == models.HealthAuthExpired ||
 		acc.Health == models.HealthRevokedByUser ||
 		acc.Health == models.HealthQuarantinedDenylist ||

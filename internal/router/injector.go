@@ -243,8 +243,14 @@ func (s *Service) resolveClientPaths(clientID models.AgentClientID) (hostPath st
 		wslCandidates = []string{".codeium/windsurf/mcp_config.json"}
 		wslFallback = ".codeium/windsurf/mcp_config.json"
 	case models.AgentOpenCode:
-		jsoncPath := filepath.Join(home, ".config", "opencode", "opencode.jsonc")
-		jsonPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+		ocBase := filepath.Join(home, ".config")
+		if s.homeDir == "" && goos != "windows" {
+			if xdgCfg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdgCfg != "" {
+				ocBase = xdgCfg
+			}
+		}
+		jsoncPath := filepath.Join(ocBase, "opencode", "opencode.jsonc")
+		jsonPath := filepath.Join(ocBase, "opencode", "opencode.json")
 		if info, err := os.Stat(jsoncPath); err == nil && !info.IsDir() {
 			hostPath = jsoncPath
 		} else if infoJ, errJ := os.Stat(jsonPath); errJ == nil && !infoJ.IsDir() {
@@ -289,9 +295,16 @@ func discoverWSLUserFileCandidates(wslRoot string, relSlashPaths []string, defau
 				}
 			}
 			if fallbackCandidate == "" && defaultNative != "" {
-				defCand := filepath.Join(homeRoot, u.Name(), defaultNative)
-				if info, pErr := os.Stat(filepath.Dir(defCand)); pErr == nil && info.IsDir() {
-					fallbackCandidate = defCand
+				userHome := filepath.Join(homeRoot, u.Name())
+				defCand := filepath.Join(userHome, defaultNative)
+				probeDir := filepath.Dir(defCand)
+				if probeDir == userHome && defaultRelSlash == ".claude.json" {
+					probeDir = filepath.Join(userHome, ".claude")
+				}
+				if probeDir != userHome {
+					if info, pErr := os.Stat(probeDir); pErr == nil && info.IsDir() {
+						fallbackCandidate = defCand
+					}
 				}
 			}
 		}
@@ -356,8 +369,16 @@ func (s *Service) inspectClientStatus(
 				lastSynced = &mod
 			}
 		}
-	} else if dirInfo, dErr := os.Stat(filepath.Dir(hostPath)); dErr == nil && dirInfo.IsDir() {
-		detected = true
+	} else {
+		// Claude Code stores its top-level config at `~/.claude.json` whose parent is `$HOME`
+		// (which always exists). Probe `~/.claude` instead so fresh machines aren't false-positives.
+		probeDir := filepath.Dir(hostPath)
+		if spec.id == models.AgentClaudeCode {
+			probeDir = filepath.Join(probeDir, ".claude")
+		}
+		if dirInfo, dErr := os.Stat(probeDir); dErr == nil && dirInfo.IsDir() {
+			detected = true
+		}
 	}
 
 	backupExists := false

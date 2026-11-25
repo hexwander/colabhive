@@ -99,9 +99,22 @@ func (c Config) withDefaults() Config {
 }
 
 type discoveredRecord struct {
-	meta       models.DiscoveredLocalCredential
-	sourcePath string
-	sourceType string
+	meta        models.DiscoveredLocalCredential
+	sourcePath  string
+	sourceType  string
+	resolvedEm  string
+	resolvedNm  string
+	accessToken string
+	expiry      *time.Time
+}
+
+type cachedScanIdentity struct {
+	email        string
+	displayName  string
+	accessToken  string
+	expiry       *time.Time
+	invalidGrant bool
+	cachedAt     time.Time
 }
 
 // Service implements models.AccountPoolService.
@@ -115,7 +128,6 @@ type Service struct {
 	oauthMu      sync.Mutex
 	pendingOAuth map[string]*models.OAuthPendingSession
 
-	inviteMu      sync.Mutex
 	emailUpsertMu sync.Mutex
 
 	acctMu       sync.Mutex
@@ -125,8 +137,9 @@ type Service struct {
 	drainerMu      sync.RWMutex
 	sessionDrainer func(ctx context.Context, accountID string) error
 
-	scanMu     sync.RWMutex
-	discovered map[string]discoveredRecord
+	scanMu            sync.RWMutex
+	discovered        map[string]discoveredRecord
+	scanIdentityCache map[string]cachedScanIdentity
 }
 
 var _ models.AccountPoolService = (*Service)(nil)
@@ -157,8 +170,9 @@ func NewConcreteService(st models.Store, hub models.EventHub, cfg Config) *Servi
 		cipher:       vc,
 		transport:    tf,
 		pendingOAuth: make(map[string]*models.OAuthPendingSession),
-		acctLocks:    make(map[string]*sync.Mutex),
-		discovered:   make(map[string]discoveredRecord),
+		acctLocks:         make(map[string]*sync.Mutex),
+		discovered:        make(map[string]discoveredRecord),
+		scanIdentityCache: make(map[string]cachedScanIdentity),
 	}
 }
 
@@ -702,10 +716,24 @@ func (s *Service) ReconcileAccountSessionRollup(
 		effectiveBurn = localBurn
 	}
 
+	prevActive := acc.ActiveAssignments
 	acc.ActiveAssignments = effectiveActive
 	acc.LiveBurnRateCUHr = round2(effectiveBurn)
 	acc.ActiveSessionSummary = strings.Join(summaries, " + ")
 	acc.UpdatedAt = now
+
+	// When a live GPU session on this account was just freed (active count decreased),
+	// immediately lift any HTTP 412 / MAX_CONCURRENCY cooldown so the user can schedule
+	// into the newly freed slot right away instead of waiting out the 10-minute cooldown.
+	if effectiveActive < prevActive && acc.Health == models.HealthMaxConcurrency {
+		acc.CooldownUntil = nil
+		acc.HealthReason = ""
+		if effectiveActive == 0 {
+			acc.Health = models.HealthHealthy
+		} else {
+			acc.Health = models.HealthActiveWorking
+		}
+	}
 
 	s.recomputeAccountDerivedFields(ctx, acc)
 	if err := s.st.SaveAccount(ctx, acc); err != nil {

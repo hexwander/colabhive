@@ -16,6 +16,7 @@ func TestParseDesktopFlags(t *testing.T) {
 	t.Setenv("COLABHIVE_DATA_DIR", "")
 	t.Setenv("COLABHIVE_DB_PATH", "")
 	t.Setenv("COLABHIVE_WEB_DIR", "")
+	t.Setenv("COLABHIVE_DEFAULT_STRATEGY", "")
 
 	var errBuf bytes.Buffer
 	cfg, showVer, err := parseDesktopFlags([]string{
@@ -52,6 +53,9 @@ func TestParseDesktopFlags(t *testing.T) {
 	}
 	if cfg.AttachURL != "http://127.0.0.1:17860" {
 		t.Fatalf("unexpected AttachURL: %q", cfg.AttachURL)
+	}
+	if cfg.DefaultStrategy != "" {
+		t.Fatalf("expected omitted --strategy to remain empty (preserve SQLite policy), got %q", cfg.DefaultStrategy)
 	}
 }
 

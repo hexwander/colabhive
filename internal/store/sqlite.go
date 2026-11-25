@@ -107,6 +107,9 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 		return fmt.Errorf("store: check migration v1: %w", err)
 	}
 	if count > 0 {
+		if err := s.ensureAccountsProviderSecretColumnLocked(ctx); err != nil {
+			return err
+		}
 		if err := s.ensureCaseUniqueExperimentsIndexLocked(ctx); err != nil {
 			return err
 		}
@@ -140,6 +143,7 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			invite_code TEXT NOT NULL DEFAULT '',
 			encrypted_refresh_token TEXT NOT NULL DEFAULT '',
 			encrypted_access_token TEXT NOT NULL DEFAULT '',
+			encrypted_provider_secret TEXT NOT NULL DEFAULT '',
 			oauth_client_id TEXT NOT NULL DEFAULT '',
 			oauth_client_secret TEXT NOT NULL DEFAULT '',
 			receipt_token_hash TEXT NOT NULL DEFAULT '',
@@ -223,7 +227,50 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)`, now); err != nil {
 		return fmt.Errorf("store: record migration v1: %w", err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.ensureAccountsProviderSecretColumnLocked(ctx)
+}
+
+func (s *SQLiteStore) ensureAccountsProviderSecretColumnLocked(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(accounts);`)
+	if err != nil {
+		return fmt.Errorf("store: inspect accounts columns: %w", err)
+	}
+	hasTable := false
+	hasProviderSecret := false
+	for rows.Next() {
+		hasTable = true
+		var (
+			cid       int
+			name      string
+			colType   string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if sErr := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); sErr != nil {
+			_ = rows.Close()
+			return fmt.Errorf("store: scan accounts table_info: %w", sErr)
+		}
+		if strings.EqualFold(strings.TrimSpace(name), "encrypted_provider_secret") {
+			hasProviderSecret = true
+		}
+	}
+	if rErr := rows.Err(); rErr != nil {
+		_ = rows.Close()
+		return fmt.Errorf("store: iterate accounts table_info: %w", rErr)
+	}
+	_ = rows.Close()
+
+	if !hasTable || hasProviderSecret {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE accounts ADD COLUMN encrypted_provider_secret TEXT NOT NULL DEFAULT '';`); err != nil {
+		return fmt.Errorf("store: add encrypted_provider_secret column to accounts: %w", err)
+	}
+	return nil
 }
 
 // Close closes the underlying SQLite database handle.
@@ -248,6 +295,10 @@ func normalizeAccountDefaults(acc *models.Account) models.Account {
 	}
 	cp.UpdatedAt = now
 	acc.UpdatedAt = now
+	cp.Provider = models.NormalizeProviderType(string(cp.Provider))
+	if strings.TrimSpace(string(acc.Provider)) == "" {
+		acc.Provider = cp.Provider
+	}
 	if cp.Groups == nil {
 		cp.Groups = []string{}
 	}
@@ -313,9 +364,9 @@ func (s *SQLiteStore) SaveAccount(ctx context.Context, acc *models.Account) erro
 		INSERT INTO accounts (
 			id, email, subscription_tier, health, enabled, priority, proxy_id,
 			is_contributor, invite_code, encrypted_refresh_token, encrypted_access_token,
-			oauth_client_id, oauth_client_secret, receipt_token_hash,
+			encrypted_provider_secret, oauth_client_id, oauth_client_secret, receipt_token_hash,
 			created_at, updated_at, payload_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			email = excluded.email,
 			subscription_tier = excluded.subscription_tier,
@@ -327,6 +378,7 @@ func (s *SQLiteStore) SaveAccount(ctx context.Context, acc *models.Account) erro
 			invite_code = excluded.invite_code,
 			encrypted_refresh_token = excluded.encrypted_refresh_token,
 			encrypted_access_token = excluded.encrypted_access_token,
+			encrypted_provider_secret = excluded.encrypted_provider_secret,
 			oauth_client_id = excluded.oauth_client_id,
 			oauth_client_secret = excluded.oauth_client_secret,
 			receipt_token_hash = excluded.receipt_token_hash,
@@ -344,6 +396,7 @@ func (s *SQLiteStore) SaveAccount(ctx context.Context, acc *models.Account) erro
 		clean.InviteCode,
 		acc.EncryptedRefreshToken,
 		acc.EncryptedAccessToken,
+		acc.EncryptedProviderSecret,
 		acc.OAuthClientID,
 		acc.OAuthClientSecret,
 		receiptHash,
@@ -363,14 +416,15 @@ type rowScanner interface {
 
 func scanAccountRow(r rowScanner) (*models.Account, error) {
 	var (
-		encRefresh   string
-		encAccess    string
-		clientID     string
-		clientSecret string
-		receiptHash  string
-		payloadJSON  string
+		encRefresh        string
+		encAccess         string
+		encProviderSecret string
+		clientID          string
+		clientSecret      string
+		receiptHash       string
+		payloadJSON       string
 	)
-	if err := r.Scan(&encRefresh, &encAccess, &clientID, &clientSecret, &receiptHash, &payloadJSON); err != nil {
+	if err := r.Scan(&encRefresh, &encAccess, &encProviderSecret, &clientID, &clientSecret, &receiptHash, &payloadJSON); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("%w: account", ErrNotFound)
 		}
@@ -383,9 +437,15 @@ func scanAccountRow(r rowScanner) (*models.Account, error) {
 	}
 	acc.EncryptedRefreshToken = encRefresh
 	acc.EncryptedAccessToken = encAccess
+	acc.EncryptedProviderSecret = encProviderSecret
 	acc.OAuthClientID = clientID
 	acc.OAuthClientSecret = clientSecret
 	acc.ReceiptTokenHash = receiptHash
+	if strings.TrimSpace(string(acc.Provider)) == "" {
+		acc.Provider = models.ProviderColab
+	} else {
+		acc.Provider = models.NormalizeProviderType(string(acc.Provider))
+	}
 	if acc.Groups == nil {
 		acc.Groups = []string{}
 	}
@@ -398,7 +458,7 @@ func scanAccountRow(r rowScanner) (*models.Account, error) {
 	return &acc, nil
 }
 
-const accountSelectCols = `encrypted_refresh_token, encrypted_access_token, oauth_client_id, oauth_client_secret, receipt_token_hash, payload_json`
+const accountSelectCols = `encrypted_refresh_token, encrypted_access_token, encrypted_provider_secret, oauth_client_id, oauth_client_secret, receipt_token_hash, payload_json`
 
 func (s *SQLiteStore) GetAccount(ctx context.Context, id string) (*models.Account, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+accountSelectCols+` FROM accounts WHERE id = ?`, id)
@@ -606,104 +666,6 @@ func (s *SQLiteStore) DeleteProxy(ctx context.Context, id string) error {
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return fmt.Errorf("%w: proxy %s", ErrNotFound, id)
-	}
-	return nil
-}
-
-// ============================================================================
-// Contributor Invites
-// ============================================================================
-
-func (s *SQLiteStore) SaveInvite(ctx context.Context, invite *models.ContributorInvite) error {
-	if invite == nil {
-		return errors.New("store: nil invite")
-	}
-	if invite.Code == "" {
-		invite.Code = models.NewPrefixedID("ch_inv_")
-	}
-	if invite.CreatedAt.IsZero() {
-		invite.CreatedAt = time.Now().UTC()
-	}
-	if invite.TargetGroups == nil {
-		invite.TargetGroups = []string{}
-	}
-	if invite.SupportedModes == nil {
-		invite.SupportedModes = []models.OAuthAuthMode{models.OAuthModeRemoteCopyPaste}
-	}
-	if invite.RequiredScopes == nil {
-		invite.RequiredScopes = append([]string(nil), models.ContributorOAuthScopes...)
-	}
-
-	payload, err := json.Marshal(invite)
-	if err != nil {
-		return fmt.Errorf("store: marshal invite: %w", err)
-	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO invites (code, revoked, created_at, payload_json)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(code) DO UPDATE SET
-			revoked = excluded.revoked,
-			payload_json = excluded.payload_json
-	`, invite.Code, boolToInt(invite.Revoked), invite.CreatedAt.UTC().Format(time.RFC3339Nano), string(payload))
-	if err != nil {
-		return fmt.Errorf("store: save invite %q: %w", invite.Code, err)
-	}
-	return nil
-}
-
-func (s *SQLiteStore) GetInvite(ctx context.Context, code string) (*models.ContributorInvite, error) {
-	var payloadJSON string
-	err := s.db.QueryRowContext(ctx, `SELECT payload_json FROM invites WHERE code = ?`, code).Scan(&payloadJSON)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("%w: invite %s", ErrNotFound, code)
-		}
-		return nil, fmt.Errorf("store: get invite %q: %w", code, err)
-	}
-	var inv models.ContributorInvite
-	if err := json.Unmarshal([]byte(payloadJSON), &inv); err != nil {
-		return nil, fmt.Errorf("store: unmarshal invite: %w", err)
-	}
-	return &inv, nil
-}
-
-func (s *SQLiteStore) ListInvites(ctx context.Context) ([]*models.ContributorInvite, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT payload_json FROM invites ORDER BY created_at DESC`)
-	if err != nil {
-		return nil, fmt.Errorf("store: list invites: %w", err)
-	}
-	defer rows.Close()
-
-	out := make([]*models.ContributorInvite, 0)
-	for rows.Next() {
-		var payloadJSON string
-		if err := rows.Scan(&payloadJSON); err != nil {
-			return nil, err
-		}
-		var inv models.ContributorInvite
-		if err := json.Unmarshal([]byte(payloadJSON), &inv); err != nil {
-			return nil, err
-		}
-		out = append(out, &inv)
-	}
-	return out, rows.Err()
-}
-
-func (s *SQLiteStore) DeleteInvite(ctx context.Context, code string) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	res, err := s.db.ExecContext(ctx, `DELETE FROM invites WHERE code = ?`, code)
-	if err != nil {
-		return fmt.Errorf("store: delete invite %q: %w", code, err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("%w: invite %s", ErrNotFound, code)
 	}
 	return nil
 }

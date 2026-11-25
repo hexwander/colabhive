@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,15 +105,6 @@ func (m *memStore) SaveProxy(_ context.Context, _ *models.ProxyConfig) error    
 func (m *memStore) GetProxy(_ context.Context, _ string) (*models.ProxyConfig, error) { return nil, nil }
 func (m *memStore) ListProxies(_ context.Context) ([]*models.ProxyConfig, error)  { return nil, nil }
 func (m *memStore) DeleteProxy(_ context.Context, _ string) error                 { return nil }
-
-func (m *memStore) SaveInvite(_ context.Context, _ *models.ContributorInvite) error { return nil }
-func (m *memStore) GetInvite(_ context.Context, _ string) (*models.ContributorInvite, error) {
-	return nil, nil
-}
-func (m *memStore) ListInvites(_ context.Context) ([]*models.ContributorInvite, error) {
-	return nil, nil
-}
-func (m *memStore) DeleteInvite(_ context.Context, _ string) error { return nil }
 
 func (m *memStore) SaveSession(_ context.Context, sess *models.RuntimeSession) error {
 	m.mu.Lock()
@@ -624,6 +616,54 @@ func TestSurgicalAgentConfigInjectorAllFormats(t *testing.T) {
 	}
 }
 
+func TestAgentClientDetectionMacOSAndClaudeCodeNoFalsePositive(t *testing.T) {
+	ctx := context.Background()
+	tmpHome := t.TempDir()
+	svc := NewServiceWithDirs(newMemStore(), nil, &memHub{}, tmpHome, "", "", "darwin")
+
+	statuses, err := svc.ListAgentClientStatuses(ctx, "http://127.0.0.1:7860", "")
+	if err != nil {
+		t.Fatalf("ListAgentClientStatuses failed: %v", err)
+	}
+	byID := make(map[models.AgentClientID]models.AgentClientConfigStatus, len(statuses))
+	for _, st := range statuses {
+		byID[st.ClientID] = st
+		if st.WSLConfigPath != "" {
+			t.Fatalf("expected empty WSLConfigPath on darwin for %s, got %q", st.ClientID, st.WSLConfigPath)
+		}
+		if st.Detected {
+			t.Fatalf("expected %s Detected=false in empty macOS home, got true (path=%s)", st.ClientID, st.ConfigPath)
+		}
+	}
+
+	wantClaudeDesktop := filepath.Join(tmpHome, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+	if got := byID[models.AgentClaudeDesktop].ConfigPath; got != wantClaudeDesktop {
+		t.Fatalf("macOS Claude Desktop path mismatch: want %q got %q", wantClaudeDesktop, got)
+	}
+
+	// Creating `~/.claude` should mark Claude Code as detected without requiring `~/.claude.json` yet.
+	if err := os.MkdirAll(filepath.Join(tmpHome, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(wantClaudeDesktop), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	statusesAfter, err := svc.ListAgentClientStatuses(ctx, "http://127.0.0.1:7860", "")
+	if err != nil {
+		t.Fatalf("ListAgentClientStatuses after mkdir failed: %v", err)
+	}
+	afterByID := make(map[models.AgentClientID]models.AgentClientConfigStatus, len(statusesAfter))
+	for _, st := range statusesAfter {
+		afterByID[st.ClientID] = st
+	}
+	if !afterByID[models.AgentClaudeCode].Detected {
+		t.Fatalf("expected Claude Code Detected=true after ~/.claude exists")
+	}
+	if !afterByID[models.AgentClaudeDesktop].Detected {
+		t.Fatalf("expected Claude Desktop Detected=true after ~/Library/Application Support/Claude exists")
+	}
+}
+
 func TestConcurrentAcquireAccountSlotShards4ZeroStampede(t *testing.T) {
 	ctx := context.Background()
 	st := newMemStore()
@@ -969,5 +1009,199 @@ func TestNamespacedStickyBindingsTenantIsolation(t *testing.T) {
 	}
 	if gotAdm, ok := svc.ResolveStickySession(ctx, "shared-sticky"); !ok || gotAdm.ID != "sess_admin" {
 		t.Fatalf("Tenant A unbind broke Admin sticky binding: %+v", gotAdm)
+	}
+}
+
+func TestNormalizeStrategyFreeFirstAliases(t *testing.T) {
+	ctx := context.Background()
+	st := newMemStore()
+	svc := NewServiceWithDirs(st, nil, &memHub{}, t.TempDir(), "", "", "linux")
+
+	for _, alias := range []string{"free-first", "free_first", "zero-cost", "FREE-FIRST", " Zero-Cost "} {
+		got := NormalizeStrategy(models.RoutingStrategy(alias), models.StrategyWasteZero)
+		if got != models.StrategyFreeFirst {
+			t.Fatalf("NormalizeStrategy(%q) = %q, want %q", alias, got, models.StrategyFreeFirst)
+		}
+	}
+
+	updated, err := svc.UpdatePolicy(ctx, models.RouterPolicy{
+		DefaultStrategy:      models.RoutingStrategy("zero-cost"),
+		StickySessionEnabled: true,
+		AutoFallbackEnabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("UpdatePolicy(zero-cost): %v", err)
+	}
+	if updated.DefaultStrategy != models.StrategyFreeFirst {
+		t.Fatalf("expected persisted DefaultStrategy=%q, got %q", models.StrategyFreeFirst, updated.DefaultStrategy)
+	}
+}
+
+func TestStrategyFreeFirstThreeTierRoutingOrder(t *testing.T) {
+	ctx := context.Background()
+	st := newMemStore()
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+
+	svc := NewServiceWithDirs(st, nil, &memHub{}, t.TempDir(), "", "", "linux")
+	svc.NowFunc = func() time.Time { return now }
+
+	expEarly := now.Add(5 * 24 * time.Hour)
+	expLater := now.Add(45 * 24 * time.Hour)
+
+	accounts := []*models.Account{
+		// Legacy non-Colab row (must NEVER be scheduled or receive pending slot reservations!)
+		{
+			ID:               "acc_legacy_ext",
+			Email:            "legacy@external.pool",
+			Provider:         models.ProviderType("legacy_external"),
+			SubscriptionTier: models.TierFree,
+			Health:           models.HealthHealthy,
+			Enabled:          true,
+			MaxConcurrentVMs: 2,
+		},
+		// Tier 1: Colab Free T4 dynamic window (6,000 milli-CCU = ~3.06h)
+		{
+			ID:               "acc_colab_free",
+			Email:            "free.colab@gmail.com",
+			Provider:         models.ProviderColab,
+			SubscriptionTier: models.TierFree,
+			Health:           models.HealthQuotaLowFreeOnly,
+			Enabled:          true,
+			MaxConcurrentVMs: 1,
+			FreeQuota: &models.FreeQuotaInfo{
+				RemainingMilliCCU: 6000,
+				RemainingFreeCU:   6.0,
+			},
+			GPUEntitlements: map[models.AcceleratorType]models.GPUEntitlement{
+				models.AcceleratorG4: {Accelerator: models.AcceleratorG4, Status: models.EntitlementTierRestricted},
+				models.AcceleratorT4: {Accelerator: models.AcceleratorT4, Status: models.EntitlementAvailable},
+			},
+		},
+		// Tier 2a: Paid Colab Pro+ with earliest expiring CU batch (+5d)
+		{
+			ID:                     "acc_colab_paid_early",
+			Email:                  "pro.early@gmail.com",
+			Provider:               models.ProviderColab,
+			SubscriptionTier:       models.TierProPlus,
+			Health:                 models.HealthHealthy,
+			Enabled:                true,
+			MaxConcurrentVMs:       3,
+			PaidCUBalance:          140.0,
+			SchedulableCU:          140.0,
+			ExpiringSoonCU:         60.0,
+			EarliestBatchExpiresAt: &expEarly,
+		},
+		// Tier 2b: Paid Colab Ultra with later expiring CU batch (+45d)
+		{
+			ID:                     "acc_colab_paid_later",
+			Email:                  "ultra.later@gmail.com",
+			Provider:               models.ProviderColab,
+			SubscriptionTier:       models.TierAIUltra,
+			Health:                 models.HealthHealthy,
+			Enabled:                true,
+			MaxConcurrentVMs:       5,
+			PaidCUBalance:          400.0,
+			SchedulableCU:          400.0,
+			EarliestBatchExpiresAt: &expLater,
+		},
+	}
+
+	for _, a := range accounts {
+		if err := st.SaveAccount(ctx, a); err != nil {
+			t.Fatalf("SaveAccount(%s): %v", a.ID, err)
+		}
+	}
+
+	var excluded []string
+	expectPick := func(step string, selector string, reqGPU models.AcceleratorType, autoFallback bool, wantID string, wantTier models.AcceleratorType) {
+		t.Helper()
+		acc, tier, release, err := svc.AcquireAccountSlot(ctx, models.SessionAllocRequest{
+			Accelerator:        reqGPU,
+			AutoFallback:       autoFallback,
+			Strategy:           models.StrategyFreeFirst,
+			AccountSelector:    selector,
+			ExcludedAccountIDs: excluded,
+		})
+		if err != nil {
+			t.Fatalf("[%s] AcquireAccountSlot failed: %v", step, err)
+		}
+		release()
+		if acc.ID != wantID || tier != wantTier {
+			t.Fatalf("[%s] got (%s, %s), want (%s, %s)", step, acc.ID, tier, wantID, wantTier)
+		}
+		excluded = append(excluded, acc.ID)
+	}
+
+	// 1. Default Colab interactive selection (`AccountSelector == ""`):
+	//    MUST exclude legacy non-Colab rows BEFORE slot reservation,
+	//    while StrategyFreeFirst prioritizes $0 Free Colab T4 FIRST, then expiring Paid Colab CUs!
+	expectPick("colab-tier1-free-t4", "", models.AcceleratorG4, true, "acc_colab_free", models.AcceleratorT4)
+	expectPick("colab-tier2-paid-early", "", models.AcceleratorG4, true, "acc_colab_paid_early", models.AcceleratorG4)
+	expectPick("colab-tier2-paid-later", "", models.AcceleratorG4, true, "acc_colab_paid_later", models.AcceleratorG4)
+
+	// Once all Colab accounts are excluded, default Colab interactive selection MUST fail closed.
+	if _, _, _, err := svc.AcquireAccountSlot(ctx, models.SessionAllocRequest{
+		Accelerator:        models.AcceleratorG4,
+		AutoFallback:       true,
+		Strategy:           models.StrategyFreeFirst,
+		ExcludedAccountIDs: excluded,
+	}); !errors.Is(err, ErrNoEligibleAccount) {
+		t.Fatalf("expected ErrNoEligibleAccount when all Colab accounts are exhausted, got %v", err)
+	}
+
+	// Verify zero pending reservations leaked onto any non-Colab account.
+	svc.allocMu.Lock()
+	if svc.pendingByAccount["acc_legacy_ext"] != 0 {
+		svc.allocMu.Unlock()
+		t.Fatalf("non-Colab account unexpectedly received pending reservation %d", svc.pendingByAccount["acc_legacy_ext"])
+	}
+	svc.allocMu.Unlock()
+
+	// 2. Explicit non-Colab `provider:...` and `id:<non-colab>` selectors MUST be rejected with ErrProviderNotInteractive!
+	for _, sel := range []string{"provider:legacy_external", "id:acc_legacy_ext", "acc_legacy_ext"} {
+		if _, _, _, err := svc.AcquireAccountSlot(ctx, models.SessionAllocRequest{
+			Accelerator:     models.AcceleratorG4,
+			AutoFallback:    true,
+			Strategy:        models.StrategyFreeFirst,
+			AccountSelector: sel,
+		}); !errors.Is(err, ErrProviderNotInteractive) {
+			t.Fatalf("expected ErrProviderNotInteractive for non-Colab selector %q, got %v", sel, err)
+		}
+	}
+
+	// Verify explicit `id:<colab-id>` and `provider:colab` select the exact matching Colab account!
+	pinnedAcc, pinnedTier, pinnedRel, err := svc.AcquireAccountSlot(ctx, models.SessionAllocRequest{
+		Accelerator:     models.AcceleratorG4,
+		AutoFallback:    false,
+		AccountSelector: "id:acc_colab_paid_later",
+	})
+	if err != nil {
+		t.Fatalf("AcquireAccountSlot(id:acc_colab_paid_later) failed: %v", err)
+	}
+	pinnedRel()
+	if pinnedAcc.ID != "acc_colab_paid_later" || pinnedTier != models.AcceleratorG4 {
+		t.Fatalf("expected id:acc_colab_paid_later on G4, got (%s, %s)", pinnedAcc.ID, pinnedTier)
+	}
+
+	colabSelAcc, colabSelTier, colabSelRel, err := svc.AcquireAccountSlot(ctx, models.SessionAllocRequest{
+		Accelerator:     models.AcceleratorG4,
+		AutoFallback:    true,
+		Strategy:        models.StrategyFreeFirst,
+		AccountSelector: "provider:colab",
+	})
+	if err != nil {
+		t.Fatalf("AcquireAccountSlot(provider:colab) failed: %v", err)
+	}
+	colabSelRel()
+	if colabSelAcc.ID != "acc_colab_free" || colabSelTier != models.AcceleratorT4 {
+		t.Fatalf("expected provider:colab to select acc_colab_free on T4, got (%s, %s)", colabSelAcc.ID, colabSelTier)
+	}
+
+	// Unknown provider selector fails closed (never falls back to Colab)
+	if _, _, err := svc.SelectAccountAndTier(ctx, models.SessionAllocRequest{
+		Accelerator:     models.AcceleratorT4,
+		AccountSelector: "provider:unknown_cloud",
+	}); !errors.Is(err, ErrNoEligibleAccount) {
+		t.Fatalf("expected ErrNoEligibleAccount for unknown provider selector, got %v", err)
 	}
 }

@@ -265,7 +265,7 @@ func (s *Server) seedDefaultMockAccounts() {
 		AuthCode:         "4/0A_contrib_alice",
 		RefreshToken:     "1//0contrib_refresh_alice",
 		AccessToken:      "ya29.contrib_access_alice",
-		Scopes:           append([]string(nil), models.ContributorOAuthScopes...),
+		Scopes:           append([]string(nil), models.OwnerOAuthScopes...),
 	})
 }
 

@@ -2,8 +2,6 @@ package mockcolab
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"time"
 
 	"github.com/colabhive/colabhive/internal/models"
@@ -15,8 +13,6 @@ import (
 type DemoClusterSummary struct {
 	Accounts           []*models.Account
 	Proxies            []*models.ProxyConfig
-	Invite             *models.ContributorInvite
-	DemoReceiptToken   string
 	ActiveExperimentID string
 	QuotaSummary       *models.QuotaSummary
 }
@@ -44,7 +40,6 @@ func SeedDemoCluster(
 		}
 		return &DemoClusterSummary{
 			Accounts:           existingAccts,
-			DemoReceiptToken:   "ch_rcpt_demo_alice_2026",
 			ActiveExperimentID: "exp_qwen3_27b_eval",
 			QuotaSummary:       summary,
 		}, nil
@@ -88,44 +83,11 @@ func SeedDemoCluster(
 		}
 	}
 
-	// 2. Seed Shareable Contributor Invite
-	invExpiry := now.Add(14 * 24 * time.Hour)
-	invite := &models.ContributorInvite{
-		Code:           "ch_inv_icml2026",
-		PoolTitle:      "ICML 2026 Open Reasoning Sweep",
-		MaintainerName: "ColabHive Lab",
-		WelcomeNote:    "Donate idle 90-day expiring Colab Pro/Pro+ CUs (colaboratory-only scope, zero Drive access).",
-		TargetGroups:   []string{"contributors", "eval-sweep"},
-		DefaultProxyID: "prx_us_iad_02",
-		DefaultGuardrails: models.ContributorGuardrails{
-			MinReserveCU:          50.0,
-			MaxDonatedCUTotal:     200.0,
-			MaxDonatedCUDaily:     60.0,
-			AllowPaidCUBurn:       true,
-			AllowedGPUs:           []models.AcceleratorType{models.AcceleratorG4, models.AcceleratorA100, models.AcceleratorL4, models.AcceleratorT4},
-			MaxConcurrentVMs:      1,
-			BlockDrivePropagation: true,
-		},
-		MaxUses:        25,
-		UsedCount:      1,
-		SupportedModes: []models.OAuthAuthMode{models.OAuthModeRemoteCopyPaste, models.OAuthModeCLIDonate},
-		RequiredScopes: append([]string(nil), models.ContributorOAuthScopes...),
-		ShareURL:       "http://127.0.0.1:7860/contribute/ch_inv_icml2026",
-		ExpiresAt:      &invExpiry,
-		CreatedAt:      now.Add(-24 * time.Hour),
-	}
-	if err := st.SaveInvite(ctx, invite); err != nil {
-		return nil, err
-	}
-
-	// 3. Seed 4 Realistic Accounts (AI Ultra, Pro+, Pro, Contributed Pro+)
+	// 2. Seed 4 Realistic Accounts (AI Ultra, Pro+, Pro, Pro+ Secondary)
 	expSoon := now.Add(5 * 24 * time.Hour)
 	cycleReset := now.Add(18 * 24 * time.Hour)
 	refillSoon := now.Add(3*time.Hour + 15*time.Minute)
 	tokenExp := now.Add(55 * time.Minute)
-	demoReceiptToken := "ch_rcpt_demo_alice_2026"
-	rcptSum := sha256.Sum256([]byte(demoReceiptToken))
-	rcptHash := hex.EncodeToString(rcptSum[:])
 
 	type acctSeed struct {
 		acc     *models.Account
@@ -262,24 +224,16 @@ func SeedDemoCluster(
 				PaidCUBalance:     310.00,
 				ReferenceCycleCU:  500.0,
 				SchedulableCU:     185.60,
-				LiveBurnRateCUHr:  9.66,
+				LiveBurnRateCUHr:   9.66,
 				TunnelAPISupported: true,
-				IsContributor:      true,
-				InviteCode:         invite.Code,
-				ReceiptTokenHash:   rcptHash,
+				IsContributor:      false,
 				Guardrails: models.ContributorGuardrails{
-					MinReserveCU:          50.0,
-					MaxDonatedCUTotal:     200.0,
-					MaxDonatedCUDaily:     60.0,
-					DonatedCUUsedTotal:    14.40,
-					DonatedCUUsedToday:    6.20,
-					AllowPaidCUBurn:       true,
-					AllowedGPUs:           []models.AcceleratorType{models.AcceleratorG4, models.AcceleratorA100, models.AcceleratorL4, models.AcceleratorT4},
-					MaxConcurrentVMs:      1,
-					BlockDrivePropagation: true,
-					ExpiresAt:             &invExpiry,
+					MinReserveCU:     50.0,
+					AllowPaidCUBurn:  true,
+					AllowedGPUs:      []models.AcceleratorType{models.AcceleratorG4, models.AcceleratorA100, models.AcceleratorL4, models.AcceleratorT4},
+					MaxConcurrentVMs: 1,
 				},
-				Scopes:               append([]string(nil), models.ContributorOAuthScopes...),
+				Scopes:               append([]string(nil), models.OwnerOAuthScopes...),
 				ActiveSessionSummary: "1× G4 96GB (qwen3_s3)",
 				TokenExpiresAt:       &tokenExp,
 				LastPolledAt:         &now,
@@ -486,8 +440,6 @@ func SeedDemoCluster(
 	return &DemoClusterSummary{
 		Accounts:           savedAccts,
 		Proxies:            proxies,
-		Invite:             invite,
-		DemoReceiptToken:   demoReceiptToken,
 		ActiveExperimentID: expID,
 		QuotaSummary:       quotaSummary,
 	}, nil

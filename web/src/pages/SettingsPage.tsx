@@ -67,6 +67,7 @@ const fmtCU1 = (v: number) => formatCU(v, 1);
 
 /** Plain-Chinese names for the account-picking strategies. */
 const STRATEGY_LABEL_ZH: Record<RoutingStrategy, string> = {
+  'free-first': '优先烧免费额度（白嫖优先）',
   'waste-zero': '防过期优先（推荐）',
   'max-balance': '大余额优先',
   'sticky-session': '固定环境优先',
@@ -401,8 +402,18 @@ export function SettingsPage({ health, onOpenConnectWithKey }: SettingsPageProps
             value={activeTab}
             onChange={setActiveTab}
             options={[
-              { value: 'keys', icon: <KeyRound />, label: t('cfg.api_keys'), count: keys.length },
-              { value: 'proxies', icon: <Globe />, label: t('cfg.proxies'), count: proxies.length },
+              {
+                value: 'keys',
+                icon: <KeyRound />,
+                label: zh ? '访问密钥' : 'Access Keys',
+                count: keys.length,
+              },
+              {
+                value: 'proxies',
+                icon: <Globe />,
+                label: zh ? '网络代理' : 'Proxies',
+                count: proxies.length,
+              },
             ]}
           />
         </div>
@@ -713,7 +724,7 @@ export function SettingsPage({ health, onOpenConnectWithKey }: SettingsPageProps
             }
             body={
               zh
-                ? '如果只挂 1–2 个自用账号，保持默认本机直连即可；当你同时管理多个 Google 账号或跨区账号时，在这里添加 HTTP / SOCKS5 代理并在「账号与共享」里绑定后，该账号的登录刷新、余额查询和代码执行都会固定走同一个出口 IP。'
+                ? '如果只挂 1–2 个自用账号，保持默认本机直连即可；当你同时管理多个 Google 账号或跨区账号时，在这里添加 HTTP / SOCKS5 代理并在「账号与算力池」里绑定后，该账号的登录刷新、余额查询和代码执行都会固定走同一个出口 IP。'
                 : 'With 1–2 personal accounts, Direct Connection works fine. Add HTTP / SOCKS5 proxies here when managing multiple or cross-region accounts so all OAuth, quota checks, and Jupyter tunnels stay pinned to one exit IP.'
             }
           />
@@ -724,7 +735,7 @@ export function SettingsPage({ health, onOpenConnectWithKey }: SettingsPageProps
             title={t('cfg.proxies')}
             subtitle={
               zh
-                ? '添加后，到「账号与共享」里点开某个账号，就能把它绑定到这里的任意一个代理。'
+                ? '添加后，到「账号与算力池」里点开某个账号，就能把它绑定到这里的任意一个代理。'
                 : 'After adding one, open an account under “Accounts & Sharing” to bind it to any proxy listed here.'
             }
             headerRight={

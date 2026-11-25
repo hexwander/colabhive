@@ -1,25 +1,21 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowRight,
   Check,
-  ChevronLeft,
-  ChevronRight,
   Copy,
   Globe,
+  GripVertical,
   KeyRound,
   Loader2,
   Pin,
   RefreshCw,
   Sparkles,
   Unlink,
-  Zap,
 } from 'lucide-react';
 import {
   ALL_ROUTING_STRATEGIES,
   type AcceleratorType,
   type Account,
-  type AgentClientConfigStatus,
-  type AgentClientID,
   type RouteBinding,
   type RouterPolicy,
   type RuntimeSession,
@@ -43,7 +39,6 @@ import {
 } from '../components/ui';
 import { RouterTopologyGraph } from '../components/topology/RouterTopologyGraph';
 import { TraceInspectorPanel } from '../components/topology/TraceInspectorPanel';
-import { buildFallbackClientConfigs } from '../components/layout/telemetryUi';
 import {
   DEMO_ACCOUNTS,
   DEMO_ROUTER_POLICY,
@@ -65,40 +60,11 @@ export interface AgentRouterPageProps {
 const GENERAL_WATERFALL: AcceleratorType[] = ['H100', 'G4', 'A100', 'L4', 'T4'];
 const LARGE_VRAM_WATERFALL: AcceleratorType[] = ['H100', 'G4'];
 
-const AGENT_CONNECTED_EVENT = 'colabhive:agent-connected';
 const SETTINGS_PATH = '/cfg';
 
 type RouterTab = 'strategy' | 'sticky' | 'logs';
 
-/** The six flagship tools surfaced in the Quick Connect bar. */
-interface QuickConnectTool {
-  key: string;
-  /** Matching MCP client; omitted for the bundled `colab` CLI. */
-  clientId?: AgentClientID;
-  label: string;
-  monogram: string;
-}
-
-const QUICK_CONNECT_TOOLS: QuickConnectTool[] = [
-  { key: 'claude-code', clientId: 'claude-code', label: 'Claude Code', monogram: 'CC' },
-  { key: 'antigravity', clientId: 'antigravity', label: 'Antigravity', monogram: 'AG' },
-  { key: 'cursor', clientId: 'cursor', label: 'Cursor', monogram: 'CU' },
-  { key: 'codex', clientId: 'codex', label: 'Codex', monogram: 'CX' },
-  { key: 'gemini-cli', clientId: 'gemini-cli', label: 'Gemini CLI', monogram: 'GM' },
-  { key: 'colab-cli', label: 'colab CLI', monogram: '>_' },
-];
-
-/** Offline snapshot of the client list (same shape the local service returns). */
-function fallbackClientStatuses(): AgentClientConfigStatus[] {
-  return buildFallbackClientConfigs(
-    typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:7860',
-    '',
-    'http',
-  );
-}
-
 export function AgentRouterPage({
-  onOpenConnect,
   onNavigate,
   deploymentMode = 'local',
   publicUrl,
@@ -111,7 +77,6 @@ export function AgentRouterPage({
   const [traces, setTraces] = useState<ToolTraceEvent[]>([]);
   const [sessions, setSessions] = useState<RuntimeSession[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
-  const [clientStatuses, setClientStatuses] = useState<AgentClientConfigStatus[]>([]);
 
   const [loading, setLoading] = useState(true);
   const [isOfflineDemo, setIsOfflineDemo] = useState(false);
@@ -123,12 +88,16 @@ export function AgentRouterPage({
   const [streamPaused, setStreamPaused] = useState(false);
   const [callerFilter, setCallerFilter] = useState<string | null>(null);
   const [mcpCopied, setMcpCopied] = useState(false);
+  const [draggingTier, setDraggingTier] = useState<AcceleratorType | null>(null);
+  const [dragDraftChain, setDragDraftChain] = useState<AcceleratorType[] | null>(null);
+  const dragDraftChainRef = useRef<AcceleratorType[] | null>(null);
+  const dragCommittedRef = useRef(false);
 
   // Progressive disclosure below the topology: one focused panel at a time
   const [activeTab, setActiveTab] = useState<RouterTab>('strategy');
   // The tab card joins the page entrance cascade once; later tab switches
   // should appear immediately rather than wait out the stagger delay.
-  const [tabCardStagger, setTabCardStagger] = useState(2);
+  const [tabCardStagger, setTabCardStagger] = useState(1);
   const selectTab = useCallback((next: RouterTab) => {
     setTabCardStagger(0);
     setActiveTab(next);
@@ -150,21 +119,14 @@ export function AgentRouterPage({
     setAccounts(DEMO_ACCOUNTS);
   }, []);
 
-  /** Re-reads which AI tools are detected / connected on this machine. */
-  const refreshClientStatuses = useCallback(async () => {
-    const list = await api.listAgentClients().catch(() => fallbackClientStatuses());
-    setClientStatuses(Array.isArray(list) ? list : fallbackClientStatuses());
-  }, []);
-
   const loadRouterState = useCallback(async () => {
     try {
-      const [pol, stickyList, traceList, sessList, accList, clientList] = await Promise.all([
+      const [pol, stickyList, traceList, sessList, accList] = await Promise.all([
         api.getRouterPolicy(),
         api.listStickyBindings(),
         api.listTraces(100),
         api.listSessions().catch(() => [] as RuntimeSession[]),
         api.listAccounts().catch(() => [] as Account[]),
-        api.listAgentClients().catch(() => fallbackClientStatuses()),
       ]);
 
       if (pol) setPolicy(pol);
@@ -172,13 +134,10 @@ export function AgentRouterPage({
       setTraces(Array.isArray(traceList) ? traceList : []);
       setSessions(Array.isArray(sessList) ? sessList : []);
       setAccounts(Array.isArray(accList) ? accList : []);
-      setClientStatuses(Array.isArray(clientList) ? clientList : fallbackClientStatuses());
       setIsOfflineDemo(false);
       setTickSec(0);
     } catch {
       activateDemoState();
-      // The router endpoints are unreachable: still show the detection snapshot
-      setClientStatuses((prev) => (prev.length > 0 ? prev : fallbackClientStatuses()));
     } finally {
       setLoading(false);
     }
@@ -188,12 +147,21 @@ export function AgentRouterPage({
     void loadRouterState();
   }, [loadRouterState]);
 
-  // Changes made inside the Connect drawer show up on the tiles right away
+  // Policy changes made elsewhere (e.g. Free-First toggle) show up right away
   useEffect(() => {
-    const handleAgentConnected = () => void refreshClientStatuses();
-    window.addEventListener(AGENT_CONNECTED_EVENT, handleAgentConnected);
-    return () => window.removeEventListener(AGENT_CONNECTED_EVENT, handleAgentConnected);
-  }, [refreshClientStatuses]);
+    const handlePolicyChanged = () => {
+      api
+        .getRouterPolicy()
+        .then((pol) => {
+          if (pol) setPolicy(pol);
+        })
+        .catch(() => {});
+    };
+    window.addEventListener('colabhive:router-policy-changed', handlePolicyChanged);
+    return () => {
+      window.removeEventListener('colabhive:router-policy-changed', handlePolicyChanged);
+    };
+  }, []);
 
   // Real-time WebSocket stream for `trace_event`, `session_updated`, `account_updated`
   const handleWSEvent = useCallback(
@@ -234,6 +202,16 @@ export function AgentRouterPage({
 
   const wsState = useColabHiveEvents(handleWSEvent, !isOfflineDemo);
 
+  const policySavedTimerRef = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (policySavedTimerRef.current !== null) {
+        window.clearTimeout(policySavedTimerRef.current);
+      }
+    },
+    [],
+  );
+
   const persistPolicy = async (next: RouterPolicy) => {
     setPolicy(next);
     setSavingPolicy(true);
@@ -245,7 +223,20 @@ export function AgentRouterPage({
         await new Promise((r) => window.setTimeout(r, 180));
       }
       setPolicySavedFlash(true);
-      window.setTimeout(() => setPolicySavedFlash(false), 1800);
+      if (policySavedTimerRef.current !== null) {
+        window.clearTimeout(policySavedTimerRef.current);
+      }
+      policySavedTimerRef.current = window.setTimeout(() => {
+        setPolicySavedFlash(false);
+        policySavedTimerRef.current = null;
+      }, 1800);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('colabhive:router-policy-changed', {
+            detail: { strategy: next.default_strategy },
+          }),
+        );
+      }
     } catch {
       // Keep optimistic UI update if transient failure
     } finally {
@@ -263,6 +254,56 @@ export function AgentRouterPage({
     void persistPolicy({ ...policy, fallback_chain: chain });
   };
 
+  const handleTierDragStart = (e: React.DragEvent<HTMLDivElement>, tier: AcceleratorType) => {
+    if (!policy.auto_fallback_enabled) {
+      e.preventDefault();
+      return;
+    }
+    const base = [...(policy.fallback_chain || GENERAL_WATERFALL)];
+    dragCommittedRef.current = false;
+    dragDraftChainRef.current = base;
+    setDraggingTier(tier);
+    setDragDraftChain(base);
+    e.dataTransfer.effectAllowed = 'move';
+    try {
+      e.dataTransfer.setData('text/plain', tier);
+    } catch {
+      // Ignore WebView restrictions on dataTransfer payloads
+    }
+  };
+
+  const handleTierDragOver = (e: React.DragEvent<HTMLDivElement>, targetTier: AcceleratorType) => {
+    if (!draggingTier || !policy.auto_fallback_enabled) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (draggingTier === targetTier) return;
+    const current = dragDraftChainRef.current || [...(policy.fallback_chain || GENERAL_WATERFALL)];
+    const fromIdx = current.indexOf(draggingTier);
+    const toIdx = current.indexOf(targetTier);
+    if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return;
+    const next = [...current];
+    const [moved] = next.splice(fromIdx, 1);
+    next.splice(toIdx, 0, moved);
+    dragDraftChainRef.current = next;
+    setDragDraftChain(next);
+  };
+
+  const finishTierDrag = (commit: boolean) => {
+    const finalChain = dragDraftChainRef.current;
+    const origChain = policy.fallback_chain || GENERAL_WATERFALL;
+    setDraggingTier(null);
+    setDragDraftChain(null);
+    dragDraftChainRef.current = null;
+    if (!commit || dragCommittedRef.current || !finalChain) return;
+    dragCommittedRef.current = true;
+    const changed =
+      finalChain.length !== origChain.length ||
+      finalChain.some((tier, i) => tier !== origChain[i]);
+    if (changed) {
+      void persistPolicy({ ...policy, fallback_chain: finalChain });
+    }
+  };
+
   const handleUnbindSticky = async (stickyKey: string) => {
     setUnbindingKey(stickyKey);
     try {
@@ -277,7 +318,7 @@ export function AgentRouterPage({
     }
   };
 
-  const isCloudMode = deploymentMode === 'cloud' || Boolean(clientStatuses[0]?.cloud_mode);
+  const isCloudMode = deploymentMode === 'cloud';
 
   const mcpEndpointUrl = useMemo(() => {
     const base = (
@@ -309,29 +350,6 @@ export function AgentRouterPage({
     [traces],
   );
 
-  // Quick Connect bar: live detection state per flagship tool
-  const clientStatusById = useMemo(() => {
-    const m = new Map<AgentClientID, AgentClientConfigStatus>();
-    clientStatuses.forEach((c) => m.set(c.client_id, c));
-    return m;
-  }, [clientStatuses]);
-
-  const quickTools = useMemo(
-    () =>
-      QUICK_CONNECT_TOOLS.map((tool) => {
-        const status = tool.clientId ? clientStatusById.get(tool.clientId) : undefined;
-        return {
-          ...tool,
-          isInjected: Boolean(status?.injected),
-          // The bundled `colab` CLI needs no config file, so it is always ready
-          isDetected: tool.clientId ? Boolean(status?.detected) : true,
-        };
-      }),
-    [clientStatusById],
-  );
-  const injectedCount = quickTools.filter((tool) => tool.isInjected).length;
-  const detectedCount = quickTools.filter((tool) => !tool.isInjected && tool.isDetected).length;
-
   // Manual refresh feedback for the header control
   const [refreshing, setRefreshing] = useState(false);
   const handleRefresh = async () => {
@@ -344,7 +362,11 @@ export function AgentRouterPage({
   };
 
   const fallbackChain = policy.fallback_chain || GENERAL_WATERFALL;
-  const strictChainActive = policy.fallback_chain?.length === 2;
+  const strictChainActive =
+    fallbackChain.length === 2 &&
+    fallbackChain.includes('H100') &&
+    fallbackChain.includes('G4');
+  const generalChainActive = !strictChainActive && policy.auto_fallback_enabled;
   const keepWarmMinutes = Math.round(policy.sticky_idle_ttl_sec / 60);
 
   const failoverLabel = isZh ? '自动换卡防报错' : 'Auto-switch GPU when out of stock';
@@ -413,6 +435,25 @@ export function AgentRouterPage({
               )}
             </button>
 
+            <a
+              href={SETTINGS_PATH}
+              onClick={(e) => {
+                if (onNavigate) {
+                  e.preventDefault();
+                  onNavigate(SETTINGS_PATH);
+                }
+              }}
+              className="h-8 px-3 rounded-full border border-line bg-surface-2 hover:bg-surface-1 hover:border-line-strong text-[12px] font-medium text-fg-secondary hover:text-fg inline-flex items-center gap-1.5 transition-colors no-underline shadow-[var(--shadow-control)]"
+              title={
+                isZh
+                  ? '管理 AI 工具使用的访问密钥与网络代理'
+                  : 'Manage access keys and network proxies'
+              }
+            >
+              <KeyRound className="w-3.5 h-3.5 shrink-0" />
+              <span>{isZh ? '密钥与代理' : 'Keys & Proxies'}</span>
+            </a>
+
             <IconButton
               label={isZh ? '刷新' : 'Refresh'}
               onClick={() => void handleRefresh()}
@@ -435,151 +476,9 @@ export function AgentRouterPage({
         }
       />
 
-      {/* Layer 0 — Quick Connect bar */}
-      <LayeredCard padding="sm" staggerIndex={0}>
-        <div className="space-y-3.5">
-          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
-            <div className="flex items-center gap-3 min-w-0">
-              <span className="ui-glow-badge w-8 h-8 rounded-xl" aria-hidden="true">
-                {isCloudMode ? <Globe className="w-4 h-4" /> : <Zap className="w-4 h-4" />}
-              </span>
-              <div className="min-w-0">
-                <h2 className="text-[14px] font-semibold leading-snug text-fg">
-                  {isCloudMode
-                    ? isZh
-                      ? '云端远程网关接入（Cloud Remote MCP）'
-                      : 'Cloud Remote MCP Gateway'
-                    : isZh
-                      ? '一键连接你的 AI 工具'
-                      : 'Quick Connect Your AI Tools'}
-                </h2>
-                <p className="mt-0.5 text-[12px] leading-relaxed text-fg-secondary">
-                  {isCloudMode
-                    ? isZh
-                      ? '点击任一编程助手即可一键签发独立 ch_sk_... 密钥，并生成本机 colabhive connect 命令或远程 Streamable HTTP 配置'
-                      : 'Click any AI assistant to mint a scoped ch_sk_... key and copy a 1-line laptop colabhive connect command or remote HTTP snippet'
-                    : isZh
-                      ? '自动检测本机已安装的编程助手，点击即可一键写入配置（首次修改自动备份，随时可撤回）'
-                      : 'Auto-detects installed AI assistants — click any tool for 1-click setup with automatic backup'}
-                </p>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2 shrink-0">
-              {isCloudMode ? (
-                <StatusPill tone="sky" dot>
-                  {isZh ? '支持本机 CLI 一行绑定远程网关' : 'Remote HTTP + Laptop CLI'}
-                </StatusPill>
-              ) : (
-                <StatusPill tone={injectedCount > 0 ? 'emerald' : 'coral'} dot>
-                  {injectedCount > 0
-                    ? isZh
-                      ? `已接入 ${injectedCount} 个工具`
-                      : `${injectedCount} connected`
-                    : detectedCount > 0
-                      ? isZh
-                        ? `检测到 ${detectedCount} 个可接入工具`
-                        : `${detectedCount} detected`
-                      : isZh
-                        ? `${quickTools.length} 款工具可一键接入`
-                        : `${quickTools.length} tools ready`}
-                </StatusPill>
-              )}
-
-              <a
-                href={SETTINGS_PATH}
-                onClick={(e) => {
-                  if (onNavigate) {
-                    e.preventDefault();
-                    onNavigate(SETTINGS_PATH);
-                  }
-                }}
-                className="ui-btn ui-btn-secondary ui-btn-md no-underline"
-                title={
-                  isZh
-                    ? '管理 AI 工具使用的访问密钥与网络代理'
-                    : 'Manage the access keys and network proxies your AI tools use'
-                }
-              >
-                <KeyRound className="w-3.5 h-3.5 shrink-0" />
-                {isZh ? '密钥与代理设置' : 'Keys & Proxies'}
-                <ArrowRight className="w-3 h-3 shrink-0" />
-              </a>
-            </div>
-          </div>
-
-          <div className="rounded-2xl bg-surface-1 border border-line-faint p-2">
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-2.5 ui-stagger">
-              {quickTools.map((tool) => (
-                <button
-                  key={tool.key}
-                  type="button"
-                  onClick={() => onOpenConnect?.()}
-                  data-done={(!isCloudMode && tool.isInjected) || undefined}
-                  title={
-                    isCloudMode
-                      ? isZh
-                        ? `点击生成 ${tool.label} 远程接入命令与专属 ch_sk_... 密钥`
-                        : `Click to mint a key and copy remote setup for ${tool.label}`
-                      : tool.isInjected
-                        ? isZh
-                          ? `${tool.label} 已接入，点击管理或撤回配置`
-                          : `${tool.label} is connected — click to manage or undo`
-                        : isZh
-                          ? `点击一键接入 ${tool.label}`
-                          : `Click to connect ${tool.label}`
-                  }
-                  className={cn(
-                    'group relative flex flex-col justify-between min-w-0 rounded-[14px] border p-3 cursor-pointer text-left transition-all duration-200 bg-surface-2 hover:bg-surface-1 hover:-translate-y-[1px]',
-                    !isCloudMode && tool.isInjected
-                      ? 'border-[var(--emerald-border)] shadow-[var(--shadow-control)] hover:border-[var(--emerald)]'
-                      : 'border-line shadow-[var(--shadow-control)] hover:border-line-strong hover:shadow-[var(--shadow-card)]',
-                  )}
-                >
-                  <span className="flex items-center gap-2.5 min-w-0">
-                    <span
-                      aria-hidden="true"
-                      className="ch-num flex items-center justify-center w-8 h-8 shrink-0 rounded-[10px] text-[11px] font-bold tracking-tight"
-                      style={{
-                        backgroundColor: 'var(--brand-bg)',
-                        color: 'var(--brand-fg)',
-                        boxShadow: '0 1px 2px rgba(0, 0, 0, 0.14)',
-                      }}
-                    >
-                      {tool.monogram}
-                    </span>
-                    <span className="truncate text-[13px] font-semibold text-fg">{tool.label}</span>
-                  </span>
-
-                  <span className="mt-2.5 flex min-w-0">
-                    {isCloudMode ? (
-                      <StatusPill size="xs" tone="sky" dot className="max-w-full">
-                        <span className="truncate">{isZh ? '远程接入' : 'Remote MCP'}</span>
-                      </StatusPill>
-                    ) : tool.isInjected ? (
-                      <StatusPill size="xs" tone="emerald" dot className="max-w-full">
-                        <span className="truncate">{isZh ? '已接入' : 'Connected'}</span>
-                      </StatusPill>
-                    ) : tool.isDetected ? (
-                      <StatusPill size="xs" tone="coral" dot className="max-w-full">
-                        <span className="truncate">{isZh ? '一键接入' : '1-Click Connect'}</span>
-                      </StatusPill>
-                    ) : (
-                      <StatusPill size="xs" tone="neutral" className="max-w-full">
-                        <span className="truncate">{isZh ? '一键接入' : '1-Click Connect'}</span>
-                      </StatusPill>
-                    )}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-      </LayeredCard>
-
       {/* Layer 1 — live routing topology */}
       <RouterTopologyGraph
-        staggerIndex={1}
+        staggerIndex={0}
         policy={policy}
         bindings={bindings}
         sessions={sessions}
@@ -641,8 +540,13 @@ export function AgentRouterPage({
                 >
                   {ALL_ROUTING_STRATEGIES.map((strat) => {
                     const meta = STRATEGY_METADATA[strat];
-                    const selected = policy.default_strategy === strat;
-                    const isRecommended = strat === 'waste-zero';
+                    const effectiveStrategy =
+                      policy.default_strategy === 'free-opportunistic'
+                        ? 'free-first'
+                        : policy.default_strategy;
+                    const selected = effectiveStrategy === strat;
+                    const isFreeFirst = strat === 'free-first';
+                    const isRecommended = isFreeFirst || strat === 'waste-zero';
                     const [mainTitle, ...taglineParts] = (
                       isZh ? meta.zhTitle : meta.enTitle
                     ).split(' · ');
@@ -656,9 +560,13 @@ export function AgentRouterPage({
                         onClick={() => void persistPolicy({ ...policy, default_strategy: strat })}
                         className={cn(
                           'rounded-2xl p-4 text-left cursor-pointer transition-all hover:-translate-y-[1px]',
-                          selected
-                            ? 'bg-surface-2 border-[1.5px] border-[var(--accent)] shadow-[var(--shadow-card)]'
-                            : 'bg-surface-1/75 border border-line-faint hover:bg-surface-2 hover:border-line-strong',
+                          selected && isFreeFirst
+                            ? 'bg-surface-2 border-[1.5px] border-[var(--emerald)] shadow-[var(--shadow-card)]'
+                            : selected
+                              ? 'bg-surface-2 border-[1.5px] border-[var(--accent)] shadow-[var(--shadow-card)]'
+                              : isFreeFirst
+                                ? 'bg-[var(--emerald-soft)]/45 border border-[var(--emerald-border)] hover:bg-surface-2 hover:border-[var(--emerald)]'
+                                : 'bg-surface-1/75 border border-line-faint hover:bg-surface-2 hover:border-line-strong',
                         )}
                       >
                         <div className="flex items-start justify-between gap-2">
@@ -667,15 +575,17 @@ export function AgentRouterPage({
                               aria-hidden="true"
                               className={cn(
                                 'mt-[2px] flex items-center justify-center w-4 h-4 shrink-0 rounded-full border transition-colors',
-                                selected
-                                  ? 'bg-[var(--accent)] border-[var(--accent)]'
-                                  : 'bg-surface-2 border-line-strong',
+                                selected && isFreeFirst
+                                  ? 'bg-[var(--emerald)] border-[var(--emerald)]'
+                                  : selected
+                                    ? 'bg-[var(--accent)] border-[var(--accent)]'
+                                    : 'bg-surface-2 border-line-strong',
                               )}
                             >
                               {selected && (
                                 <Check
                                   className="w-2.5 h-2.5 stroke-[3]"
-                                  style={{ color: 'var(--accent-fg)' }}
+                                  style={{ color: isFreeFirst ? '#FFFFFF' : 'var(--accent-fg)' }}
                                 />
                               )}
                             </span>
@@ -692,7 +602,15 @@ export function AgentRouterPage({
                           </div>
                           <StatusPill
                             size="xs"
-                            tone={isRecommended ? 'emerald' : selected ? 'accent' : 'neutral'}
+                            tone={
+                              isFreeFirst
+                                ? 'emerald'
+                                : isRecommended
+                                  ? 'sky'
+                                  : selected
+                                    ? 'accent'
+                                    : 'neutral'
+                            }
                             className="shrink-0"
                           >
                             {isZh ? meta.zhBadge : meta.enBadge}
@@ -736,7 +654,8 @@ export function AgentRouterPage({
                   <div className="flex flex-wrap items-center gap-2 shrink-0">
                     <ActionButton
                       size="xs"
-                      variant="secondary"
+                      variant={generalChainActive ? 'primary' : 'secondary'}
+                      aria-pressed={generalChainActive}
                       title={
                         isZh
                           ? '按 H100 → G4 → A100 → L4 → T4 的顺序依次尝试，最大化成功率'
@@ -754,17 +673,24 @@ export function AgentRouterPage({
                     </ActionButton>
                     <ActionButton
                       size="xs"
-                      variant="secondary"
+                      variant={strictChainActive && policy.auto_fallback_enabled ? 'primary' : 'secondary'}
+                      aria-pressed={strictChainActive && policy.auto_fallback_enabled}
                       title={
-                        isZh
-                          ? '大模型保护：只在 H100 (80GB) 与 G4 (96GB) 之间换卡，绝不降到 40GB 显卡导致爆显存'
-                          : 'Large-model protection: only switches between H100 (80GB) and G4 (96GB); never drops to a 40GB GPU'
+                        strictChainActive
+                          ? isZh
+                            ? '再次点击可取消大显存保护，恢复 5 档通用顺延'
+                            : 'Click again to turn off ≥80GB protection and restore all 5 GPU tiers'
+                          : isZh
+                            ? '大模型保护：只在 H100 (80GB) 与 G4 (96GB) 之间换卡，绝不降到 40GB 显卡导致爆显存'
+                            : 'Large-model protection: only switches between H100 (80GB) and G4 (96GB); never drops to a 40GB GPU'
                       }
                       onClick={() =>
                         void persistPolicy({
                           ...policy,
                           auto_fallback_enabled: true,
-                          fallback_chain: LARGE_VRAM_WATERFALL,
+                          fallback_chain: strictChainActive
+                            ? GENERAL_WATERFALL
+                            : LARGE_VRAM_WATERFALL,
                         })
                       }
                     >
@@ -780,56 +706,116 @@ export function AgentRouterPage({
                   </div>
                 </div>
 
-                {/* Reorderable GPU order */}
+                {/* Reorderable GPU order (drag-and-drop + keyboard Left/Right) */}
                 <div
                   className={cn(
                     'flex flex-wrap items-center gap-1.5 transition-opacity',
                     !policy.auto_fallback_enabled && 'opacity-50',
                   )}
+                  onDragOver={(e) => {
+                    if (draggingTier) {
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = 'move';
+                    }
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    finishTierDrag(true);
+                  }}
                 >
-                  {fallbackChain.map((tier, idx, arr) => (
-                    <React.Fragment key={`${tier}-${idx}`}>
-                      <div className="inline-flex items-center h-7 px-0.5 rounded-lg border border-line bg-surface-2 shadow-[var(--shadow-control)]">
-                        <button
-                          type="button"
-                          disabled={idx === 0 || !policy.auto_fallback_enabled}
-                          onClick={() => moveFallbackTier(idx, -1)}
-                          aria-label={isZh ? `提高 ${tier} 优先级` : `Move ${tier} earlier`}
-                          title={isZh ? '提高优先级' : 'Move earlier'}
-                          className="inline-flex items-center justify-center w-5 h-5 rounded-md text-fg-muted cursor-pointer transition-colors hover:bg-[var(--hover-fill)] hover:text-fg disabled:opacity-30 disabled:cursor-not-allowed"
+                  {(dragDraftChain || fallbackChain).map((tier, idx, arr) => {
+                    const isDragging = draggingTier === tier;
+                    return (
+                      <React.Fragment key={tier}>
+                        <div
+                          draggable={policy.auto_fallback_enabled}
+                          tabIndex={policy.auto_fallback_enabled ? 0 : -1}
+                          role="listitem"
+                          aria-label={
+                            isZh
+                              ? `${tier}（拖动调整优先级，或用左右方向键移动）`
+                              : `${tier} (drag or use Left/Right arrows to reorder)`
+                          }
+                          title={
+                            isZh
+                              ? '按住拖动调整换卡顺序（也支持键盘 ← / → 键）'
+                              : 'Drag to reorder fallback priority (or press ← / →)'
+                          }
+                          onDragStart={(e) => handleTierDragStart(e, tier)}
+                          onDragOver={(e) => handleTierDragOver(e, tier)}
+                          onDrop={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            finishTierDrag(true);
+                          }}
+                          onDragEnd={() => finishTierDrag(true)}
+                          onKeyDown={(e) => {
+                            if (!policy.auto_fallback_enabled) return;
+                            if (e.key === 'ArrowLeft') {
+                              e.preventDefault();
+                              moveFallbackTier(idx, -1);
+                            } else if (e.key === 'ArrowRight') {
+                              e.preventDefault();
+                              moveFallbackTier(idx, 1);
+                            }
+                          }}
+                          className={cn(
+                            'inline-flex items-center gap-1.5 h-7 pl-1.5 pr-2.5 rounded-lg border select-none transition-all duration-150 focus:outline-none focus:ring-2 focus:ring-line-strong',
+                            policy.auto_fallback_enabled
+                              ? 'cursor-grab active:cursor-grabbing hover:border-line-strong hover:bg-surface-1'
+                              : 'cursor-not-allowed',
+                            isDragging
+                              ? 'border-[var(--brand-bg)] bg-surface-1 opacity-60 scale-[1.03] shadow-md'
+                              : 'border-line bg-surface-2 shadow-[var(--shadow-control)]',
+                          )}
                         >
-                          <ChevronLeft className="w-3 h-3" />
-                        </button>
-                        <span className="ch-num inline-flex items-center gap-1.5 px-1 text-[12px] font-medium text-fg">
+                          <GripVertical
+                            className="w-3 h-3 text-fg-muted/70 shrink-0"
+                            aria-hidden="true"
+                          />
                           <span
-                            className="w-1.5 h-1.5 rounded-full"
+                            className="w-1.5 h-1.5 rounded-full shrink-0"
                             style={{ backgroundColor: getAcceleratorCssColor(tier) }}
                           />
-                          {tier}
-                        </span>
-                        <button
-                          type="button"
-                          disabled={idx === arr.length - 1 || !policy.auto_fallback_enabled}
-                          onClick={() => moveFallbackTier(idx, 1)}
-                          aria-label={isZh ? `降低 ${tier} 优先级` : `Move ${tier} later`}
-                          title={isZh ? '降低优先级' : 'Move later'}
-                          className="inline-flex items-center justify-center w-5 h-5 rounded-md text-fg-muted cursor-pointer transition-colors hover:bg-[var(--hover-fill)] hover:text-fg disabled:opacity-30 disabled:cursor-not-allowed"
-                        >
-                          <ChevronRight className="w-3 h-3" />
-                        </button>
-                      </div>
-                      {idx < arr.length - 1 && (
-                        <ArrowRight className="w-3 h-3 shrink-0 text-fg-muted" aria-hidden="true" />
-                      )}
-                    </React.Fragment>
-                  ))}
+                          <span className="ch-num text-[12px] font-medium text-fg">{tier}</span>
+                        </div>
+                        {idx < arr.length - 1 && (
+                          <ArrowRight
+                            className="w-3 h-3 shrink-0 text-fg-muted"
+                            aria-hidden="true"
+                          />
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+
+                  {!strictChainActive && policy.auto_fallback_enabled && (
+                    <span className="ml-1 text-[11px] text-fg-muted">
+                      {isZh ? '按住拖动可调整顺序' : 'Drag chips to reorder'}
+                    </span>
+                  )}
 
                   {strictChainActive && (
-                    <StatusPill tone="amber" size="sm" className="ml-1">
-                      {isZh
-                        ? '大显存保护：绝不降到 40GB 以下防爆显存'
-                        : '≥80GB VRAM Protected (Prevents OOM)'}
-                    </StatusPill>
+                    <div className="inline-flex items-center gap-1.5 ml-1">
+                      <StatusPill tone="amber" size="sm">
+                        {isZh
+                          ? '大显存保护：绝不降到 40GB 以下防爆显存'
+                          : '≥80GB VRAM Protected (Prevents OOM)'}
+                      </StatusPill>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void persistPolicy({
+                            ...policy,
+                            auto_fallback_enabled: true,
+                            fallback_chain: GENERAL_WATERFALL,
+                          })
+                        }
+                        className="text-[11.5px] font-medium text-fg-muted hover:text-fg underline underline-offset-2 cursor-pointer px-1"
+                      >
+                        {isZh ? '恢复 5 档' : 'Restore all 5'}
+                      </button>
+                    </div>
                   )}
                 </div>
               </InsetWell>

@@ -3,14 +3,16 @@ import {
   AlertCircle,
   ArrowLeft,
   ArrowUpRight,
+  Award,
   Camera,
+  ChevronDown,
+  ChevronRight,
   Cloud,
   CornerDownLeft,
   Eye,
   EyeOff,
   Gauge,
   Globe,
-  HeartHandshake,
   KeyRound,
   Lock,
   LogOut,
@@ -19,6 +21,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   RefreshCw,
+  Rocket,
   Route,
   Search,
   ShieldCheck,
@@ -38,6 +41,7 @@ import type {
 } from '../../types';
 import {
   ADMIN_TOKEN_CHANGED_EVENT,
+  ADMIN_TOKEN_STORAGE_KEY,
   api,
   APIError,
   clearStoredAdminToken,
@@ -48,6 +52,11 @@ import {
   type WSConnectionState,
 } from '../../lib/api';
 import { IS_STATIC_DEMO_BUILD } from '../../lib/demoSiteAdapter';
+import { getFriendlySessionDisplay } from '../../lib/sessionLabels';
+import {
+  isStudioPinnedToSidebar,
+  STUDIO_PIN_CHANGED_EVENT,
+} from '../../lib/pluginSdk';
 import { useI18n } from '../../i18n';
 import { getObservatoryHomePath, type AppSection, type ParsedRoute } from './navigation';
 import { ShareQuotaModal } from './ShareQuotaModal';
@@ -80,11 +89,13 @@ export interface AppShellProps {
   offlineSnapshot: boolean;
   onRefreshTelemetry: () => void;
   onOpenConnectDrawer: (keyPrefix?: string) => void;
+  onOpenSavingsReceipt?: () => void;
   children: React.ReactNode;
 }
 
 const SIDEBAR_COLLAPSED_KEY = 'colabhive.sidebar.collapsed';
 const DISMISSED_ALERTS_KEY = 'colabhive_dismissed_alerts_v1';
+const DEV_TOOL_SECTIONS: ReadonlyArray<AppSection> = ['workbench', 'router', 'settings'];
 
 function readSidebarCollapsed(): boolean {
   try {
@@ -135,10 +146,21 @@ function useDismiss(scope: string, open: boolean, onDismiss: () => void): void {
 interface AccountRingChipData {
   id: string;
   shortLabel: string;
+  identityLabel: string;
+  quotaText: string;
   fullLabel: string;
   pct: number;
   cu: number;
   tone: QuotaRingTone;
+  isContributor: boolean;
+  healthLabel?: string;
+}
+
+function ringToneTextColor(tone: QuotaRingTone): string {
+  if (tone === 'coral') return 'var(--coral-text)';
+  if (tone === 'amber') return 'var(--amber-text)';
+  if (tone === 'sky') return 'var(--sky-text)';
+  return 'var(--emerald-text)';
 }
 
 function resolveAccountCycleCap(acc: Account): number {
@@ -152,6 +174,10 @@ function resolveAccountCycleCap(acc: Account): number {
 }
 
 function computeAccountPct(acc: Account): number {
+  if (acc.subscription_tier === 'FREE' && acc.paid_cu_balance <= 0) {
+    const freeCu = Math.max(0, acc.free_quota?.remaining_free_cu ?? 0);
+    return Math.max(0, Math.min(100, Math.round((freeCu / 15) * 100)));
+  }
   const usable = acc.is_contributor ? acc.schedulable_cu : acc.paid_cu_balance;
   const cap = resolveAccountCycleCap(acc);
   if (cap <= 0) return 0;
@@ -176,7 +202,7 @@ function deriveAccountRingTone(acc: Account, pct: number): QuotaRingTone {
   return 'emerald';
 }
 
-function deriveShortAccountLabel(acc: Account, index: number, zh: boolean, privacyMask: boolean): string {
+function deriveShortAccountBaseLabel(acc: Account, zh: boolean, privacyMask: boolean): string {
   if (acc.is_contributor) {
     if (privacyMask) return zh ? '共享' : 'Shared';
     const rawName = acc.alias?.replace(/^Contrib-/i, '').trim();
@@ -184,10 +210,49 @@ function deriveShortAccountLabel(acc: Account, index: number, zh: boolean, priva
     return zh ? '共享' : 'Shared';
   }
   if (acc.subscription_tier === 'AI_ULTRA') return 'Ultra';
-  if (acc.subscription_tier === 'PRO_PLUS') return index > 0 ? `Pro+ #${index + 1}` : 'Pro+';
+  if (acc.subscription_tier === 'PRO_PLUS') return 'Pro+';
   if (acc.subscription_tier === 'PRO') return 'Pro';
   if (acc.subscription_tier === 'PAYG') return 'PAYG';
   return 'Free';
+}
+
+function deriveShortAccountLabel(
+  acc: Account,
+  index: number,
+  zh: boolean,
+  privacyMask: boolean,
+  allAccounts?: Account[],
+): string {
+  const base = deriveShortAccountBaseLabel(acc, zh, privacyMask);
+  if (!allAccounts || allAccounts.length <= 1) {
+    return base;
+  }
+  let totalSame = 0;
+  let rank = 0;
+  for (let i = 0; i < allAccounts.length; i += 1) {
+    if (deriveShortAccountBaseLabel(allAccounts[i], zh, privacyMask) === base) {
+      totalSame += 1;
+      if (i === index) {
+        rank = totalSame;
+      }
+    }
+  }
+  if (totalSame > 1 && rank > 0) {
+    return `${base} #${rank}`;
+  }
+  return base;
+}
+
+function deriveAccountHealthBadge(acc: Account, zh: boolean): string | undefined {
+  if (acc.health === 'AUTH_EXPIRED') return zh ? '需重新登录' : 'Re-auth';
+  if (acc.health === 'PROXY_ERROR') return zh ? '代理异常' : 'Proxy err';
+  if (acc.health === 'QUARANTINED_DENYLIST') return zh ? '已隔离' : 'Quarantined';
+  if (acc.health === 'COOLDOWN_RATE_LIMIT') return zh ? '冷却中' : 'Cooldown';
+  if (acc.health === 'PAUSED_MANUAL' || acc.health === 'PAUSED_CAP_REACHED') {
+    return zh ? '已暂停' : 'Paused';
+  }
+  if (acc.health === 'REVOKED_BY_USER') return zh ? '已收回' : 'Revoked';
+  return undefined;
 }
 
 interface LiveTaskRow {
@@ -232,26 +297,30 @@ function buildLiveTaskRows(
   }
 
   for (const sess of sessions) {
-    if (rows.length >= 3) break;
     if (
       sess.status === 'BUSY' ||
       sess.status === 'PROVISIONING' ||
       sess.status === 'IDLE' ||
       sess.status === 'RECONNECTING'
     ) {
+      const disp = getFriendlySessionDisplay(sess, zh);
       rows.push({
         id: sess.id,
-        title: sess.notebook_name || sess.name || sess.id,
-        subtitle: sess.adopted_external
+        title: disp.isLLM ? disp.prefixedTitle : sess.notebook_name || sess.name || sess.id,
+        subtitle: disp.isLLM
           ? zh
-            ? `云端在跑实例（已自动同步） · ${formatCU(sess.burn_rate_cu_hr)} CU/h`
-            : `Synced Cloud VM · ${formatCU(sess.burn_rate_cu_hr)} CU/h`
-          : zh
-            ? `${sess.status === 'BUSY' ? '执行中' : '在线保活'} · Keepalive ${sess.keepalive_healthy ? '正常' : '重连'}`
-            : `${sess.status === 'BUSY' ? 'Busy' : 'Keepalive ready'} · ${formatCU(sess.burn_rate_cu_hr)} CU/h`,
+            ? `大模型推理服务 (/v1) · ${formatCU(sess.burn_rate_cu_hr)} CU/h`
+            : `LLM Inference (/v1) · ${formatCU(sess.burn_rate_cu_hr)} CU/h`
+          : sess.adopted_external
+            ? zh
+              ? `云端在跑实例（已自动同步） · ${formatCU(sess.burn_rate_cu_hr)} CU/h`
+              : `Synced Cloud VM · ${formatCU(sess.burn_rate_cu_hr)} CU/h`
+            : zh
+              ? `${sess.status === 'BUSY' ? '执行中' : '在线保活'} · Keepalive ${sess.keepalive_healthy ? '正常' : '重连'}`
+              : `${sess.status === 'BUSY' ? 'Busy' : 'Keepalive ready'} · ${formatCU(sess.burn_rate_cu_hr)} CU/h`,
         gpuTag: sess.accelerator,
-        href: `/exp/${encodeURIComponent(sess.id)}`,
-        tone: sess.status === 'BUSY' && !sess.adopted_external ? 'coral' : 'emerald',
+        href: disp.isLLM ? '/apps/llm' : `/exp/${encodeURIComponent(sess.id)}`,
+        tone: disp.isLLM ? 'amber' : sess.status === 'BUSY' && !sess.adopted_external ? 'coral' : 'emerald',
       });
     }
   }
@@ -287,8 +356,8 @@ function buildLiveTaskRows(
           title:
             acc.active_session_summary ||
             (zh
-              ? `${acc.alias || acc.email.split('@')[0]} 云端在跑实例`
-              : `${acc.alias || acc.email.split('@')[0]} Cloud VM`),
+              ? `${acc.alias || (acc.email || '').split('@')[0] || acc.id} 云端在跑实例`
+              : `${acc.alias || (acc.email || '').split('@')[0] || acc.id} Cloud VM`),
           subtitle: zh
             ? `云端在跑实例 · ${formatCU(acc.live_burn_rate_cu_hr)} CU/h`
             : `Synced Cloud VM · ${formatCU(acc.live_burn_rate_cu_hr)} CU/h`,
@@ -300,7 +369,7 @@ function buildLiveTaskRows(
     }
   }
 
-  return rows.slice(0, 3);
+  return rows;
 }
 
 interface WatchlistNotice {
@@ -329,7 +398,7 @@ function buildWatchlistNotices(
   for (let i = 0; i < accounts.length; i += 1) {
     const acc = accounts[i];
     const pct = computeAccountPct(acc);
-    const name = deriveShortAccountLabel(acc, i, zh, privacyMask);
+    const name = deriveShortAccountLabel(acc, i, zh, privacyMask, accounts);
     if (acc.health === 'AUTH_EXPIRED' || acc.health === 'PROXY_ERROR') {
       notices.push({
         id: `crit-${acc.id}`,
@@ -357,7 +426,7 @@ function buildWatchlistNotices(
     const acc = accounts[i];
     if (acc.expiring_soon_cu > 0) {
       const days = daysUntilIso(acc.earliest_batch_expires_at) ?? 4;
-      const name = deriveShortAccountLabel(acc, i, zh, privacyMask);
+      const name = deriveShortAccountLabel(acc, i, zh, privacyMask, accounts);
       notices.push({
         id: `exp-${acc.id}`,
         title: zh
@@ -378,7 +447,7 @@ function buildWatchlistNotices(
     const acc = accounts[i];
     if (acc.is_contributor) {
       const floor = Math.round(acc.guardrails?.min_reserve_cu ?? 50);
-      const name = deriveShortAccountLabel(acc, i, zh, privacyMask);
+      const name = deriveShortAccountLabel(acc, i, zh, privacyMask, accounts);
       notices.push({
         id: `contrib-${acc.id}`,
         title: zh
@@ -967,6 +1036,7 @@ function QuickSearchModal({
 interface FlatNavItem {
   key: string;
   section?: AppSection;
+  activeSections?: AppSection[];
   href?: string;
   onClick?: () => void;
   label: string;
@@ -1004,10 +1074,14 @@ export function AppShell({
   const accounts = accountsProp ?? (offlineSnapshot ? DEMO_ACCOUNTS : []);
 
   const [collapsed, setCollapsed] = useState<boolean>(readSidebarCollapsed);
+  const [devToolsOpen, setDevToolsOpen] = useState<boolean>(() =>
+    DEV_TOOL_SECTIONS.includes(route.section),
+  );
   const [dismissedAlerts, setDismissedAlerts] = useState<string[]>(readDismissedAlerts);
   const [searchOpen, setSearchOpen] = useState(false);
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [authPopoverOpen, setAuthPopoverOpen] = useState(false);
+  const [poolPopoverOpen, setPoolPopoverOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [mobileTokenOpen, setMobileTokenOpen] = useState(false);
   const [adminTokenDraft, setAdminTokenDraft] = useState<string>(
@@ -1016,6 +1090,27 @@ export function AppShell({
   const [hasAdminToken, setHasAdminToken] = useState<boolean>(() => Boolean(getStoredAdminToken()));
   const [authGateLocked, setAuthGateLocked] = useState<boolean>(false);
   const [retrying, setRetrying] = useState(false);
+  const [connectedAgentCount, setConnectedAgentCount] = useState<number>(0);
+
+  useEffect(() => {
+    if (health.auth_required && !hasAdminToken) return;
+    let alive = true;
+    const refreshAgents = () => {
+      api
+        .listAgentClients()
+        .then((list) => {
+          if (!alive || !Array.isArray(list)) return;
+          setConnectedAgentCount(list.filter((c) => c.injected).length);
+        })
+        .catch(() => {});
+    };
+    refreshAgents();
+    window.addEventListener('colabhive:agent-connected', refreshAgents);
+    return () => {
+      alive = false;
+      window.removeEventListener('colabhive:agent-connected', refreshAgents);
+    };
+  }, [health.auth_required, hasAdminToken]);
 
   useEffect(() => {
     const handleUnauthorized = () => {
@@ -1029,13 +1124,33 @@ export function AppShell({
         setAuthGateLocked(false);
       }
     };
+    const handleStorage = (e: StorageEvent) => {
+      if (
+        e.key === null ||
+        e.key === ADMIN_TOKEN_STORAGE_KEY ||
+        e.key === 'ch_admin_token'
+      ) {
+        handleTokenChanged();
+        if (!getStoredAdminToken()) {
+          setAuthGateLocked(true);
+        }
+      }
+    };
     window.addEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
     window.addEventListener(ADMIN_TOKEN_CHANGED_EVENT, handleTokenChanged);
+    window.addEventListener('storage', handleStorage);
     return () => {
       window.removeEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
       window.removeEventListener(ADMIN_TOKEN_CHANGED_EVENT, handleTokenChanged);
+      window.removeEventListener('storage', handleStorage);
     };
   }, []);
+
+  useEffect(() => {
+    if (DEV_TOOL_SECTIONS.includes(route.section)) {
+      setDevToolsOpen(true);
+    }
+  }, [route.section]);
 
   useEffect(() => {
     try {
@@ -1128,6 +1243,7 @@ export function AppShell({
   );
 
   useDismiss('admin-token', authPopoverOpen, () => setAuthPopoverOpen(false));
+  useDismiss('pool-rings', poolPopoverOpen, () => setPoolPopoverOpen(false));
   useDismiss('mobile-menu', mobileMenuOpen, () => {
     setMobileMenuOpen(false);
     setMobileTokenOpen(false);
@@ -1263,21 +1379,42 @@ export function AppShell({
   const poolCuText = `${Math.round(summary.total_available_cu).toLocaleString('en-US')} CU`;
   const activeLabel = `${summary.active_vms} ${zh ? '运行中' : 'Running'}`;
 
-  // Top 3 pooled account ring chips (used in Top Header Right Strip & Sidebar Bottom)
-  const accountRingChips: AccountRingChipData[] = accounts.slice(0, 3).map((acc, idx) => {
+  // Pooled account ring chips (all accounts for scrollable popover; max 3 inline in Header & Sidebar)
+  const allAccountRingChips: AccountRingChipData[] = accounts.map((acc, idx) => {
     const pct = computeAccountPct(acc);
     const cap = resolveAccountCycleCap(acc);
     const usable = acc.is_contributor ? acc.schedulable_cu : acc.paid_cu_balance;
     const tone = deriveAccountRingTone(acc, pct);
+    const identityLabel = acc.alias ? `${acc.alias} · ${displayEmail(acc.email)}` : displayEmail(acc.email);
+    let quotaText: string;
+    let fullLabel: string;
+    if (acc.subscription_tier === 'FREE' && acc.paid_cu_balance <= 0) {
+      const freeCu = Math.max(0, acc.free_quota?.remaining_free_cu ?? 0);
+      quotaText = `${formatCU(freeCu, 0)} CU`;
+      fullLabel = `${identityLabel} · ${zh ? '免费额度' : 'Free'} ${formatCU(freeCu)} CU (${pct}%)`;
+    } else {
+      quotaText = `${formatCU(usable, 0)} CU`;
+      fullLabel = `${identityLabel} · ${formatCU(usable)} / ${formatCU(cap, 0)} CU (${pct}%)`;
+    }
     return {
       id: acc.id,
-      shortLabel: deriveShortAccountLabel(acc, idx, zh, privacyMask),
-      fullLabel: `${acc.alias || displayEmail(acc.email)} · ${formatCU(usable)} / ${formatCU(cap, 0)} CU (${pct}%)`,
+      shortLabel: deriveShortAccountLabel(acc, idx, zh, privacyMask, accounts),
+      identityLabel,
+      quotaText,
+      fullLabel,
       pct,
       cu: usable,
       tone,
+      isContributor: Boolean(acc.is_contributor),
+      healthLabel: deriveAccountHealthBadge(acc, zh),
     };
   });
+
+  const MAX_INLINE_POOL_RINGS = 3;
+  const accountRingChips = allAccountRingChips.slice(0, MAX_INLINE_POOL_RINGS);
+  const hiddenRingChips = allAccountRingChips.slice(MAX_INLINE_POOL_RINGS);
+  const hiddenRingCount = hiddenRingChips.length;
+  const hiddenRingHasAlert = hiddenRingChips.some((c) => c.tone === 'coral');
 
   // Live Tasks (`运行中`) & Quota Watchlist (`额度提醒`)
   const liveTaskRows = buildLiveTaskRows(experiments, sessions, accounts, summary, zh, offlineSnapshot);
@@ -1304,7 +1441,31 @@ export function AppShell({
     openQuickStartGuide({ navigate: route.navigate });
   };
 
-  // Flat, equal-weight 14px grouped navigation (ZERO nested tiny secondary sub-menus!)
+  const [studioPinned, setStudioPinned] = useState<boolean>(() => isStudioPinnedToSidebar());
+
+  useEffect(() => {
+    const onPinChanged = () => setStudioPinned(isStudioPinnedToSidebar());
+    window.addEventListener(STUDIO_PIN_CHANGED_EVENT, onPinChanged);
+    window.addEventListener('storage', onPinChanged);
+    return () => {
+      window.removeEventListener(STUDIO_PIN_CHANGED_EVENT, onPinChanged);
+      window.removeEventListener('storage', onPinChanged);
+    };
+  }, []);
+
+  const hasRunningMediaSession = useMemo(
+    () =>
+      sessions.some((s) => {
+        if (!s || s.status === 'STOPPED' || s.status === 'LOST' || s.status === 'ERROR') return false;
+        const name = (s.name || '').toLowerCase();
+        return name.startsWith('app-wangp-') || name.startsWith('app-media-');
+      }),
+    [sessions],
+  );
+
+  const showStudioInSidebar = hasRunningMediaSession || studioPinned || route.section === 'studio';
+
+  // Calm 4-item primary workspace navigation (Studio dynamically surfaces when active, pinned, or open!)
   const workspaceItems: FlatNavItem[] = [
     {
       key: 'observatory',
@@ -1321,6 +1482,52 @@ export function AppShell({
       ),
     },
     {
+      key: 'apps',
+      section: 'apps',
+      activeSections: showStudioInSidebar ? ['apps', 'chat'] : ['apps', 'chat', 'studio'],
+      href: '/apps',
+      label: t('nav.apps'),
+      icon: Rocket,
+      trailing: (
+        <span
+          className="px-1.5 py-0.5 rounded-full text-[10px] font-semibold"
+          style={{ backgroundColor: 'var(--emerald-soft)', color: 'var(--emerald-text)' }}
+        >
+          {t('nav.apps_sub_chat')}
+        </span>
+      ),
+    },
+    ...(showStudioInSidebar
+      ? [
+          {
+            key: 'studio',
+            section: 'studio' as AppSection,
+            href: '/studio/media',
+            label: zh ? '原生创作台' : 'Media Studio',
+            icon: Sparkles,
+            trailing: hasRunningMediaSession ? (
+              <span
+                className="px-1.5 py-0.5 rounded-full text-[10px] font-semibold"
+                style={{ backgroundColor: 'var(--emerald-soft)', color: 'var(--emerald-text)' }}
+              >
+                {zh ? '运行中' : 'Live'}
+              </span>
+            ) : studioPinned ? (
+              <span className="px-1.5 py-0.5 rounded-full text-[10px] font-medium text-fg-muted bg-surface-2">
+                {zh ? '已固定' : 'Pinned'}
+              </span>
+            ) : undefined,
+          },
+        ]
+      : []),
+    {
+      key: 'savings',
+      section: 'savings',
+      href: '/savings',
+      label: t('nav.savings'),
+      icon: Award,
+    },
+    {
       key: 'pool',
       section: 'pool',
       href: '/pool',
@@ -1332,6 +1539,10 @@ export function AppShell({
         </span>
       ),
     },
+  ];
+
+  // Collapsible Developer & Advanced Tools group (collapsed by default unless active)
+  const devToolItems: FlatNavItem[] = [
     {
       key: 'workbench',
       section: 'workbench',
@@ -1346,9 +1557,6 @@ export function AppShell({
           </span>
         ) : undefined,
     },
-  ];
-
-  const systemItems: FlatNavItem[] = [
     {
       key: 'router',
       section: 'router',
@@ -1365,34 +1573,22 @@ export function AppShell({
       icon: KeyRound,
       trailing: <span className="ch-num text-[10.5px] text-fg-muted">AES</span>,
     },
-    {
-      key: 'quick_guide',
-      onClick: handleOpenGuide,
-      label: t('nav.quick_guide'),
-      icon: Sparkles,
-      trailing: (
-        <span className="px-1.5 py-0.5 rounded-full text-[10.5px] font-medium bg-[var(--neutral-soft)] text-fg-secondary">
-          {zh ? '3 步' : '3 steps'}
-        </span>
-      ),
-    },
-    {
-      key: 'contribute',
-      href: '/contribute',
-      label: t('nav.contribute'),
-      icon: HeartHandshake,
-      externalHint: true,
-    },
   ];
 
-  const allRouteNavItems = [...workspaceItems, ...systemItems];
-  const activeNavItem = allRouteNavItems.find(
-    (item) => item.section && item.section === route.section,
-  );
-  const currentGroupLabel = workspaceItems.some((item) => item.section === route.section)
+  const isNavItemActive = (item: FlatNavItem) =>
+    Boolean(
+      (item.activeSections && item.activeSections.includes(route.section)) ||
+        (item.section && item.section === route.section),
+    );
+
+  const isDevToolSectionActive = devToolItems.some(isNavItemActive);
+  const allRouteNavItems = [...workspaceItems, ...devToolItems];
+  const activeNavItem = allRouteNavItems.find(isNavItemActive);
+  const currentGroupLabel = workspaceItems.some(isNavItemActive)
     ? t('nav.group_workspace')
-    : t('nav.group_system');
-  const currentPageLabel = activeNavItem?.label ?? t('app.name');
+    : t('nav.group_devtools');
+  const currentPageLabel =
+    route.section === 'chat' ? t('nav.chat') : (activeNavItem?.label ?? t('app.name'));
 
   // Quick-jump items for Cmd+K modal
   const quickJumpItems: QuickJumpItem[] = [
@@ -1409,30 +1605,44 @@ export function AppShell({
           onSelect: () => route.navigate(i.href!),
         };
       }),
-    ...systemItems.map((i) => {
+    {
+      id: 'nav-apps-llm',
+      group: t('nav.apps'),
+      title: t('nav.chat'),
+      subtitle: '/apps/llm',
+      icon: <Zap />,
+      onSelect: () => route.navigate('/apps/llm'),
+    },
+    ...devToolItems.map((i) => {
       const Icon = i.icon;
       return {
-        id: `sys-${i.key}`,
-        group: t('nav.group_system'),
+        id: `dev-${i.key}`,
+        group: t('nav.group_devtools'),
         title: i.label,
-        subtitle: i.href ?? t('nav.quick_guide_hint'),
+        subtitle: i.href ?? '',
         icon: <Icon />,
         onSelect: () => {
-          if (i.onClick) i.onClick();
-          else if (i.href) route.navigate(i.href);
+          if (i.href) route.navigate(i.href);
         },
       };
     }),
-    ...accounts.map((acc, idx) => {
+    {
+      id: 'sys-quick-guide',
+      group: t('nav.group_system'),
+      title: t('nav.quick_guide'),
+      subtitle: t('nav.quick_guide_hint'),
+      icon: <Sparkles />,
+      onSelect: handleOpenGuide,
+    },
+    ...accounts.map((acc) => {
       const pct = computeAccountPct(acc);
       const tone = deriveAccountRingTone(acc, pct);
+      const subtitle = `${acc.subscription_tier} · ${formatCU(acc.schedulable_cu)} CU ${zh ? '可用' : 'usable'}`;
       return {
         id: `acc-${acc.id}`,
         group: zh ? '账号池' : 'Account',
         title: acc.alias || displayEmail(acc.email),
-        subtitle: `${acc.subscription_tier} · ${formatCU(acc.schedulable_cu)} CU ${
-          zh ? '可用' : 'usable'
-        }`,
+        subtitle,
         badge: <CircularQuotaRing value={pct} size={28} strokeWidth={2.8} tone={tone} />,
         icon: <Users />,
         onSelect: () => route.navigate('/pool'),
@@ -1495,10 +1705,6 @@ export function AppShell({
       label: zh ? '卡死任务清理' : 'Stuck-job cleanup',
       value: health.anti_zombie_armed ? (zh ? '已开启' : 'On') : zh ? '待命' : 'Standby',
     },
-    {
-      label: zh ? '好友账号保护' : 'Friend account protection',
-      value: health.contributor_firewall_on ? (zh ? '已开启' : 'On') : zh ? '未开启' : 'Off',
-    },
     { label: zh ? '登录凭证加密' : 'Sign-in encryption', value: 'AES-256-GCM' },
     { label: zh ? '实时连接' : 'Live link', value: wsLabel },
   ];
@@ -1557,7 +1763,7 @@ export function AppShell({
 
   const renderFlatNavRow = (item: FlatNavItem) => {
     const Icon = item.icon;
-    const active = Boolean(item.section && item.section === route.section);
+    const active = isNavItemActive(item);
     const rowClass = cn(
       'ui-nav-zone w-full text-left',
       collapsed ? 'justify-center h-9' : 'gap-2.5 h-9 px-2.5',
@@ -1633,12 +1839,19 @@ export function AppShell({
     );
   };
 
-  const mobileTabs: { key: string; section: AppSection; href: string; label: string; icon: FlatNavItem['icon']; live?: boolean }[] = [
+  const mobileTabs: {
+    key: string;
+    section: AppSection;
+    activeSections?: AppSection[];
+    href: string;
+    label: string;
+    icon: FlatNavItem['icon'];
+    live?: boolean;
+  }[] = [
     { key: 'observatory', section: 'observatory', href: observatoryHref, label: zh ? '总览' : 'Overview', icon: Gauge },
-    { key: 'pool', section: 'pool', href: '/pool', label: zh ? '账号池' : 'Pool', icon: Users },
-    { key: 'workbench', section: 'workbench', href: '/exp', label: zh ? '实验' : 'Jobs', icon: TerminalSquare, live: summary.active_vms > 0 },
-    { key: 'router', section: 'router', href: '/router', label: zh ? '路由' : 'Routing', icon: Route },
-    { key: 'settings', section: 'settings', href: '/cfg', label: zh ? '密钥' : 'Keys', icon: KeyRound },
+    { key: 'apps', section: 'apps', activeSections: ['apps', 'chat', 'studio'], href: '/apps', label: zh ? '应用店' : 'Apps', icon: Rocket },
+    { key: 'savings', section: 'savings', href: '/savings', label: zh ? '省钱账单' : 'Savings', icon: Award },
+    { key: 'pool', section: 'pool', href: '/pool', label: zh ? '算力池' : 'Pool', icon: Users },
   ];
 
   return (
@@ -1730,11 +1943,67 @@ export function AppShell({
         )}
 
         {/* Scrollable Structured Middle Body */}
-        <div className="flex-1 min-h-0 overflow-y-auto px-3 pb-2 space-y-3.5">
-          {/* 2. `运行中` Live Tasks Block */}
-          {!collapsed && (
-            <section aria-label={t('nav.live_tasks')} className="space-y-1.5">
-              <div className="flex items-center justify-between px-1">
+        <div className="flex-1 min-h-0 overflow-y-auto px-3 pb-2 space-y-4">
+          {/* 1. Primary 4-Item Workspace Navigation */}
+          <nav aria-label={t('nav.group_workspace')} className="space-y-0.5">
+            {!collapsed && (
+              <div className="px-1 pb-1 text-[11px] font-semibold tracking-wide text-fg-muted">
+                {t('nav.group_workspace')}
+              </div>
+            )}
+            {workspaceItems.map(renderFlatNavRow)}
+          </nav>
+
+          {/* 2. Collapsible Developer & Advanced Tools Accordion */}
+          <nav aria-label={t('nav.group_devtools')} className="space-y-0.5">
+            {collapsed ? (
+              <>
+                <div
+                  className="mx-2 my-1.5 border-t"
+                  style={{ borderColor: 'var(--border-faint)' }}
+                  aria-hidden="true"
+                />
+                {devToolItems.map(renderFlatNavRow)}
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  aria-expanded={devToolsOpen}
+                  onClick={() => setDevToolsOpen((v) => !v)}
+                  className="flex items-center justify-between gap-2 w-full px-1.5 py-1.5 rounded-lg text-left text-[11px] font-semibold tracking-wide text-fg-muted hover:text-fg hover:bg-[var(--hover-fill)] transition-colors cursor-pointer bg-transparent border-0"
+                >
+                  <span className="flex items-center gap-1.5 min-w-0">
+                    <span className="truncate">{t('nav.group_devtools')}</span>
+                    {!devToolsOpen && isDevToolSectionActive && (
+                      <span
+                        className="w-1.5 h-1.5 rounded-full shrink-0"
+                        style={{ backgroundColor: 'var(--emerald)' }}
+                      />
+                    )}
+                    {!devToolsOpen && summary.active_vms > 0 && (
+                      <span className="ch-num px-1.5 py-0.2 rounded-full text-[10px] font-semibold bg-[var(--neutral-soft)] text-fg-secondary">
+                        {summary.active_vms} {zh ? '卡' : 'GPU'}
+                      </span>
+                    )}
+                  </span>
+                  {devToolsOpen ? (
+                    <ChevronDown className="w-3.5 h-3.5 shrink-0" />
+                  ) : (
+                    <ChevronRight className="w-3.5 h-3.5 shrink-0" />
+                  )}
+                </button>
+                {devToolsOpen && (
+                  <div className="space-y-0.5 pt-0.5">{devToolItems.map(renderFlatNavRow)}</div>
+                )}
+              </>
+            )}
+          </nav>
+
+          {/* 3. Live Tasks (`运行中`, shown ONLY when active tasks exist for calm zero-clutter rail) */}
+          {!collapsed && liveTaskRows.length > 0 && (
+            <section aria-label={t('nav.live_tasks')} className="space-y-1.5 pt-1 border-t border-line-faint">
+              <div className="flex items-center justify-between px-1 pt-1">
                 <span className="text-[11px] font-semibold tracking-wide text-fg-muted">
                   {t('nav.live_tasks')}
                 </span>
@@ -1743,68 +2012,65 @@ export function AppShell({
                 </span>
               </div>
 
-              {liveTaskRows.length > 0 ? (
-                <div className="space-y-1">
-                  {liveTaskRows.map((task, idx) => (
-                    <button
-                      key={task.id}
-                      type="button"
-                      onClick={() => route.navigate(task.href)}
-                      className={cn(
-                        'flex flex-col gap-0.5 w-full px-2.5 py-2 rounded-[11px] text-left cursor-pointer transition-colors',
-                        idx === 0
-                          ? 'bg-surface-2 border border-line shadow-[var(--shadow-control)] hover:border-line-strong'
-                          : 'hover:bg-[var(--hover-fill)]',
-                      )}
-                    >
-                      <span className="flex items-center justify-between gap-2 min-w-0">
-                        <span className="flex items-center gap-1.5 min-w-0">
-                          <span
-                            className="w-1.5 h-1.5 rounded-full shrink-0"
-                            style={{
-                              backgroundColor:
-                                task.tone === 'coral' ? 'var(--coral)' : 'var(--emerald)',
-                            }}
-                          />
-                          <span className="truncate text-[12.5px] font-semibold text-fg">
-                            {task.title}
-                          </span>
-                        </span>
-                        <span className="ch-num shrink-0 text-[10.5px] font-medium px-1.5 py-0.5 rounded-md bg-[var(--neutral-soft)] text-fg-secondary">
-                          {task.gpuTag}
+              <div className="space-y-1">
+                {liveTaskRows.slice(0, 3).map((task, idx) => (
+                  <button
+                    key={task.id}
+                    type="button"
+                    onClick={() => route.navigate(task.href)}
+                    className={cn(
+                      'flex flex-col gap-0.5 w-full px-2.5 py-2 rounded-[11px] text-left cursor-pointer transition-colors',
+                      idx === 0
+                        ? 'bg-surface-2 border border-line shadow-[var(--shadow-control)] hover:border-line-strong'
+                        : 'hover:bg-[var(--hover-fill)]',
+                    )}
+                  >
+                    <span className="flex items-center justify-between gap-2 min-w-0">
+                      <span className="flex items-center gap-1.5 min-w-0">
+                        <span
+                          className="w-1.5 h-1.5 rounded-full shrink-0"
+                          style={{
+                            backgroundColor:
+                              task.tone === 'coral' ? 'var(--coral)' : 'var(--emerald)',
+                          }}
+                        />
+                        <span className="truncate text-[12.5px] font-semibold text-fg">
+                          {task.title}
                         </span>
                       </span>
-                      <span className="pl-3 truncate text-[11px] text-fg-muted">
-                        {task.subtitle}
+                      <span className="ch-num shrink-0 text-[10.5px] font-medium px-1.5 py-0.5 rounded-md bg-[var(--neutral-soft)] text-fg-secondary">
+                        {task.gpuTag}
                       </span>
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => route.navigate('/exp')}
-                  className="flex items-center justify-between gap-2 w-full px-2.5 py-2 rounded-[11px] bg-surface-2/70 border border-line-faint text-left cursor-pointer hover:bg-surface-2"
-                >
-                  <span className="flex items-center gap-1.5 min-w-0 text-[12px] text-fg-secondary">
-                    <span
-                      className="w-1.5 h-1.5 rounded-full shrink-0"
-                      style={{ backgroundColor: 'var(--emerald)' }}
-                    />
-                    <span className="truncate">
-                      {zh ? '当前空闲 · 0 CU/h 待命中' : 'Idle · 0 CU/h standby'}
                     </span>
-                  </span>
-                  <span className="text-[11px] text-fg-muted">{zh ? '启动' : 'Run'}</span>
-                </button>
-              )}
+                    <span className="pl-3 truncate text-[11px] text-fg-muted">
+                      {task.subtitle}
+                    </span>
+                  </button>
+                ))}
+                {liveTaskRows.length > 3 && (
+                  <button
+                    type="button"
+                    onClick={() => route.navigate('/exp')}
+                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-[10px] text-[11px] text-fg-muted hover:text-fg hover:bg-[var(--hover-fill)] cursor-pointer transition-colors"
+                  >
+                    <span>
+                      {zh
+                        ? `还有 +${liveTaskRows.length - 3} 台运行中`
+                        : `+${liveTaskRows.length - 3} more running`}
+                    </span>
+                    <span className="font-medium text-fg-secondary">
+                      {zh ? '查看全部 →' : 'View all →'}
+                    </span>
+                  </button>
+                )}
+              </div>
             </section>
           )}
 
-          {/* 3. `额度提醒` Watchlist Block (hidden completely when visibleAlerts.length === 0) */}
+          {/* 4. `额度提醒` Watchlist Block (hidden completely when visibleAlerts.length === 0) */}
           {!collapsed && visibleAlerts.length > 0 && (
-            <section aria-label={t('nav.watchlist')} className="space-y-1">
-              <div className="flex items-center justify-between px-1">
+            <section aria-label={t('nav.watchlist')} className="space-y-1 pt-1 border-t border-line-faint">
+              <div className="flex items-center justify-between px-1 pt-1">
                 <div className="flex items-center gap-1.5 min-w-0">
                   <span className="text-[11px] font-semibold tracking-wide text-fg-muted">
                     {t('nav.watchlist')}
@@ -1890,26 +2156,6 @@ export function AppShell({
               </div>
             </section>
           )}
-
-          {/* 4a. Group `工作台` (Flat 14px Primary Rows) */}
-          <nav aria-label={t('nav.group_workspace')} className="space-y-0.5">
-            {!collapsed && (
-              <div className="px-1 pb-1 text-[11px] font-semibold tracking-wide text-fg-muted">
-                {t('nav.group_workspace')}
-              </div>
-            )}
-            {workspaceItems.map(renderFlatNavRow)}
-          </nav>
-
-          {/* 4b. Group `接入与系统` (Flat 14px Primary Rows — Zero Indented Sub-Menus!) */}
-          <nav aria-label={t('nav.group_system')} className="space-y-0.5">
-            {!collapsed && (
-              <div className="px-1 pb-1 text-[11px] font-semibold tracking-wide text-fg-muted">
-                {t('nav.group_system')}
-              </div>
-            )}
-            {systemItems.map(renderFlatNavRow)}
-          </nav>
         </div>
 
         {/* 5. Bottom Cluster: `卡池实时余量` Mini Account Rings + Utility Bar */}
@@ -1929,17 +2175,22 @@ export function AppShell({
               }}
             >
               <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] font-semibold text-fg-muted">
-                  {t('nav.pool_rings')}
+                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-fg-muted">
+                  <span>{t('nav.pool_rings')}</span>
+                  {allAccountRingChips.length > 1 && (
+                    <span className="ch-num text-[10px] font-medium opacity-75">
+                      ({allAccountRingChips.length})
+                    </span>
+                  )}
                 </span>
                 <span className="ch-num text-[11px] font-semibold text-fg">{poolCuText}</span>
               </div>
-              <div className="mt-1.5 grid grid-cols-3 gap-1">
+              <div className="mt-1.5 space-y-1">
                 {accountRingChips.map((chip) => (
-                  <span
+                  <div
                     key={chip.id}
                     title={chip.fullLabel}
-                    className="inline-flex items-center gap-1 min-w-0 px-1 py-0.5 rounded-md bg-[var(--neutral-soft)]"
+                    className="flex items-center gap-1.5 min-w-0 px-1.5 py-0.5 rounded-md bg-[var(--neutral-soft)]"
                   >
                     <CircularQuotaRing
                       value={chip.pct}
@@ -1948,15 +2199,42 @@ export function AppShell({
                       tone={chip.tone}
                       showValue={false}
                     />
-                    <span className="truncate text-[10.5px] font-medium text-fg-secondary">
+                    <span className="truncate text-[11px] font-medium text-fg-secondary">
                       {chip.shortLabel}
                     </span>
-                    <span className="ch-num ml-auto text-[10px] font-semibold text-fg">
+                    <span className="ch-num ml-auto shrink-0 text-[10px] text-fg-muted">
+                      {chip.quotaText}
+                    </span>
+                    <span
+                      className="ch-num shrink-0 w-[30px] text-right text-[10.5px] font-semibold"
+                      style={{ color: ringToneTextColor(chip.tone) }}
+                    >
                       {chip.pct}%
                     </span>
-                  </span>
+                  </div>
                 ))}
               </div>
+              {hiddenRingCount > 0 && (
+                <div
+                  className="mt-1.5 pt-1 border-t flex items-center justify-between gap-1 text-[10.5px] font-medium text-fg-muted"
+                  style={{ borderColor: 'var(--border-faint)' }}
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    {hiddenRingHasAlert && (
+                      <span
+                        className="w-1.5 h-1.5 rounded-full shrink-0"
+                        style={{ backgroundColor: 'var(--coral)' }}
+                      />
+                    )}
+                    <span>
+                      {zh
+                        ? `还有 +${hiddenRingCount} 个账号`
+                        : `+${hiddenRingCount} more account${hiddenRingCount > 1 ? 's' : ''}`}
+                    </span>
+                  </span>
+                  <span className="text-fg-secondary">{zh ? '查看全部 →' : 'View all →'}</span>
+                </div>
+              )}
             </button>
           )}
 
@@ -2161,7 +2439,18 @@ export function AppShell({
               />
               <span className="hidden sm:inline text-fg-muted">{currentGroupLabel}</span>
               <span className="hidden sm:inline text-fg-muted opacity-45">/</span>
-              {route.experimentId ? (
+              {route.section === 'chat' ? (
+                <>
+                  <a
+                    href="/apps"
+                    className="shrink-0 no-underline text-fg-secondary transition-colors hover:text-fg"
+                  >
+                    {t('nav.apps')}
+                  </a>
+                  <span className="text-fg-muted opacity-45">/</span>
+                  <span className="min-w-0 truncate font-semibold text-fg">{t('nav.chat')}</span>
+                </>
+              ) : route.experimentId ? (
                 <>
                   <a
                     href="/exp"
@@ -2212,70 +2501,267 @@ export function AppShell({
             </IconButton>
 
             {accountRingChips.length > 0 && (
-              <button
-                type="button"
-                onClick={() => route.navigate('/pool')}
-                title={`${t('nav.top_pool_label')}: ${poolCuText} · ${activeLabel}`}
-                className="hidden sm:inline-flex items-center gap-2.5 h-8.5 pl-3 pr-3.5 rounded-full border cursor-pointer transition-[border-color,background-color,box-shadow,transform] duration-200 hover:border-line-strong active:scale-[0.98]"
-                style={{
-                  backgroundColor: 'var(--surface-2)',
-                  borderColor: 'var(--border-subtle)',
-                  boxShadow: 'var(--shadow-control)',
-                }}
-              >
-                <span className="hidden xl:inline text-[11.5px] font-medium text-fg-muted">
-                  {t('nav.top_pool_label')}
-                </span>
-                {accountRingChips.map((chip, idx) => (
-                  <React.Fragment key={chip.id}>
-                    {idx > 0 && (
+              <div className="relative hidden sm:block" data-dismiss-scope="pool-rings">
+                <button
+                  type="button"
+                  aria-expanded={poolPopoverOpen}
+                  onClick={() => setPoolPopoverOpen((v) => !v)}
+                  title={
+                    zh
+                      ? `${t('nav.top_pool_label')}：共 ${allAccountRingChips.length} 个账号 · ${poolCuText} · ${activeLabel}（点击展开全部账号余量）`
+                      : `${t('nav.top_pool_label')}: ${allAccountRingChips.length} accounts · ${poolCuText} · ${activeLabel} (click to view all)`
+                  }
+                  className={cn(
+                    'inline-flex items-center gap-2.5 h-8.5 pl-3 pr-2.5 rounded-full border cursor-pointer transition-[border-color,background-color,box-shadow,transform] duration-200 hover:border-line-strong active:scale-[0.98]',
+                    poolPopoverOpen && 'border-line-strong',
+                  )}
+                  style={{
+                    backgroundColor: 'var(--surface-2)',
+                    borderColor: poolPopoverOpen ? 'var(--border-strong)' : 'var(--border-subtle)',
+                    boxShadow: 'var(--shadow-control)',
+                  }}
+                >
+                  <span className="hidden xl:inline text-[11.5px] font-medium text-fg-muted whitespace-nowrap">
+                    {t('nav.top_pool_label')}
+                  </span>
+                  {accountRingChips.map((chip, idx) => (
+                    <React.Fragment key={chip.id}>
+                      {idx > 0 && (
+                        <span
+                          className={cn(
+                            'hidden md:inline-block w-px h-3 shrink-0',
+                            idx >= 2 && 'md:hidden lg:inline-block',
+                          )}
+                          style={{ backgroundColor: 'var(--border-subtle)' }}
+                          aria-hidden="true"
+                        />
+                      )}
                       <span
-                        className="hidden md:inline-block w-px h-3"
+                        className={cn(
+                          'inline-flex items-center gap-1.5 text-[12px] min-w-0',
+                          idx >= 2 && 'hidden lg:inline-flex',
+                        )}
+                      >
+                        <CircularQuotaRing
+                          value={chip.pct}
+                          size={16}
+                          strokeWidth={2.5}
+                          tone={chip.tone}
+                          showValue={false}
+                        />
+                        <span className="font-semibold text-fg max-w-[84px] truncate whitespace-nowrap">
+                          {chip.shortLabel}
+                        </span>
+                        <span
+                          className="ch-num font-semibold shrink-0"
+                          style={{ color: ringToneTextColor(chip.tone) }}
+                        >
+                          {chip.pct}%
+                        </span>
+                      </span>
+                    </React.Fragment>
+                  ))}
+
+                  {allAccountRingChips.length > 2 && (
+                    <>
+                      <span
+                        className={cn(
+                          'w-px h-3 shrink-0',
+                          hiddenRingCount > 0 ? 'inline-block' : 'inline-block lg:hidden',
+                        )}
                         style={{ backgroundColor: 'var(--border-subtle)' }}
                         aria-hidden="true"
                       />
-                    )}
-                    <span
-                      className={cn(
-                        'inline-flex items-center gap-1.5 text-[12px]',
-                        idx >= 2 && 'hidden lg:inline-flex',
-                      )}
-                    >
-                      <CircularQuotaRing
-                        value={chip.pct}
-                        size={16}
-                        strokeWidth={2.5}
-                        tone={chip.tone}
-                        showValue={false}
-                      />
-                      <span className="font-semibold text-fg">{chip.shortLabel}</span>
-                      <span
-                        className="ch-num font-semibold"
-                        style={{
-                          color:
-                            chip.tone === 'coral'
+                      {hiddenRingCount > 0 && (
+                        <span
+                          className="hidden lg:inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[11px] font-semibold ch-num shrink-0"
+                          style={{
+                            backgroundColor: hiddenRingHasAlert
+                              ? 'var(--coral-soft)'
+                              : 'var(--neutral-soft)',
+                            color: hiddenRingHasAlert
                               ? 'var(--coral-text)'
-                              : chip.tone === 'amber'
-                                ? 'var(--amber-text)'
-                                : 'var(--emerald-text)',
+                              : 'var(--text-secondary)',
+                          }}
+                        >
+                          {hiddenRingHasAlert && (
+                            <span
+                              className="w-1.5 h-1.5 rounded-full"
+                              style={{ backgroundColor: 'var(--coral)' }}
+                            />
+                          )}
+                          +{hiddenRingCount}
+                        </span>
+                      )}
+                      <span
+                        className="inline-flex lg:hidden items-center gap-1 px-1.5 py-0.5 rounded-full text-[11px] font-semibold ch-num shrink-0"
+                        style={{
+                          backgroundColor: allAccountRingChips
+                            .slice(2)
+                            .some((c) => c.tone === 'coral')
+                            ? 'var(--coral-soft)'
+                            : 'var(--neutral-soft)',
+                          color: allAccountRingChips.slice(2).some((c) => c.tone === 'coral')
+                            ? 'var(--coral-text)'
+                            : 'var(--text-secondary)',
                         }}
                       >
-                        {chip.pct}%
+                        {allAccountRingChips.slice(2).some((c) => c.tone === 'coral') && (
+                          <span
+                            className="w-1.5 h-1.5 rounded-full"
+                            style={{ backgroundColor: 'var(--coral)' }}
+                          />
+                        )}
+                        +{allAccountRingChips.length - 2}
                       </span>
-                    </span>
-                  </React.Fragment>
-                ))}
-              </button>
+                    </>
+                  )}
+
+                  <ChevronDown
+                    className={cn(
+                      'w-3 h-3 text-fg-muted shrink-0 transition-transform duration-150',
+                      poolPopoverOpen && 'rotate-180',
+                    )}
+                    aria-hidden="true"
+                  />
+                </button>
+
+                {poolPopoverOpen && (
+                  <div className="ui-float ui-float-pop ui-anim-pop absolute right-0 top-full mt-2 z-50 w-[340px] max-w-[calc(100vw-24px)] rounded-2xl p-3">
+                    <div
+                      className="flex items-start justify-between gap-3 pb-2.5 border-b"
+                      style={{ borderColor: 'var(--border-faint)' }}
+                    >
+                      <div className="min-w-0">
+                        <div className="text-[12.5px] font-semibold text-fg">
+                          {zh
+                            ? `池内全部账号 (${allAccountRingChips.length})`
+                            : `All Pooled Accounts (${allAccountRingChips.length})`}
+                        </div>
+                        <div className="ch-num text-[11px] text-fg-muted mt-0.5">
+                          {summary.accounts_healthy}/{summary.accounts_total}{' '}
+                          {zh ? '健康可用' : 'healthy'} · {activeLabel}
+                        </div>
+                      </div>
+                      <div className="ch-num text-[13px] font-semibold text-fg shrink-0">
+                        {poolCuText}
+                      </div>
+                    </div>
+
+                    <div className="mt-2 max-h-[300px] overflow-y-auto pr-0.5 space-y-1">
+                      {allAccountRingChips.map((chip) => (
+                        <button
+                          key={chip.id}
+                          type="button"
+                          onClick={() => {
+                            setPoolPopoverOpen(false);
+                            route.navigate('/pool');
+                          }}
+                          className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-xl text-left cursor-pointer transition-colors hover:bg-[var(--hover-fill)]"
+                        >
+                          <CircularQuotaRing
+                            value={chip.pct}
+                            size={18}
+                            strokeWidth={2.6}
+                            tone={chip.tone}
+                            showValue={false}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <span className="truncate text-[12px] font-semibold text-fg">
+                                {chip.shortLabel}
+                              </span>
+                              {chip.isContributor &&
+                                chip.shortLabel !== '共享' &&
+                                chip.shortLabel !== 'Shared' && (
+                                <span
+                                  className="px-1.5 py-0.2 rounded-full text-[9.5px] font-semibold shrink-0"
+                                  style={{
+                                    backgroundColor: 'var(--sky-soft)',
+                                    color: 'var(--sky-text)',
+                                  }}
+                                >
+                                  {zh ? '好友共享' : 'Shared'}
+                                </span>
+                              )}
+                              {chip.healthLabel && (
+                                <span
+                                  className="px-1.5 py-0.2 rounded-full text-[9.5px] font-semibold shrink-0"
+                                  style={{
+                                    backgroundColor: 'var(--coral-soft)',
+                                    color: 'var(--coral-text)',
+                                  }}
+                                >
+                                  {chip.healthLabel}
+                                </span>
+                              )}
+                            </div>
+                            <div className="truncate text-[11px] text-fg-muted">
+                              {chip.identityLabel}
+                            </div>
+                          </div>
+                          <div className="shrink-0 text-right ch-num">
+                            <div
+                              className="text-[12px] font-semibold leading-tight"
+                              style={{ color: ringToneTextColor(chip.tone) }}
+                            >
+                              {chip.pct}%
+                            </div>
+                            <div className="text-[10.5px] text-fg-muted leading-tight mt-0.5">
+                              {chip.quotaText}
+                            </div>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+
+                    <div
+                      className="mt-2 pt-2 border-t flex items-center justify-between gap-2"
+                      style={{ borderColor: 'var(--border-faint)' }}
+                    >
+                      <span className="text-[11px] text-fg-muted">
+                        {zh
+                          ? '顶部最多显示 3 个，其余自动折叠至此'
+                          : 'Top bar caps at 3; scroll here for all'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPoolPopoverOpen(false);
+                          route.navigate('/pool');
+                        }}
+                        className="inline-flex items-center gap-1 text-[11.5px] font-semibold text-fg hover:underline cursor-pointer shrink-0"
+                      >
+                        <span>{zh ? '管理算力池' : 'Manage Pool'}</span>
+                        <ArrowUpRight className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
 
             <button
               type="button"
               onClick={() => onOpenConnectDrawer()}
               aria-label={t('nav.connect_agent')}
+              title={
+                connectedAgentCount > 0
+                  ? zh
+                    ? `已接入 ${connectedAgentCount} 个 AI 助手 · 点击管理或接入更多`
+                    : `${connectedAgentCount} AI assistant(s) connected — click to manage`
+                  : t('nav.connect_agent')
+              }
               className="ui-btn ui-btn-primary ui-btn-md"
             >
               <Zap className="w-3.5 h-3.5" />
               <span className="hidden min-[420px]:inline">{t('nav.connect_agent')}</span>
+              {connectedAgentCount > 0 && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-white/15 dark:bg-black/15 text-[11px] font-semibold ch-num leading-none">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                  {connectedAgentCount}
+                </span>
+              )}
             </button>
 
             <div className="md:hidden" data-dismiss-scope="mobile-menu">
@@ -2365,12 +2851,22 @@ export function AppShell({
                   onClick={togglePrivacyMask}
                 />
                 <MenuRow
-                  icon={<Camera />}
-                  label={t('nav.share_card')}
-                  onClick={() => {
-                    closeMobileMenu();
-                    setShareModalOpen(true);
-                  }}
+                  icon={<TerminalSquare />}
+                  label={t('nav.workbench')}
+                  href="/exp"
+                  onClick={closeMobileMenu}
+                />
+                <MenuRow
+                  icon={<Route />}
+                  label={t('nav.router')}
+                  href="/router"
+                  onClick={closeMobileMenu}
+                />
+                <MenuRow
+                  icon={<KeyRound />}
+                  label={t('nav.settings')}
+                  href="/cfg"
+                  onClick={closeMobileMenu}
                 />
                 <MenuRow
                   icon={<Lock />}
@@ -2386,12 +2882,6 @@ export function AppShell({
                     onClick={handleLockConsole}
                   />
                 )}
-                <MenuRow
-                  icon={<HeartHandshake />}
-                  label={t('nav.contribute')}
-                  href="/contribute"
-                  onClick={closeMobileMenu}
-                />
               </>
             )}
           </div>
@@ -2405,15 +2895,17 @@ export function AppShell({
       </div>
 
       {/* ================================================================== */}
-      {/* Mobile Bottom Tab Bar (<768px): All 5 Primary Sections              */}
+      {/* Mobile Bottom Tab Bar (<768px): Clean 4 Primary Sections            */}
       {/* ================================================================== */}
       <nav
         aria-label={zh ? '主导航' : 'Primary'}
-        className="ui-chrome ui-chrome-bottom md:hidden fixed bottom-0 inset-x-0 z-30 grid grid-cols-5 pb-[env(safe-area-inset-bottom)]"
+        className="ui-chrome ui-chrome-bottom md:hidden fixed bottom-0 inset-x-0 z-30 grid grid-cols-4 pb-[env(safe-area-inset-bottom)]"
       >
         {mobileTabs.map((tab) => {
           const Icon = tab.icon;
-          const active = route.section === tab.section;
+          const active = tab.activeSections
+            ? tab.activeSections.includes(route.section)
+            : route.section === tab.section;
           return (
             <a
               key={tab.key}

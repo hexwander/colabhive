@@ -44,6 +44,7 @@ import {
   StatusPill,
   Switch,
 } from '../ui/primitives';
+import { AgentBrandIcon } from '../ui/AgentBrandIcon';
 
 type ConnectTargetTab = AgentClientID | 'colab-cli' | 'python-sdk';
 type Transport = 'http' | 'stdio';
@@ -130,20 +131,19 @@ function buildCloudRemoteSnippet(
 const TARGET_TABS: {
   id: ConnectTargetTab;
   label: string;
-  monogram: string;
   badge: string;
   isSdkOrCli?: boolean;
 }[] = [
-  { id: 'antigravity', label: 'Antigravity', monogram: 'AG', badge: 'MCP HTTP' },
-  { id: 'claude-code', label: 'Claude Code', monogram: 'CC', badge: 'MCP HTTP' },
-  { id: 'claude-desktop', label: 'Claude Desktop', monogram: 'CD', badge: 'STDIO' },
-  { id: 'codex', label: 'Codex', monogram: 'CX', badge: 'TOML' },
-  { id: 'gemini-cli', label: 'Gemini CLI', monogram: 'GM', badge: 'JSON' },
-  { id: 'cursor', label: 'Cursor', monogram: 'CU', badge: 'MCP' },
-  { id: 'windsurf', label: 'Windsurf', monogram: 'WS', badge: 'MCP' },
-  { id: 'opencode', label: 'OpenCode', monogram: 'OC', badge: 'JSONC' },
-  { id: 'colab-cli', label: 'colab CLI', monogram: '>_', badge: 'CLI', isSdkOrCli: true },
-  { id: 'python-sdk', label: 'Python SDK', monogram: 'PY', badge: 'SDK', isSdkOrCli: true },
+  { id: 'antigravity', label: 'Antigravity', badge: 'MCP HTTP' },
+  { id: 'claude-code', label: 'Claude Code', badge: 'MCP HTTP' },
+  { id: 'claude-desktop', label: 'Claude Desktop', badge: 'STDIO' },
+  { id: 'codex', label: 'Codex', badge: 'TOML' },
+  { id: 'gemini-cli', label: 'Gemini CLI', badge: 'JSON' },
+  { id: 'cursor', label: 'Cursor', badge: 'MCP' },
+  { id: 'windsurf', label: 'Windsurf', badge: 'MCP' },
+  { id: 'opencode', label: 'OpenCode', badge: 'JSONC' },
+  { id: 'colab-cli', label: 'colab CLI', badge: 'CLI', isSdkOrCli: true },
+  { id: 'python-sdk', label: 'Python SDK', badge: 'SDK', isSdkOrCli: true },
 ];
 
 const AUTO_MINT_KEY_OPTION = '__auto_mint__';
@@ -1107,10 +1107,10 @@ print(exp.status, exp.merged_jsonl_path)`;
                   setToast(null);
                 }}
                 className={cn(
-                  'relative flex flex-col items-center gap-1.5 min-w-0 px-1 pt-3 pb-2.5 rounded-xl border text-center cursor-pointer',
+                  'group relative flex flex-col items-center gap-1.5 min-w-0 px-1 pt-3 pb-2.5 rounded-xl border text-center cursor-pointer',
                   'transition-[background-color,border-color,box-shadow,transform] duration-200 active:scale-[0.97]',
                   isSelected
-                    ? 'border-[var(--accent)] bg-[var(--surface-2)] shadow-[var(--shadow-card)]'
+                    ? 'border-[var(--accent)] bg-[var(--surface-2)] shadow-[var(--shadow-card)] ring-1 ring-[var(--accent)]/15'
                     : 'border-line bg-[var(--control-bg)] hover:border-line-strong hover:bg-[var(--control-bg-hover)] hover:-translate-y-px',
                 )}
               >
@@ -1121,25 +1121,29 @@ print(exp.status, exp.merged_jsonl_path)`;
                   />
                 )}
                 <span
-                  className="ch-num flex items-center justify-center w-8 h-8 rounded-[10px] border text-[11px] font-semibold transition-colors"
+                  className={cn(
+                    'flex items-center justify-center w-9 h-9 rounded-[11px] border transition-[background-color,border-color,box-shadow,transform] duration-200',
+                    isSelected
+                      ? 'bg-[#FFFFFF] dark:bg-[#262624] text-fg'
+                      : 'bg-[var(--surface-2)] text-fg group-hover:bg-[#FFFFFF] dark:group-hover:bg-[#262624]',
+                  )}
                   style={
                     isSelected
                       ? {
-                          backgroundColor: 'var(--accent)',
-                          backgroundImage: 'var(--accent-sheen)',
-                          borderColor: 'transparent',
-                          color: 'var(--accent-fg)',
-                          boxShadow: 'var(--shadow-accent)',
+                          borderColor: 'var(--border-strong)',
+                          boxShadow: 'var(--shadow-card)',
                         }
                       : {
-                          backgroundColor: 'var(--surface-2)',
                           borderColor: 'var(--border-subtle)',
-                          color: 'var(--text-secondary)',
                           boxShadow: 'var(--shadow-control)',
                         }
                   }
                 >
-                  {tab.monogram}
+                  <AgentBrandIcon
+                    id={tab.id}
+                    size={20}
+                    className="transition-transform duration-200 group-hover:scale-105"
+                  />
                 </span>
                 <span className="max-w-full truncate text-[11px] font-medium leading-tight text-fg">
                   {tab.label}

@@ -95,22 +95,7 @@ func TestFullWiredControlPlaneStackAndMCPStdio(t *testing.T) {
 		t.Fatalf("unexpected mcp stdio bridge output: %s", mcpOut.String())
 	}
 
-	// 4. Test `colabhive donate <invite_url>` against full Contributor OAuth PKCE + MockColab stack!
-	outBuf.Reset()
-	errBuf.Reset()
-	code = runMain(
-		ctx,
-		"colabhive",
-		[]string{"donate", ts.URL + "/contribute/ch_inv_icml2026", "--reserve-cu", "60", "--auth-code", "4/0A_contrib_alice"},
-		nil,
-		&outBuf,
-		&errBuf,
-	)
-	if code != 0 || !strings.Contains(outBuf.String(), "ch_rcpt_") {
-		t.Fatalf("colabhive donate failed (code=%d): out=%q err=%q", code, outBuf.String(), errBuf.String())
-	}
-
-	// 5. Stop session cleanly
+	// 4. Stop session cleanly
 	outBuf.Reset()
 	code = runMain(ctx, "colab", []string{"--server", ts.URL, "stop", "-s", "e2e_g4"}, nil, &outBuf, &errBuf)
 	if code != 0 {

@@ -644,3 +644,75 @@ func TestResolveRuntimePathsAndControlPlaneAttach(t *testing.T) {
 		t.Fatalf("expected cp2.BaseURL=%s, got %s", cp1.BaseURL, cp2.BaseURL)
 	}
 }
+
+func TestRouterPolicyPersistsAcrossControlPlaneRestarts(t *testing.T) {
+	tmpRoot := t.TempDir()
+	dbPath := filepath.Join(tmpRoot, "colabhive.db")
+	webDist := filepath.Join(tmpRoot, "web", "dist")
+	if err := os.MkdirAll(webDist, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(webDist, "index.html"), []byte("<!doctype html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("COLABHIVE_DAEMON_INFO_PATH", filepath.Join(tmpRoot, "daemon.json"))
+
+	ctx := context.Background()
+
+	// 1. First boot with empty DefaultStrategy -> fresh DB defaults to waste-zero; user switches to max-balance.
+	cp1, err := EnsureControlPlane(ctx, Config{
+		Host:   "127.0.0.1",
+		Port:   0,
+		DBPath: dbPath,
+		WebDir: webDist,
+	}, nil)
+	if err != nil {
+		t.Fatalf("EnsureControlPlane boot 1 failed: %v", err)
+	}
+	putReq, err := http.NewRequest(
+		http.MethodPut,
+		cp1.BaseURL+"/api/v1/router/policy",
+		strings.NewReader(`{"default_strategy":"max-balance","auto_failover":true,"allow_free_fallback":true}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	putReq.Header.Set("Content-Type", "application/json")
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		t.Fatalf("PUT /api/v1/router/policy failed: %v", err)
+	}
+	_ = putResp.Body.Close()
+	if putResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /api/v1/router/policy, got %d", putResp.StatusCode)
+	}
+	if err := cp1.Close(); err != nil {
+		t.Fatalf("cp1.Close() failed: %v", err)
+	}
+	_ = os.Remove(filepath.Join(tmpRoot, "daemon.json"))
+
+	// 2. Second boot (simulating app upgrade/restart without --strategy) -> MUST preserve max-balance!
+	cp2, err := EnsureControlPlane(ctx, Config{
+		Host:   "127.0.0.1",
+		Port:   0,
+		DBPath: dbPath,
+		WebDir: webDist,
+	}, nil)
+	if err != nil {
+		t.Fatalf("EnsureControlPlane boot 2 failed: %v", err)
+	}
+	defer cp2.Close()
+
+	getResp, err := http.Get(cp2.BaseURL + "/api/v1/router/policy")
+	if err != nil {
+		t.Fatalf("GET /api/v1/router/policy failed: %v", err)
+	}
+	defer getResp.Body.Close()
+	var pol models.RouterPolicy
+	if err := json.NewDecoder(getResp.Body).Decode(&pol); err != nil {
+		t.Fatal(err)
+	}
+	if pol.DefaultStrategy != models.StrategyMaxBalance {
+		t.Fatalf("expected persisted strategy %q after restart, got %q", models.StrategyMaxBalance, pol.DefaultStrategy)
+	}
+}

@@ -36,7 +36,7 @@ import (
 
 var (
 	// ErrSessionNotFound indicates the requested session ID or name does not exist.
-	ErrSessionNotFound = errors.New("runtime session not found")
+	ErrSessionNotFound = models.ErrSessionNotFound
 	// ErrExperimentNotFound indicates the requested experiment ID does not exist.
 	ErrExperimentNotFound = errors.New("experiment not found")
 	// ErrExperimentAlreadyExists indicates an experiment with the requested ID already exists.
@@ -55,6 +55,10 @@ type Options struct {
 	ResourcePollInterval   time.Duration
 	RemoteSyncInterval     time.Duration
 	PostAssignWarmup       time.Duration
+	AssignTimeout          time.Duration
+	FallbackAssignTimeout  time.Duration
+	WSPreAcceptRetryDelay  time.Duration
+	WSProbeTimeout         time.Duration
 	ArtifactsDir           string
 	DisableBackgroundLoops bool
 	HTTPClientFactory      func(proxyURL string) (*http.Client, *websocket.Dialer, error)
@@ -138,6 +142,18 @@ func NewConcreteEngine(
 	}
 	if opts.RemoteSyncInterval <= 0 {
 		opts.RemoteSyncInterval = 20 * time.Second
+	}
+	if opts.AssignTimeout <= 0 {
+		opts.AssignTimeout = 90 * time.Second
+	}
+	if opts.FallbackAssignTimeout <= 0 {
+		opts.FallbackAssignTimeout = 28 * time.Second
+	}
+	if opts.WSPreAcceptRetryDelay <= 0 {
+		opts.WSPreAcceptRetryDelay = 1200 * time.Millisecond
+	}
+	if opts.WSProbeTimeout <= 0 {
+		opts.WSProbeTimeout = 4 * time.Second
 	}
 	if opts.ArtifactsDir == "" {
 		opts.ArtifactsDir = filepath.Join(os.TempDir(), "colabhive-artifacts")
@@ -471,7 +487,7 @@ func (e *Engine) buildClientAndDialer(proxyURL string) (*http.Client, *websocket
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	wsDialer := &websocket.Dialer{
-		HandshakeTimeout: 20 * time.Second,
+		HandshakeTimeout: 10 * time.Second,
 	}
 
 	trimmed := strings.TrimSpace(proxyURL)
@@ -639,6 +655,42 @@ func (e *kernelBootstrapError) Unwrap() error {
 	return e.Err
 }
 
+// assignCapacityTimeoutError indicates that POST /tun/m/assign timed out after Step 1 XSRF GET
+// already proved the account's OAuth and proxy path healthy (e.g. out-of-stock GPU tier).
+// Failing over on this error cools down ONLY the specific account:tier pair instead of marking
+// the healthy account as HealthProxyError.
+type assignCapacityTimeoutError struct {
+	Tier    models.AcceleratorType
+	Timeout time.Duration
+	Err     error
+}
+
+func (e *assignCapacityTimeoutError) Error() string {
+	return fmt.Sprintf("colab /tun/m/assign %s probe timed out after %s (capacity unavailable): %v", e.Tier, e.Timeout.Round(time.Millisecond), e.Err)
+}
+
+func (e *assignCapacityTimeoutError) Unwrap() error {
+	return e.Err
+}
+
+func containsAcceleratorRuntime(list []models.AcceleratorType, target models.AcceleratorType) bool {
+	for _, item := range list {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRemainingFallbackTierAfter(current models.AcceleratorType, candidateTiers []models.AcceleratorType) bool {
+	for idx, tier := range candidateTiers {
+		if tier == current {
+			return idx < len(candidateTiers)-1
+		}
+	}
+	return false
+}
+
 type accountSlotAcquirer interface {
 	AcquireAccountSlot(ctx context.Context, req models.SessionAllocRequest) (*models.Account, models.AcceleratorType, func(), error)
 }
@@ -692,8 +744,10 @@ func (e *Engine) CreateSession(ctx context.Context, req models.SessionAllocReque
 	}
 	candidateChain := req.FallbackChain
 	autoFallback := req.AutoFallback
+	var largeChain []models.AcceleratorType
 	if e.rtr != nil {
 		if pol, pErr := e.rtr.GetPolicy(ctx); pErr == nil && pol != nil {
+			largeChain = pol.LargeVRAMFallbackChain
 			if len(req.FallbackChain) == 0 {
 				autoFallback = req.AutoFallback && pol.AutoFallbackEnabled
 				if req.RequireLargeVRAM {
@@ -705,6 +759,12 @@ func (e *Engine) CreateSession(ctx context.Context, req models.SessionAllocReque
 		}
 	}
 	candidateTiers := models.FallbackCandidatesFrom(requestedAcc, autoFallback, candidateChain)
+	if autoFallback && len(req.FallbackChain) == 0 && !req.RequireLargeVRAM &&
+		len(candidateTiers) == 1 && len(largeChain) > 0 &&
+		!containsAcceleratorRuntime(candidateChain, requestedAcc) &&
+		containsAcceleratorRuntime(largeChain, requestedAcc) {
+		candidateTiers = models.FallbackCandidatesFrom(requestedAcc, autoFallback, largeChain)
+	}
 	maxAttempts := numAccounts * len(candidateTiers)
 	if maxAttempts < 16 {
 		maxAttempts = 16
@@ -742,11 +802,46 @@ func (e *Engine) CreateSession(ctx context.Context, req models.SessionAllocReque
 			}
 			triedPairs[pairKey] = true
 
-			sess, provErr := e.provisionOnAccount(ctx, acc, assignedTier, requestedAcc, sessName, req)
+			fastFallbackProbe := autoFallback && hasRemainingFallbackTierAfter(assignedTier, candidateTiers)
+			if req.OnProgress != nil {
+				acctTag := strings.TrimSpace(acc.Alias)
+				if acctTag == "" {
+					acctTag = acc.ID
+				}
+				probeHintZh := ""
+				if fastFallbackProbe {
+					probeHintZh = "，若无库存将自动换档"
+				}
+				req.OnProgress(
+					fmt.Sprintf("Requesting %s GPU on %s (attempt %d)...", assignedTier, acctTag, attempt+1),
+					fmt.Sprintf("正在向 Google Colab 申请 %s 显卡（账号 %s · 第 %d 次探测%s）...", assignedTier, acctTag, attempt+1, probeHintZh),
+				)
+			}
+			sess, provErr := e.provisionOnAccount(ctx, acc, assignedTier, requestedAcc, sessName, req, fastFallbackProbe)
 			if provErr == nil {
 				retSess = sess
 				stopLoop = true
 				return
+			}
+			if req.OnProgress != nil && ctx.Err() == nil {
+				reasonZh := "暂不可用"
+				reasonEn := "unavailable"
+				lowerErr := strings.ToLower(provErr.Error())
+				switch {
+				case strings.Contains(lowerErr, "capacity unavailable"), strings.Contains(lowerErr, "timed out"), strings.Contains(lowerErr, "deadline exceeded"):
+					reasonZh = "探测超时/暂无库存"
+					reasonEn = "capacity probe timed out"
+				case strings.Contains(lowerErr, "412"), strings.Contains(lowerErr, "concurrent"), strings.Contains(lowerErr, "too many"):
+					reasonZh = "并发槽位已满"
+					reasonEn = "concurrency limit reached"
+				case strings.Contains(lowerErr, "503"):
+					reasonZh = "Google 后端 503 繁忙"
+					reasonEn = "Google backend 503 busy"
+				}
+				req.OnProgress(
+					fmt.Sprintf("%s unavailable (%s), trying next candidate...", assignedTier, reasonEn),
+					fmt.Sprintf("%s %s，正在自动切换下一档显卡或账号...", assignedTier, reasonZh),
+				)
 			}
 			if ctx.Err() != nil {
 				retErr = ctx.Err()
@@ -785,10 +880,25 @@ func (e *Engine) classifyAndRecordProvisionFailure(
 	if acc == nil || req == nil || provErr == nil {
 		return
 	}
+	if acc.EffectiveProvider() != models.ProviderColab {
+		// Legacy non-Colab account rows cannot run Colab tunnel `/tun/m/assign`:
+		// gracefully skip to the next Colab candidate WITHOUT poisoning the row.
+		req.ExcludedAccountIDs = appendUniqueStr(req.ExcludedAccountIDs, acc.ID)
+		return
+	}
 
 	// 1. Jupyter kernel bootstrap failure after /tun/m/assign succeeded -> 2m tier cooldown + exclude acc:tier.
 	var kbErr *kernelBootstrapError
 	if errors.As(provErr, &kbErr) {
+		e.markGPUEntitlementSafe(ctx, acc.ID, assignedTier, models.EntitlementCooldown, provErr.Error(), 2*time.Minute)
+		req.ExcludedAccountTiers = appendUniqueStr(req.ExcludedAccountTiers, pairKey)
+		return
+	}
+
+	// 1b. Out-of-stock / capacity probe timeout on POST /tun/m/assign after Step 1 GET succeeded ->
+	// cool down ONLY acc:tier (2m) so the healthy account immediately falls back to the next GPU tier!
+	var capTimeoutErr *assignCapacityTimeoutError
+	if errors.As(provErr, &capTimeoutErr) {
 		e.markGPUEntitlementSafe(ctx, acc.ID, assignedTier, models.EntitlementCooldown, provErr.Error(), 2*time.Minute)
 		req.ExcludedAccountTiers = appendUniqueStr(req.ExcludedAccountTiers, pairKey)
 		return
@@ -1024,6 +1134,7 @@ func (e *Engine) provisionOnAccount(
 	requestedTier models.AcceleratorType,
 	sessName string,
 	req models.SessionAllocRequest,
+	fastFallbackProbe bool,
 ) (*models.RuntimeSession, error) {
 	now := time.Now().UTC()
 	spec, ok := models.GetHardwareSpec(tier)
@@ -1054,9 +1165,14 @@ func (e *Engine) provisionOnAccount(
 
 	assignURL := e.buildAssignURL(nbh, tier, spec, req.HighMem)
 
-	// Step 1: Pre-Flight XSRF GET /tun/m/assign
-	step1Wire, err := e.doColabAssignStep(ctx, httpClient, http.MethodGet, assignURL, accessToken, "")
+	// Step 1: Pre-Flight XSRF GET /tun/m/assign (metadata call; bound to 20s so it never hangs 15m).
+	step1Ctx, cancelStep1 := context.WithTimeout(ctx, 20*time.Second)
+	step1Wire, err := e.doColabAssignStep(step1Ctx, httpClient, http.MethodGet, assignURL, accessToken, "")
+	cancelStep1()
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 
@@ -1078,19 +1194,55 @@ func (e *Engine) provisionOnAccount(
 			return nil, errors.New("colab /tun/m/assign GET omitted XSRF token")
 		}
 
-		// Step 2: Commit Allocation POST /tun/m/assign with X-Goog-Colab-Token
-		step2Wire, postErr := e.doColabAssignStep(ctx, httpClient, http.MethodPost, assignURL, accessToken, step1Wire.Token)
+		// Step 2: Commit Allocation POST /tun/m/assign with X-Goog-Colab-Token.
+		// When auto_fallback has lower GPU tiers ready behind `tier`, tighten the single-tier
+		// out-of-stock probe timeout to FallbackAssignTimeout (default 28s) so stockout failover
+		// switches 3x-6x faster without waiting for a 90s-180s upstream stall!
+		postTimeout := e.opts.AssignTimeout
+		if postTimeout <= 0 {
+			postTimeout = 90 * time.Second
+		}
+		if fastFallbackProbe {
+			fbTimeout := e.opts.FallbackAssignTimeout
+			if fbTimeout <= 0 {
+				fbTimeout = 28 * time.Second
+			}
+			postTimeout = fbTimeout
+		}
+
+		postCtx, cancelPost := context.WithTimeout(ctx, postTimeout)
+		step2Wire, postErr := e.doColabAssignStep(postCtx, httpClient, http.MethodPost, assignURL, accessToken, step1Wire.Token)
+		postTimedOut := errors.Is(postCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+		cancelPost()
+
 		if postErr != nil {
-			// On 502/503/504 or timeout, reconcile ONCE with GET using the exact same `nbh` to avoid double-billing!
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			// On 502/503/504 or probe timeout, reconcile ONCE with a fast GET using the exact same `nbh`
+			// so a VM that finished committing right at the boundary is adopted instead of double-billed!
 			var stErr *httpStatusError
 			if !errors.As(postErr, &stErr) || stErr.StatusCode >= 500 {
-				if recon, rErr := e.doColabAssignStep(ctx, httpClient, http.MethodGet, assignURL, accessToken, ""); rErr == nil &&
-					recon.Endpoint != "" && recon.RuntimeProxyInfo != nil {
+				reconTimeout := 8 * time.Second
+				if !fastFallbackProbe {
+					reconTimeout = 12 * time.Second
+				}
+				reconCtx, cancelRecon := context.WithTimeout(ctx, reconTimeout)
+				recon, rErr := e.doColabAssignStep(reconCtx, httpClient, http.MethodGet, assignURL, accessToken, "")
+				cancelRecon()
+				if rErr == nil && recon.Endpoint != "" && recon.RuntimeProxyInfo != nil {
 					step2Wire = recon
 					postErr = nil
 				}
 			}
 			if postErr != nil {
+				if postTimedOut {
+					return nil, &assignCapacityTimeoutError{
+						Tier:    tier,
+						Timeout: postTimeout,
+						Err:     postErr,
+					}
+				}
 				return nil, postErr
 			}
 		}
@@ -1122,11 +1274,17 @@ func (e *Engine) provisionOnAccount(
 		}
 	}()
 
-	if e.opts.PostAssignWarmup > 0 {
+	warmup := e.opts.PostAssignWarmup
+	if warmup <= 0 && strings.Contains(strings.ToLower(e.opts.TunnelBaseURL), "colab.research.google.com") {
+		// Google Colab's *.prod.r.colab.dev reverse proxy needs ~2.5s after /tun/m/assign
+		// to propagate routes across Edge POPs; waiting prevents immediate WS handshake 404s.
+		warmup = 2500 * time.Millisecond
+	}
+	if warmup > 0 {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(e.opts.PostAssignWarmup):
+		case <-time.After(warmup):
 		}
 	}
 
@@ -1388,7 +1546,19 @@ func (e *Engine) acquireCredentialsInternal(ctx context.Context, acc *models.Acc
 // Session Lookup, Lifecycle & Virtual Notebook Cells
 // ============================================================================
 
+func isStoreRowNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "not found")
+}
+
 // GetSession resolves a RuntimeSession by either ID (`sess_...`), Name (`eval_g4_0`), or Endpoint.
+// Database/storage read errors (distinct from sql.ErrNoRows / not-found) are propagated intact so
+// callers such as StopSession NEVER misclassify a DB outage as ErrSessionNotFound!
 func (e *Engine) GetSession(ctx context.Context, idOrName string) (*models.RuntimeSession, error) {
 	key := strings.TrimSpace(idOrName)
 	if key == "" {
@@ -1402,18 +1572,27 @@ func (e *Engine) GetSession(ctx context.Context, idOrName string) (*models.Runti
 		sess.UptimeSec = computeUptimeSec(sess)
 		return sess, nil
 	}
+	if err != nil && !isStoreRowNotFound(err) {
+		return nil, fmt.Errorf("load session %s from store: %w", key, err)
+	}
+
 	sess, err = e.st.GetSessionByName(ctx, key)
 	if err == nil && sess != nil {
 		sess.UptimeSec = computeUptimeSec(sess)
 		return sess, nil
 	}
+	if err != nil && !isStoreRowNotFound(err) {
+		return nil, fmt.Errorf("lookup session %s by name from store: %w", key, err)
+	}
+
 	all, err := e.st.ListSessions(ctx)
-	if err == nil {
-		for _, item := range all {
-			if item != nil && (item.Endpoint == key || strings.EqualFold(item.Name, key)) {
-				item.UptimeSec = computeUptimeSec(item)
-				return item, nil
-			}
+	if err != nil {
+		return nil, fmt.Errorf("list sessions from store for %s: %w", key, err)
+	}
+	for _, item := range all {
+		if item != nil && (item.Endpoint == key || strings.EqualFold(item.Name, key)) {
+			item.UptimeSec = computeUptimeSec(item)
+			return item, nil
 		}
 	}
 	return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, key)
@@ -2214,10 +2393,15 @@ func (e *Engine) syncAccountSessionRollupWithUpstream(
 		effectiveBurn = localBurn
 	}
 
+	prevActive := storedAcc.ActiveAssignments
 	storedAcc.ActiveAssignments = effectiveActive
 	storedAcc.LiveBurnRateCUHr = math.Round(effectiveBurn*100) / 100
 	storedAcc.ActiveSessionSummary = strings.Join(summaries, " + ")
 
+	if effectiveActive < prevActive && storedAcc.Health == models.HealthMaxConcurrency {
+		storedAcc.CooldownUntil = nil
+		storedAcc.HealthReason = ""
+	}
 	hasActiveCooldown := storedAcc.CooldownUntil != nil && now.Before(*storedAcc.CooldownUntil)
 	if effectiveActive == 0 {
 		if storedAcc.Health == models.HealthActiveWorking ||

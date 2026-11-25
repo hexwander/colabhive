@@ -6,7 +6,6 @@ import type {
   AccountHealth,
   AgentAPIKey,
   AgentClientConfigStatus,
-  ContributorInvite,
   DaemonHealthStatus,
   ProxyConfig,
   QuotaSummary,
@@ -80,6 +79,20 @@ export function SubscriptionTierBadge({ tier }: { tier: SubscriptionTier }) {
   return (
     <StatusPill tone={s.tone} size="xs" className="font-semibold">
       {s.text}
+    </StatusPill>
+  );
+}
+
+export function PlatformProviderBadge({
+  account: _account,
+  showHours: _showHours = true,
+}: {
+  account: Account;
+  showHours?: boolean;
+}) {
+  return (
+    <StatusPill tone="neutral" size="xs" className="font-semibold">
+      Colab
     </StatusPill>
   );
 }
@@ -474,7 +487,7 @@ export const DEMO_ACCOUNTS: Account[] = [
     gpu_equivalence: buildAccountEquiv(282.0, true),
     public_api_supported: false,
     tunnel_api_supported: true,
-    is_contributor: true,
+    is_contributor: false,
     invite_code: 'ch_inv_icml2026',
     guardrails: {
       min_reserve_cu: 60,
@@ -556,17 +569,17 @@ export const DEMO_QUOTA_SUMMARY: QuotaSummary = {
   accounts_healthy: 4,
   accounts_working: 3,
   accounts_contributor: 1,
-  total_available_cu: 1428.42,
-  schedulable_cu: 1368.42,
-  estimated_value_usd: 142.84,
+  total_available_cu: 1480.42,
+  schedulable_cu: 1420.42,
+  estimated_value_usd: 148.04,
   active_burn_rate_cu_hr: 28.2,
-  pool_depletion_eta_hours: 48.53,
+  pool_depletion_eta_hours: 50.37,
   earliest_batch_expiry_cu: 118.4,
   earliest_batch_expires_at: futureIso(14 * 24 + 6),
   active_vms: 3,
-  total_vm_slots: 11,
+  total_vm_slots: 13,
   total_online_vram_gb: 232,
-  free_t4_windows_ready: 2,
+  free_t4_windows_ready: 3,
   saved_idle_waste_cu: 312.6,
   auto_teardowns_count: 19,
   zombie_aborts_count: 4,
@@ -720,43 +733,6 @@ export const DEMO_API_KEYS: AgentAPIKey[] = [
     idle_auto_kill_min: 15,
     enabled: true,
     last_used_at: new Date().toISOString(),
-    created_at: new Date().toISOString(),
-  },
-];
-
-export const DEMO_INVITES: ContributorInvite[] = [
-  {
-    code: 'demo_icml2026',
-    pool_title: 'ICML 2027 Open Reasoning Sharded Pool',
-    maintainer_name: 'Systems & Alignment Lab',
-    welcome_note:
-      'Donate idle 90-day expiring Colab CUs to accelerate 4x-8x parallel benchmark sweeps. Your personal safety floor & Drive firewall are cryptographically enforced.',
-    target_groups: ['lab-contributors'],
-    default_proxy_id: 'prx_us_iad_02',
-    default_guardrails: {
-      min_reserve_cu: 50,
-      max_donated_cu_total: 200,
-      max_donated_cu_daily: 40,
-      donated_cu_used_total: 0,
-      donated_cu_used_today: 0,
-      allow_paid_cu_burn: true,
-      allowed_gpus: ['G4', 'A100', 'L4', 'T4'],
-      max_concurrent_vms: 2,
-      block_drive_propagation: true,
-      mask_email_in_dashboard: false,
-      paused: false,
-    },
-    max_uses: 10,
-    used_count: 1,
-    supported_modes: ['remote_copy_paste', 'cli_donate'],
-    required_scopes: [
-      'openid',
-      'https://www.googleapis.com/auth/userinfo.profile',
-      'https://www.googleapis.com/auth/userinfo.email',
-      'https://www.googleapis.com/auth/colaboratory',
-    ],
-    revoked: false,
-    expires_at: futureIso(168),
     created_at: new Date().toISOString(),
   },
 ];

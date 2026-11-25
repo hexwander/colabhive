@@ -79,6 +79,7 @@ type desktopApp struct {
 	autoStartEnabled  bool
 	mainWindowVisible bool
 	trayVisible       bool
+	trayMode          string // "panel" | "menu"
 	lastAction        string
 	cachedSummary     *models.QuotaSummary
 	summaryConnected  bool
@@ -86,7 +87,9 @@ type desktopApp struct {
 
 	// Tray click & auto-dismiss coordination
 	trayWasOpenOnLDown       bool
+	trayModeOnLDown          string
 	lastTrayAutoHideAt       time.Time
+	lastTrayAutoHideMode     string
 	ignoreNextLButtonUpUntil time.Time
 
 	debouncer *ToggleDebouncer
@@ -210,6 +213,15 @@ func Run(ctx context.Context, cfg Config) error {
 				func() {
 					app.dispatch(func() { app.onMainWebViewFailed() })
 				},
+				func(delay time.Duration) {
+					time.AfterFunc(delay, func() {
+						app.dispatch(func() {
+							if app.mainSurface != nil {
+								app.mainSurface.retryInitialNavigation()
+							}
+						})
+					})
+				},
 			)
 			app.mainSurface = mainSurf
 			mgr.attachSurface(app.mainSurface)
@@ -233,6 +245,15 @@ func Run(ctx context.Context, cfg Config) error {
 				},
 				func() {
 					app.dispatch(func() { app.onTrayWebViewFailed() })
+				},
+				func(delay time.Duration) {
+					time.AfterFunc(delay, func() {
+						app.dispatch(func() {
+							if app.traySurface != nil {
+								app.traySurface.retryInitialNavigation()
+							}
+						})
+					})
 				},
 			)
 			app.traySurface = traySurf
@@ -633,6 +654,19 @@ func (a *desktopApp) executeActionOnUIThread(action string, route string, explic
 		if a.debouncer.ShouldExecute("toggle-tray", time.Now()) {
 			a.toggleTrayFlyout()
 		}
+	case "sync-now":
+		if a.debouncer.ShouldExecute("sync-now", time.Now()) {
+			a.hideTrayFlyout()
+			a.triggerManualCloudSync()
+		}
+	case "copy-mcp":
+		if a.debouncer.ShouldExecute("copy-mcp", time.Now()) {
+			a.hideTrayFlyout()
+			if cp := a.getCP(); cp != nil && cp.BaseURL != "" {
+				mcpURL := strings.TrimRight(cp.BaseURL, "/") + "/mcp"
+				_ = writeClipboardUnicodeText(a.getTrayHostHWND(), mcpURL)
+			}
+		}
 	case "toggle-autostart":
 		if a.debouncer.ShouldExecute("toggle-autostart", time.Now()) {
 			next := !IsAutoStartEnabled()
@@ -755,17 +789,6 @@ func (a *desktopApp) showMainWindow(route string) {
 		return
 	}
 
-	if a.mainSurface != nil {
-		a.mainSurface.setVisible(true)
-		if cleanRoute != "" && cleanRoute != "/" {
-			a.mainSurface.openSPARoute(cleanRoute)
-		} else if !a.mainSurface.navigated && a.mainSurface.ready {
-			if cp := a.getCP(); cp != nil && cp.BaseURL != "" {
-				a.mainSurface.navigateRaw(cp.BaseURL + "/")
-			}
-		}
-	}
-
 	iconic, _, _ := procIsIconic.Call(a.hwndMain)
 	if iconic != 0 {
 		_, _, _ = procShowWindow.Call(a.hwndMain, swRestore)
@@ -776,7 +799,19 @@ func (a *desktopApp) showMainWindow(route string) {
 	_, _, _ = procSetForegroundWindow.Call(a.hwndMain)
 
 	if a.mainSurface != nil {
+		// Show/position WebView2 AFTER ShowWindow so Chromium's swapchain attaches to a visible,
+		// non-zero client rect instead of staying blank white after minimize-to-tray or sleep!
+		a.mainSurface.setVisible(true)
 		a.mainSurface.resizeToClientRect()
+		a.mainSurface.notifyPositionChanged()
+		if (a.mainSurface.navFailed || !a.mainSurface.navigated) && a.mainSurface.ready {
+			if cp := a.getCP(); cp != nil && cp.BaseURL != "" {
+				a.mainSurface.navFailed = false
+				a.mainSurface.navigateRaw(cp.BaseURL + cleanRoute)
+			}
+		} else if cleanRoute != "" && cleanRoute != "/" {
+			a.mainSurface.openSPARoute(cleanRoute)
+		}
 		a.mainSurface.syncWindowState(isWindowMaximized(a.hwndMain))
 		a.mainSurface.focus()
 	}
@@ -839,11 +874,20 @@ func (a *desktopApp) showTrayFlyout() {
 		}
 		a.stateMu.Lock()
 		a.trayVisible = false
+		a.trayMode = ""
 		a.stateMu.Unlock()
 		a.invokeBrowserFallback("/tray")
 		return
 	}
 
+	a.showTrayFlyoutSized("panel", DefaultFlyoutLogicalWidth, DefaultFlyoutLogicalHeight)
+}
+
+func (a *desktopApp) showTrayContextMenuFlyout() {
+	a.showTrayFlyoutSized("menu", DefaultMenuLogicalWidth, DefaultMenuLogicalHeight)
+}
+
+func (a *desktopApp) showTrayFlyoutSized(mode string, logicalW, logicalH int) {
 	anchorRect, cursorPt := a.queryTrayIconRect()
 	probePt := cursorPt
 	if anchorRect != nil && !anchorRect.Empty() {
@@ -852,8 +896,8 @@ func (a *desktopApp) showTrayFlyout() {
 	monBounds, workArea, monDPI := queryMonitorAtPoint(probePt, a.hwndTrayFlyout)
 
 	placement := ComputeFlyoutPosition(FlyoutLayoutInput{
-		LogicalWidth:  DefaultFlyoutLogicalWidth,
-		LogicalHeight: DefaultFlyoutLogicalHeight,
+		LogicalWidth:  logicalW,
+		LogicalHeight: logicalH,
 		GapLogicalPx:  DefaultFlyoutGapPx,
 		DPI:           monDPI,
 		AnchorRect:    anchorRect,
@@ -861,6 +905,10 @@ func (a *desktopApp) showTrayFlyout() {
 		MonitorBounds: monBounds,
 		WorkArea:      workArea,
 	})
+
+	if a.traySurface != nil {
+		a.traySurface.setTrayMode(mode)
+	}
 
 	_, _, _ = procSetWindowPos.Call(
 		a.hwndTrayFlyout,
@@ -887,6 +935,7 @@ func (a *desktopApp) showTrayFlyout() {
 
 	a.stateMu.Lock()
 	a.trayVisible = true
+	a.trayMode = mode
 	a.stateMu.Unlock()
 }
 
@@ -900,15 +949,17 @@ func (a *desktopApp) hideTrayFlyout() {
 	}
 	a.stateMu.Lock()
 	a.trayVisible = false
+	a.trayMode = ""
 	a.stateMu.Unlock()
 }
 
 func (a *desktopApp) toggleTrayFlyout() {
 	a.stateMu.RLock()
 	currentlyVisible := a.trayVisible
+	currentMode := a.trayMode
 	a.stateMu.RUnlock()
 
-	if currentlyVisible {
+	if currentlyVisible && currentMode != "menu" {
 		a.hideTrayFlyout()
 		return
 	}
@@ -1090,6 +1141,14 @@ func (a *desktopApp) triggerManualCloudSync() {
 }
 
 func (a *desktopApp) showNativeTrayContextMenu() {
+	// Prefer the rounded Stardust WebView2 context menu whenever the tray WebView2 is ready;
+	// fall back cleanly to the Win32 native popup menu only if WebView2 is unavailable.
+	if a.wvMgr != nil && !a.wvMgr.isFailed() && a.hwndTrayFlyout != 0 &&
+		a.traySurface != nil && a.traySurface.ready && a.traySurface.navigated && !a.traySurface.isFailed() {
+		a.showTrayContextMenuFlyout()
+		return
+	}
+
 	a.hideTrayFlyout()
 
 	hMenu, _, _ := procCreatePopupMenu.Call()
@@ -1118,8 +1177,8 @@ func (a *desktopApp) showNativeTrayContextMenu() {
 		_, _, _ = procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
 	}
 
-	// 1. 打开快捷悬浮面板 (Magpie 视图) (bold default item)
-	appendTextItem(mfString, cmdMenuOpenTray, "打开快捷悬浮面板 (Magpie 视图)")
+	// 1. 打开快捷悬浮面板 (bold default item)
+	appendTextItem(mfString, cmdMenuOpenTray, "打开快捷悬浮面板")
 	_, _, _ = procSetMenuDefaultItem.Call(hMenu, cmdMenuOpenTray, 0)
 
 	// 2. 打开 ColabHive 主窗口
@@ -1204,12 +1263,16 @@ func (a *desktopApp) shouldSuppressTrayClickReopen(now time.Time) bool {
 	a.stateMu.RLock()
 	currentlyVisible := a.trayVisible
 	lastAutoHide := a.lastTrayAutoHideAt
+	lastAutoHideMode := a.lastTrayAutoHideMode
 	a.stateMu.RUnlock()
 
 	if currentlyVisible {
 		return false
 	}
-	return a.trayWasOpenOnLDown || (!lastAutoHide.IsZero() && now.Sub(lastAutoHide) < 220*time.Millisecond)
+	if a.trayWasOpenOnLDown && a.trayModeOnLDown != "menu" {
+		return true
+	}
+	return lastAutoHideMode != "menu" && !lastAutoHide.IsZero() && now.Sub(lastAutoHide) < 220*time.Millisecond
 }
 
 func (a *desktopApp) handleTrayCallback(lParam uintptr) {
@@ -1218,6 +1281,7 @@ func (a *desktopApp) handleTrayCallback(lParam uintptr) {
 	case wmLButtonDown:
 		a.stateMu.RLock()
 		a.trayWasOpenOnLDown = a.trayVisible
+		a.trayModeOnLDown = a.trayMode
 		a.stateMu.RUnlock()
 
 	case wmLButtonDblClk:
@@ -1331,11 +1395,10 @@ func mainWndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 				return 0
 			}
 		case wmSize:
-			if app.mainSurface != nil {
+			if app.mainSurface != nil && wParam != sizeMinimized {
 				app.mainSurface.resizeToClientRect()
-				if wParam != sizeMinimized {
-					app.mainSurface.syncWindowState(isWindowMaximized(hwnd))
-				}
+				app.mainSurface.notifyPositionChanged()
+				app.mainSurface.syncWindowState(isWindowMaximized(hwnd))
 			}
 		case wmMove, wmMoving:
 			if app.mainSurface != nil {
@@ -1384,12 +1447,13 @@ func trayFlyoutWndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	if app != nil {
 		switch uint32(msg) {
 		case wmActivate:
-			// Instant Magpie / Windows 11 Quick Settings dismissal when clicking anywhere outside!
+			// Instant Windows 11 Quick Settings dismissal when clicking anywhere outside!
 			if uint16(wParam&0xFFFF) == waInactive && !app.quitting.Load() {
 				app.stateMu.Lock()
 				wasVis := app.trayVisible
 				if wasVis {
 					app.lastTrayAutoHideAt = time.Now()
+					app.lastTrayAutoHideMode = app.trayMode
 				}
 				app.stateMu.Unlock()
 				if wasVis {

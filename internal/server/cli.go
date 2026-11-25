@@ -201,8 +201,6 @@ func RunDaemonCLI(
 		return cliCmdURL(ctx, client, subArgs, out, errOut)
 	case "auth", "whoami":
 		return cliCmdAuth(ctx, client, sub, subArgs, in, out, errOut)
-	case "donate":
-		return cliCmdDonate(ctx, globals, subArgs, in, out, errOut)
 	case "connect":
 		return cliCmdConnect(ctx, globals, subArgs, out, errOut, false)
 	case "disconnect":
@@ -565,7 +563,7 @@ func cliCmdRun(ctx context.Context, client *daemonHTTPClient, g cliGlobalOpts, a
 			Accelerator:        accel,
 			HighMem:            highMem || true,
 			NumShards:          g.Shards,
-			Strategy:           models.RoutingStrategy(firstVal(g.Strategy, "waste-zero")),
+			Strategy:           models.RoutingStrategy(g.Strategy),
 			AutoStopOnComplete: !keepVM,
 			Env:                envMap,
 		}, &exp)
@@ -1186,99 +1184,6 @@ func cliCmdAuth(ctx context.Context, client *daemonHTTPClient, sub string, args 
 	return 0
 }
 
-func cliCmdDonate(ctx context.Context, g cliGlobalOpts, args []string, in io.Reader, out, errOut io.Writer) int {
-	if len(args) == 0 {
-		_, _ = fmt.Fprintln(errOut, "Usage: colabhive donate <invite_url_or_code> [--reserve-cu 50] [--allow-gpu T4,L4,G4,A100] [--auth-code CODE]")
-		return 2
-	}
-	inviteInput := args[0]
-	reserveCU := 50.0
-	allowGPURaw := "T4,L4,G4,A100"
-	maxVMs := 1
-	freeOnly := false
-	authCode := ""
-
-	for i := 1; i < len(args); i++ {
-		switch args[i] {
-		case "--reserve-cu":
-			if i+1 < len(args) {
-				i++
-				reserveCU, _ = strconv.ParseFloat(args[i], 64)
-			}
-		case "--allow-gpu":
-			if i+1 < len(args) {
-				i++
-				allowGPURaw = args[i]
-			}
-		case "--max-vms":
-			if i+1 < len(args) {
-				i++
-				maxVMs, _ = strconv.Atoi(args[i])
-			}
-		case "--free-only":
-			freeOnly = true
-		case "--auth-code":
-			if i+1 < len(args) {
-				i++
-				authCode = args[i]
-			}
-		}
-	}
-
-	baseURL, inviteCode := splitInviteURL(inviteInput, g.ServerURL)
-	client := newDaemonClient(cliGlobalOpts{ServerURL: baseURL})
-
-	var allowed []models.AcceleratorType
-	for _, item := range strings.Split(allowGPURaw, ",") {
-		if norm, err := models.NormalizeAccelerator(item); err == nil {
-			allowed = append(allowed, norm)
-		}
-	}
-
-	guardrails := models.ContributorGuardrails{
-		MinReserveCU:          reserveCU,
-		AllowPaidCUBurn:       !freeOnly,
-		AllowedGPUs:           allowed,
-		MaxConcurrentVMs:      maxVMs,
-		BlockDrivePropagation: true,
-	}
-
-	var pending models.OAuthPendingSession
-	if _, err := client.doJSON(ctx, http.MethodPost, fmt.Sprintf("/api/public/contribute/%s/start", url.PathEscape(inviteCode)), map[string]any{
-		"guardrails": guardrails,
-		"mode":       models.OAuthModeRemoteCopyPaste,
-	}, &pending); err != nil {
-		_, _ = fmt.Fprintf(errOut, "[colabhive] Failed to start contribution: %v\n", err)
-		return 1
-	}
-
-	if authCode == "" {
-		_, _ = fmt.Fprintf(out, "=== ColabHive Contributor Onboarding ===\nReserve Floor: %.1f CU | Drive Firewall: BLOCKED\n\nStep 1: Open in browser:\n  %s\n\nStep 2: Paste Google auth code or redirect URL: ", reserveCU, pending.AuthURL)
-		reader := bufio.NewReader(in)
-		line, _ := reader.ReadString('\n')
-		authCode = strings.TrimSpace(line)
-	}
-
-	var rcpt models.ContributionReceipt
-	if _, err := client.doJSON(ctx, http.MethodPost, fmt.Sprintf("/api/public/contribute/%s/complete", url.PathEscape(inviteCode)), map[string]any{
-		"state":     pending.State,
-		"raw_input": authCode,
-		"code":      authCode,
-	}, &rcpt); err != nil {
-		_, _ = fmt.Fprintf(errOut, "[colabhive] Contribution exchange failed: %v\n", err)
-		return 1
-	}
-
-	if g.JSON {
-		enc, _ := json.MarshalIndent(rcpt, "", "  ")
-		_, _ = fmt.Fprintln(out, string(enc))
-		return 0
-	}
-	_, _ = fmt.Fprintf(out, "[OK] Contributed %s (%.2f CU)!\n  Receipt Token: %s\n  Manage/Revoke: %s\n",
-		rcpt.Status.MaskedEmail, rcpt.Status.PaidCUBalance, rcpt.ReceiptToken, rcpt.ManageURL)
-	return 0
-}
-
 func isUnderSystemTempDir(p string) bool {
 	if strings.TrimSpace(p) == "" {
 		return false
@@ -1546,27 +1451,12 @@ func resolveDefaultCLISession(ctx context.Context, client *daemonHTTPClient, exp
 	return "", fmt.Errorf("multiple active sessions (%d); specify target with -s <session>", len(active))
 }
 
-func splitInviteURL(raw string, fallbackServer string) (baseURL string, code string) {
-	trimmed := strings.TrimSpace(raw)
-	if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
-		if u, err := url.Parse(trimmed); err == nil {
-			segs := strings.Split(strings.Trim(u.Path, "/"), "/")
-			if len(segs) > 0 {
-				return fmt.Sprintf("%s://%s", u.Scheme, u.Host), segs[len(segs)-1]
-			}
-		}
-	}
-	base := firstVal(fallbackServer, os.Getenv("COLABHIVE_URL"), "http://127.0.0.1:7860")
-	return strings.TrimRight(base, "/"), trimmed
-}
-
 func printCLIUsage(prog string, out io.Writer, ver VersionInfo) {
 	_, _ = fmt.Fprintf(out, `ColabHive (%s %s) — Multi-Account Google Colab GPU Observatory, MCP Server & Drop-In CLI
 
 Control Plane & Agent Commands:
   %s serve [--mode local|cloud] [--port 7860] [--admin-token TOK] [--trust-proxy]
   %s mcp [stdio] [--strategy waste-zero] [--account <id>]
-  %s donate <invite_url> [--reserve-cu 50] [--allow-gpu T4,L4,G4,A100]
   %s connect [<agent>|--all] [--server URL] [--key ch_sk_...] [--transport http|stdio]
   %s disconnect [<agent>|--all]       Remove ColabHive MCP entry & preserve sibling configs
   %s pool <export|import> [file]      Portable AES-256-GCM .chvault pool migration
@@ -1591,11 +1481,11 @@ Drop-In Google Colab CLI Commands (100%% colab v0.8.0 compatible + Pool flags):
 
 Pool Routing Flags (accepted on any command):
   --server <URL>   --api-key <ch_sk_...>   --account <id|email|tag:X>
-  --strategy <waste-zero|max-balance|sticky-session|round-robin|free-opportunistic>
+  --strategy <free-first|waste-zero|max-balance|sticky-session|round-robin|free-opportunistic>
   --shards <K>     --experiment <EXP_ID>   --fallback <auto|none>
 `,
 		prog, firstVal(ver.Version, "1.0.0"),
-		prog, prog, prog, prog, prog, prog,
+		prog, prog, prog, prog, prog,
 		prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog,
 	)
 }

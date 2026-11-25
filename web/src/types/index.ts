@@ -312,6 +312,8 @@ export interface Account {
   avatar_url?: string;
   alias?: string;
   notes?: string;
+  provider?: import('./v11').ProviderType;
+  provider_meta?: import('./v11').ProviderAccountMeta;
   subscription_tier: SubscriptionTier;
   health: AccountHealth;
   health_reason?: string;
@@ -384,74 +386,6 @@ export interface OAuthPendingSession {
   created_at: string;
 }
 
-export interface ContributorInvite {
-  code: string;
-  pool_title: string;
-  maintainer_name: string;
-  welcome_note?: string;
-  target_groups: string[];
-  default_proxy_id?: string;
-  default_guardrails: ContributorGuardrails;
-  max_uses: number;
-  used_count: number;
-  supported_modes: OAuthAuthMode[];
-  required_scopes: string[];
-  share_url?: string;
-  revoked: boolean;
-  expires_at?: string;
-  created_at: string;
-}
-
-export interface CreateInviteRequest {
-  pool_title: string;
-  maintainer_name: string;
-  welcome_note?: string;
-  target_groups?: string[];
-  default_proxy_id?: string;
-  default_guardrails: ContributorGuardrails;
-  max_uses?: number;
-  ttl_hours?: number;
-}
-
-export interface ContributorActiveVM {
-  session_id: string;
-  accelerator: AcceleratorType;
-  burn_rate_cu_hr: number;
-  uptime_sec: number;
-  started_at: string;
-}
-
-export interface ContributorReceiptStatus {
-  account_id: string;
-  masked_email: string;
-  subscription_tier: SubscriptionTier;
-  health: AccountHealth;
-  paid_cu_balance: number;
-  schedulable_cu: number;
-  live_burn_rate_cu_hr: number;
-  guardrails: ContributorGuardrails;
-  active_vms: ContributorActiveVM[];
-  last_polled_at?: string;
-}
-
-export interface ContributionReceipt {
-  receipt_token: string;
-  manage_url: string;
-  status: ContributorReceiptStatus;
-}
-
-export interface ContributorGuardrailsPatch {
-  min_reserve_cu?: number;
-  max_donated_cu_total?: number;
-  max_donated_cu_daily?: number;
-  allow_paid_cu_burn?: boolean;
-  allowed_gpus?: AcceleratorType[];
-  max_concurrent_vms?: number;
-  schedule_window?: ScheduleWindow;
-  mask_email_in_dashboard?: boolean;
-  paused?: boolean;
-}
-
 export interface QuotaSummary {
   accounts_total: number;
   accounts_healthy: number;
@@ -480,7 +414,13 @@ export interface DiscoveredLocalCredential {
   source_type: 'keyring_plaintext' | 'colab_token_json' | 'gcloud_adc';
   source_path: string;
   environment: 'host' | 'wsl2';
+  email?: string;
   email_preview?: string;
+  display_name?: string;
+  source_label?: string;
+  already_in_pool?: boolean;
+  existing_account_id?: string;
+  status?: 'ready' | 'in_pool' | 'expired' | 'unverified';
   token_preview: string;
   scopes?: string[];
 }
@@ -823,6 +763,7 @@ export interface ExperimentTeardownResult {
 // ============================================================================
 
 export type RoutingStrategy =
+  | 'free-first'
   | 'waste-zero'
   | 'max-balance'
   | 'sticky-session'
@@ -830,11 +771,11 @@ export type RoutingStrategy =
   | 'free-opportunistic';
 
 export const ALL_ROUTING_STRATEGIES: RoutingStrategy[] = [
+  'free-first',
   'waste-zero',
   'max-balance',
   'sticky-session',
   'round-robin',
-  'free-opportunistic',
 ];
 
 export interface RouterPolicy {
@@ -983,6 +924,10 @@ export type WSEventType =
   | 'trace_event'
   | 'guardrail_preempt'
   | 'zombie_alert'
+  | 'llm_gateway_updated'
+  | 'app_instance_updated'
+  | 'checkpoint_relay'
+  | 'provider_updated'
   | 'heartbeat';
 
 export interface SessionStreamChunk {
@@ -1057,3 +1002,5 @@ export interface SystemSelfTestResult {
   steps: VerifyStepResult[];
   discovered_local_count: number;
 }
+
+export * from './v11';

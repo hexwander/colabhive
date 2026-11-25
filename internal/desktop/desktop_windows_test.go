@@ -144,6 +144,7 @@ func TestWebViewAsyncFailureFallbackAndFocusLossDebounceScope(t *testing.T) {
 		nil,
 		nil,
 		func() { app.onMainWebViewFailed() },
+		nil,
 	)
 	mainSurf.pendingRoute = "/pool"
 	app.mainSurface = mainSurf
@@ -159,6 +160,7 @@ func TestWebViewAsyncFailureFallbackAndFocusLossDebounceScope(t *testing.T) {
 		nil,
 		nil,
 		func() { app.onTrayWebViewFailed() },
+		nil,
 	)
 	app.traySurface = traySurf
 	mgr.attachSurface(traySurf)

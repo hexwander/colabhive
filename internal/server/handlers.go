@@ -2068,315 +2068,6 @@ func (s *Server) handleExportVaultBundle(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, bundle)
 }
 
-func (s *Server) handleListInvites(w http.ResponseWriter, r *http.Request) {
-	var list []*models.ContributorInvite
-	var err error
-	if s.pool != nil {
-		list, err = s.pool.ListInvites(r.Context())
-	} else if s.st != nil {
-		list, err = s.st.ListInvites(r.Context())
-	}
-	if err != nil {
-		writeJSONError(w, mapServiceErrorStatus(err), err.Error())
-		return
-	}
-	if list == nil {
-		list = []*models.ContributorInvite{}
-	}
-	writeJSON(w, http.StatusOK, list)
-}
-
-func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
-	var req models.CreateInviteRequest
-	if err := decodeJSONBody(r, &req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if s.pool != nil {
-		inv, err := s.pool.CreateInvite(r.Context(), req)
-		if err != nil {
-			writeJSONError(w, mapServiceErrorStatus(err), err.Error())
-			return
-		}
-		if inv.ShareURL == "" {
-			inv.ShareURL = fmt.Sprintf("%s/contribute/%s", s.inferServerBaseURL(r), inv.Code)
-		}
-		writeJSON(w, http.StatusOK, inv)
-		return
-	}
-	code := models.NewPrefixedID("ch_inv_")
-	inv := &models.ContributorInvite{
-		Code:              code,
-		PoolTitle:         firstVal(req.PoolTitle, "ColabHive Shared Pool"),
-		MaintainerName:    firstVal(req.MaintainerName, "Lab Admin"),
-		WelcomeNote:       req.WelcomeNote,
-		TargetGroups:      req.TargetGroups,
-		DefaultProxyID:    req.DefaultProxyID,
-		DefaultGuardrails: req.DefaultGuardrails,
-		MaxUses:           req.MaxUses,
-		SupportedModes:    []models.OAuthAuthMode{models.OAuthModeRemoteCopyPaste, models.OAuthModeCLIDonate},
-		RequiredScopes:    models.ContributorOAuthScopes,
-		ShareURL:          fmt.Sprintf("%s/contribute/%s", s.inferServerBaseURL(r), code),
-		CreatedAt:         time.Now().UTC(),
-	}
-	if s.st != nil {
-		_ = s.st.SaveInvite(r.Context(), inv)
-	}
-	writeJSON(w, http.StatusOK, inv)
-}
-
-func (s *Server) handleRevokeInvite(w http.ResponseWriter, r *http.Request) {
-	code := r.PathValue("code")
-	if s.pool != nil {
-		if err := s.pool.RevokeInvite(r.Context(), code); err != nil {
-			writeJSONError(w, mapServiceErrorStatus(err), err.Error())
-			return
-		}
-	} else if s.st != nil {
-		_ = s.st.DeleteInvite(r.Context(), code)
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) validateActiveContributorInvite(ctx context.Context, code string) (*models.ContributorInvite, int, error) {
-	if !isSafePathSegment(code) {
-		return nil, http.StatusNotFound, errors.New("invite not found")
-	}
-	now := time.Now().UTC()
-	var inv *models.ContributorInvite
-	var err error
-	if s.pool != nil {
-		inv, err = s.pool.GetPublicInvite(ctx, code)
-		if err != nil {
-			st := mapServiceErrorStatus(err)
-			if st == http.StatusInternalServerError {
-				st = http.StatusNotFound
-			}
-			return nil, st, err
-		}
-		if inv == nil {
-			return nil, http.StatusNotFound, errors.New("invite not found")
-		}
-	} else if s.st != nil {
-		inv, err = s.st.GetInvite(ctx, code)
-		if err != nil || inv == nil {
-			return nil, http.StatusNotFound, errors.New("invite not found")
-		}
-	} else {
-		return nil, http.StatusServiceUnavailable, errors.New("account pool service not configured")
-	}
-
-	if inv.Revoked {
-		return nil, http.StatusGone, errors.New("invite has been revoked")
-	}
-	if inv.ExpiresAt != nil && now.After(*inv.ExpiresAt) {
-		return nil, http.StatusGone, errors.New("invite has expired")
-	}
-	if inv.MaxUses > 0 && inv.UsedCount >= inv.MaxUses {
-		return nil, http.StatusGone, errors.New("invite max_uses exhausted")
-	}
-	return inv, http.StatusOK, nil
-}
-
-func (s *Server) handleGetPublicInvite(w http.ResponseWriter, r *http.Request) {
-	code := r.PathValue("code")
-	inv, status, err := s.validateActiveContributorInvite(r.Context(), code)
-	if err != nil {
-		writeJSONError(w, status, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, inv)
-}
-
-func (s *Server) handleStartContribution(w http.ResponseWriter, r *http.Request) {
-	code := r.PathValue("code")
-	var body struct {
-		Guardrails models.ContributorGuardrails `json:"guardrails"`
-		Mode       models.OAuthAuthMode         `json:"mode"`
-	}
-	if err := decodeJSONBody(r, &body); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if body.Mode == "" {
-		body.Mode = models.OAuthModeRemoteCopyPaste
-	}
-	body.Guardrails.BlockDrivePropagation = true
-
-	if _, status, invErr := s.validateActiveContributorInvite(r.Context(), code); invErr != nil {
-		writeJSONError(w, status, invErr.Error())
-		return
-	}
-	if s.pool == nil {
-		writeJSONError(w, http.StatusServiceUnavailable, "account pool service not configured")
-		return
-	}
-	pending, err := s.pool.StartContribution(r.Context(), code, body.Guardrails, body.Mode)
-	if err != nil {
-		writeJSONError(w, mapServiceErrorStatus(err), err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, pending)
-}
-
-func (s *Server) handleCompleteContribution(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	code := r.PathValue("code")
-	var body struct {
-		State      string                        `json:"state"`
-		Code       string                        `json:"code"`
-		RawInput   string                        `json:"raw_input"`
-		Credential map[string]any                `json:"credential"`
-		Guardrails *models.ContributorGuardrails `json:"guardrails"`
-	}
-	if err := decodeJSONBody(r, &body); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	// MANDATORY: Validate active invite BEFORE processing either credential donation OR OAuth code exchange!
-	inv, invStatus, invErr := s.validateActiveContributorInvite(ctx, code)
-	if invErr != nil {
-		writeJSONError(w, invStatus, invErr.Error())
-		return
-	}
-
-	// Support direct `colabhive-sdk donate --keyring-path` credential donation strictly via
-	// `CompleteCredentialContribution` (NEVER calling owner `ImportCredentials`!).
-	if len(body.Credential) > 0 {
-		type credContributor interface {
-			CompleteCredentialContribution(context.Context, string, models.ContributorGuardrails, []byte) (*models.ContributionReceipt, error)
-		}
-		cc, ok := s.pool.(credContributor)
-		if !ok || cc == nil {
-			writeJSONError(w, http.StatusBadRequest, "direct credential contribution is not supported by the configured pool service")
-			return
-		}
-		guardrails := inv.DefaultGuardrails
-		if body.Guardrails != nil {
-			guardrails = *body.Guardrails
-		}
-		guardrails.BlockDrivePropagation = true
-
-		rawCred, err := json.Marshal(body.Credential)
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, "invalid credential JSON: "+err.Error())
-			return
-		}
-		rcpt, err := cc.CompleteCredentialContribution(ctx, code, guardrails, rawCred)
-		if err != nil {
-			st := mapServiceErrorStatus(err)
-			if st == http.StatusInternalServerError {
-				st = http.StatusBadRequest
-			}
-			writeJSONError(w, st, err.Error())
-			return
-		}
-		if rcpt.ManageURL == "" {
-			rcpt.ManageURL = fmt.Sprintf("%s/contribute/manage/%s", s.inferServerBaseURL(r), rcpt.ReceiptToken)
-		}
-		if rcpt.Status.ActiveVMs == nil {
-			rcpt.Status.ActiveVMs = []models.ContributorActiveVM{}
-		}
-		writeJSON(w, http.StatusOK, rcpt)
-		return
-	}
-
-	if s.pool == nil {
-		writeJSONError(w, http.StatusServiceUnavailable, "account pool service not configured")
-		return
-	}
-	codeInput := firstVal(body.RawInput, body.Code)
-	rcpt, err := s.pool.CompleteContribution(ctx, code, body.State, codeInput)
-	if err != nil {
-		writeJSONError(w, mapServiceErrorStatus(err), err.Error())
-		return
-	}
-	if rcpt.ManageURL == "" {
-		rcpt.ManageURL = fmt.Sprintf("%s/contribute/manage/%s", s.inferServerBaseURL(r), rcpt.ReceiptToken)
-	}
-	if rcpt.Status.ActiveVMs == nil {
-		rcpt.Status.ActiveVMs = []models.ContributorActiveVM{}
-	}
-	writeJSON(w, http.StatusOK, rcpt)
-}
-
-func (s *Server) handleGetContributionStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	token := r.PathValue("receiptToken")
-	if s.pool == nil {
-		writeJSONError(w, http.StatusNotFound, "receipt not found")
-		return
-	}
-	status, err := s.pool.GetContributionByReceipt(ctx, token)
-	if err != nil || status == nil {
-		writeJSONError(w, http.StatusNotFound, "receipt not found")
-		return
-	}
-	status.ActiveVMs = s.listContributorActiveVMs(ctx, status.AccountID)
-	writeJSON(w, http.StatusOK, status)
-}
-
-func (s *Server) handleUpdateContributionGuardrails(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	token := r.PathValue("receiptToken")
-	var patch models.ContributorGuardrailsPatch
-	if err := decodeJSONBody(r, &patch); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if s.pool == nil {
-		writeJSONError(w, http.StatusNotFound, "receipt not found")
-		return
-	}
-	status, err := s.pool.UpdateContributionGuardrails(ctx, token, patch)
-	if err != nil {
-		writeJSONError(w, mapServiceErrorStatus(err), err.Error())
-		return
-	}
-	status.ActiveVMs = s.listContributorActiveVMs(ctx, status.AccountID)
-	writeJSON(w, http.StatusOK, status)
-}
-
-func (s *Server) handleRevokeContribution(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	token := r.PathValue("receiptToken")
-	if s.pool == nil {
-		writeJSONError(w, http.StatusNotFound, "receipt not found")
-		return
-	}
-	// Active ColabHive-provisioned VMs are drained inside `s.pool.RevokeContribution` AFTER acquiring
-	// `accountMutex` and verifying `acc.IsContributor && acc.ReceiptTokenHash == hash`!
-	if err := s.pool.RevokeContribution(ctx, token); err != nil {
-		writeJSONError(w, mapServiceErrorStatus(err), err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"revoked": true})
-}
-
-func (s *Server) listContributorActiveVMs(ctx context.Context, accountID string) []models.ContributorActiveVM {
-	out := []models.ContributorActiveVM{}
-	if s.runtime == nil || accountID == "" {
-		return out
-	}
-	sessions, err := s.runtime.ListSessions(ctx, models.SessionFilter{AccountID: accountID, ActiveOnly: true})
-	if err != nil {
-		return out
-	}
-	for _, sess := range sessions {
-		if sess != nil {
-			out = append(out, models.ContributorActiveVM{
-				SessionID:    sess.ID,
-				Accelerator:  sess.Accelerator,
-				BurnRateCUHr: sess.BurnRateCUHr,
-				UptimeSec:    sess.UptimeSec,
-				StartedAt:    sess.CreatedAt,
-			})
-		}
-	}
-	return out
-}
-
 // ============================================================================
 // 8–10. Runtime Sessions, Execution, Files, Packages, Artifacts & Experiments
 // ============================================================================
@@ -2448,6 +2139,8 @@ func (s *Server) canAPIKeyAccessExperiment(ctx context.Context, r *http.Request,
 	return false
 }
 
+const defaultSessionHistoryLimit = 50
+
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	accID := firstVal(q.Get("account_id"), q.Get("account"))
@@ -2463,6 +2156,17 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, mapServiceErrorStatus(err), err.Error())
 		return
 	}
+	// Keep 100% of active sessions while bounding historical (STOPPED/LOST) rows
+	// by default so dashboards & Workbench stay fast even with hundreds of past runs.
+	// Callers can pass ?all=true or ?limit=0 for full history, or ?limit=N to tune.
+	historyLimit := defaultSessionHistoryLimit
+	if q.Get("all") == "true" || q.Get("all") == "1" {
+		historyLimit = 0
+	} else if rawLim := strings.TrimSpace(q.Get("limit")); rawLim != "" {
+		if n, parseErr := strconv.Atoi(rawLim); parseErr == nil && n >= 0 {
+			historyLimit = n
+		}
+	}
 	if key != nil {
 		scoped := make([]*models.RuntimeSession, 0, len(list))
 		for _, sess := range list {
@@ -2471,7 +2175,26 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		list = scoped
-	} else if s.isAuthRequired() {
+	}
+	if historyLimit > 0 && !filter.ActiveOnly && len(list) > historyLimit {
+		bounded := make([]*models.RuntimeSession, 0, historyLimit+8)
+		histCount := 0
+		for _, sess := range list {
+			if sess == nil {
+				continue
+			}
+			isHist := sess.Status == models.SessionStopped || sess.Status == models.SessionLost
+			if isHist {
+				if histCount >= historyLimit {
+					continue
+				}
+				histCount++
+			}
+			bounded = append(bounded, sess)
+		}
+		list = bounded
+	}
+	if key == nil && s.isAuthRequired() {
 		signed := make([]*models.RuntimeSession, 0, len(list))
 		for _, sess := range list {
 			signed = append(signed, s.signSessionArtifacts(sess))
@@ -3633,7 +3356,7 @@ func (s *Server) handleDesktopAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch req.Action {
-	case "open-main", "open-route", "hide-tray", "show-tray", "toggle-tray", "quit", "toggle-autostart", "set-autostart", "state":
+	case "open-main", "open-route", "hide-tray", "show-tray", "toggle-tray", "sync-now", "copy-mcp", "quit", "toggle-autostart", "set-autostart", "state":
 		// Valid desktop bridge action
 	default:
 		writeJSONError(w, http.StatusBadRequest, "unsupported desktop action: "+req.Action)

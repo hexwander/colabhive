@@ -1,34 +1,29 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   ArrowRight,
   ArrowUpRight,
   Check,
-  CheckCircle2,
   Cloud,
   Copy,
-  Cpu,
   Download,
   ExternalLink,
   Flame,
   Gauge,
-  GitBranch,
+  Gift,
   Globe,
-  HeartHandshake,
   Laptop,
   Layers,
   Lock,
+  MessageCircle,
   Moon,
   Network,
-  Play,
-  RefreshCw,
+  Rocket,
   RotateCcw,
-  Server,
   ShieldCheck,
   Sparkles,
   Star,
   Sun,
-  Terminal,
   Zap,
 } from 'lucide-react';
 import {
@@ -54,6 +49,7 @@ import {
   Switch,
 } from '../components/ui/primitives';
 import { BrandMark } from '../components/ui/BrandLogo';
+import { AgentBrandIcon } from '../components/ui/AgentBrandIcon';
 import { TrayPopoverPage, type TrayTab } from './TrayPopoverPage';
 
 const GITHUB_REPO_URL = 'https://github.com/hexwander/colabhive';
@@ -223,6 +219,17 @@ export function LandingPage() {
     [zh],
   );
 
+  const copyTimerRef = useRef<number | null>(null);
+  const failoverTimerRef = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+      if (failoverTimerRef.current !== null) window.clearTimeout(failoverTimerRef.current);
+    },
+    [],
+  );
+
   const handleCopyInstall = useCallback(async () => {
     const text = installOptions[installTab].cmd;
     try {
@@ -236,7 +243,8 @@ export function LandingPage() {
       document.body.removeChild(ta);
     }
     setCopiedInstall(true);
-    window.setTimeout(() => setCopiedInstall(false), 1800);
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    copyTimerRef.current = window.setTimeout(() => setCopiedInstall(false), 1800);
   }, [installOptions, installTab]);
 
   const scrollToSection = useCallback((id: string) => {
@@ -270,11 +278,13 @@ export function LandingPage() {
 
   const handleTriggerFailover = useCallback(() => {
     setFailoverPhase('throttled');
-    window.setTimeout(() => {
+    if (failoverTimerRef.current !== null) window.clearTimeout(failoverTimerRef.current);
+    failoverTimerRef.current = window.setTimeout(() => {
       const tr = simulateDemoFailoverEvent();
       setLastFailoverTrace(tr);
       setFailoverPhase('rerouted');
       refreshSnap();
+      failoverTimerRef.current = null;
     }, 520);
   }, [refreshSnap]);
 
@@ -348,7 +358,7 @@ export function LandingPage() {
                 color: 'var(--emerald-text)',
               }}
             >
-              v1.0
+              v1.1
             </span>
           </div>
 
@@ -357,10 +367,10 @@ export function LandingPage() {
             className="hidden lg:flex items-center gap-1 text-[13px] font-medium text-fg-secondary"
           >
             {[
+              { id: 'v11-pillars', label: zh ? 'v1.1 四大新玩法' : 'v1.1 Highlights' },
               { id: 'sandbox', label: zh ? '交互试玩' : 'Live Sandbox' },
               { id: 'architecture', label: zh ? '核心架构' : 'Architecture' },
               { id: 'agents', label: zh ? 'Agent 接入' : 'Agent MCP' },
-              { id: 'modes', label: zh ? '本地与云端' : 'Local & Cloud' },
               { id: 'install', label: zh ? '快速安装' : 'Quick Install' },
             ].map((item) => (
               <button
@@ -429,19 +439,6 @@ export function LandingPage() {
                   ? 'Apache-2.0 开源 · 纯 Go 单文件 · 在线零后端实机沙盒已就绪'
                   : 'Apache-2.0 Open Source · Single Go Binary · Live Interactive Sandbox'}
               </StatusPill>
-              <button
-                type="button"
-                onClick={() => navigate('/contribute/ch_inv_demo2026')}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11.5px] font-semibold border cursor-pointer transition-colors hover:border-line-strong"
-                style={{
-                  backgroundColor: 'var(--surface-2)',
-                  borderColor: 'var(--border-subtle)',
-                  color: 'var(--text-secondary)',
-                }}
-              >
-                <HeartHandshake className="w-3.5 h-3.5 text-[var(--coral)]" />
-                <span>{zh ? '支持 30 秒好友免密共享算力 →' : '30s Zero-Drive Friend GPU Sharing →'}</span>
-              </button>
             </div>
 
             <h1
@@ -452,7 +449,7 @@ export function LandingPage() {
             >
               {zh ? (
                 <>
-                  把散落的 Google Colab 账号<span className="whitespace-nowrap">汇聚为你的</span>
+                  把散落的 Google Colab 多账号<span className="whitespace-nowrap">变成你的</span>
                   <span
                     className="inline-block px-2 mx-0.5 rounded-xl"
                     style={{
@@ -460,13 +457,12 @@ export function LandingPage() {
                       color: 'var(--emerald-text)',
                     }}
                   >
-                    私人多卡 GPU 算力池
+                    私人免费 AI 超级主机
                   </span>
-                  <span className="whitespace-nowrap">与 AI Agent 路由中枢</span>
                 </>
               ) : (
                 <>
-                  Turn Scattered Google Colab Accounts into One{' '}
+                  Turn Pooled Google Colab GPUs into Your{' '}
                   <span
                     className="inline-block px-2.5 rounded-xl"
                     style={{
@@ -474,24 +470,23 @@ export function LandingPage() {
                       color: 'var(--emerald-text)',
                     }}
                   >
-                    Self-Hosted GPU Cluster
-                  </span>{' '}
-                  &amp; MCP Router
+                    Private Free AI Supercomputer
+                  </span>
                 </>
               )}
             </h1>
 
-            <p className="max-w-[780px] mx-auto text-[15px] sm:text-[16.5px] leading-relaxed text-fg-secondary text-balance">
+            <p className="max-w-[820px] mx-auto text-[15px] sm:text-[16.5px] leading-relaxed text-fg-secondary text-balance">
               {zh
-                ? '统一调度 AI Ultra (2,500 CU)、Colab Pro+、好友免密捐赠额度与免费 T4 窗口。以完全相同的 CU 成本实现 4× 多卡并行提速，原生提供 Windows 系统托盘、macOS Apple Silicon 菜单栏应用 (ColabHive.app) 与 8 款 AI 编程助手一键 MCP 接入。'
-                : 'Pool AI Ultra (2,500 CU), Colab Pro+, passwordless friend-donated CUs, and Free T4 windows. Run 4× parallel shards at identical CU cost, monitor from a native Windows Tray or macOS Menu Bar app (ColabHive.app), and wire 8 AI coding agents in 1 click.'}
+                ? '把多个 Google Colab 免费与 Pro/Ultra 账号汇成一池：内置私人开源大模型网关 (/v1)、一键 ComfyUI / WanGP / JupyterLab 应用商店、掉线自动换号接着跑，同时支持 8 款 AI 编程助手 MCP 路由与 4× 多卡并发提速。'
+                : 'Pool multiple Google Colab Free & Pro+/Ultra accounts into one local hub: Private Open-Weight LLM Gateway (/v1), 1-Click AI App Store, Auto-Resume Relay, Savings Poster, and 8-IDE MCP Routing.'}
             </p>
 
             {/* Primary Hero CTAs */}
             <div className="pt-1 flex flex-wrap items-center justify-center gap-3">
               <button
                 type="button"
-                onClick={() => navigate(consolePath)}
+                onClick={() => navigate('/apps/llm')}
                 className="h-11 px-6 rounded-full text-[14px] font-semibold inline-flex items-center gap-2 cursor-pointer transition-transform active:scale-[0.98]"
                 style={{
                   backgroundColor: 'var(--accent)',
@@ -499,15 +494,13 @@ export function LandingPage() {
                   boxShadow: 'var(--shadow-accent)',
                 }}
               >
-                <Gauge className="w-4 h-4" />
-                <span>
-                  {zh ? '进入全屏在线控制台 →' : 'Launch Full Live Console →'}
-                </span>
+                <Zap className="w-4 h-4" />
+                <span>{zh ? '一键部署无审查大模型 →' : 'Deploy Uncensored LLM →'}</span>
               </button>
 
               <button
                 type="button"
-                onClick={() => navigate('/contribute/ch_inv_demo2026')}
+                onClick={() => navigate('/apps')}
                 className="h-11 px-5 rounded-full text-[13.5px] font-semibold border inline-flex items-center gap-2 cursor-pointer transition-colors hover:border-line-strong"
                 style={{
                   backgroundColor: 'var(--surface-2)',
@@ -516,10 +509,23 @@ export function LandingPage() {
                   boxShadow: 'var(--shadow-control)',
                 }}
               >
-                <HeartHandshake className="w-4 h-4 text-[var(--emerald)]" />
-                <span>
-                  {zh ? '预览好友免密共享页' : 'Preview Guest Share Portal'}
-                </span>
+                <Rocket className="w-4 h-4 text-[var(--amber)]" />
+                <span>{zh ? 'WanGP 视频 & AI 应用商店' : 'WanGP Video & AI App Store'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => navigate(consolePath)}
+                className="h-11 px-5 rounded-full text-[13.5px] font-semibold border inline-flex items-center gap-2 cursor-pointer transition-colors hover:border-line-strong"
+                style={{
+                  backgroundColor: 'var(--surface-2)',
+                  borderColor: 'var(--control-border)',
+                  color: 'var(--text-primary)',
+                  boxShadow: 'var(--shadow-control)',
+                }}
+              >
+                <Gauge className="w-4 h-4 text-[var(--emerald)]" />
+                <span>{zh ? '进入全屏算力控制台' : 'Full Live Console'}</span>
               </button>
 
               <a
@@ -635,6 +641,175 @@ export function LandingPage() {
         </section>
 
         {/* ====================================================================
+         * 2b. v1.1 Four Flagship Features Bento Showcase (`#v11-pillars`)
+         * ================================================================== */}
+        <section
+          id="v11-pillars"
+          className="max-w-[1260px] mx-auto px-4 sm:px-6 py-6 space-y-5 scroll-mt-20"
+        >
+          <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
+            <div className="space-y-1.5 max-w-[720px]">
+              <span className="text-[11.5px] font-bold tracking-wider uppercase text-[var(--emerald-text)]">
+                {zh ? 'ColabHive v1.1 重磅升级 · 不懂代码也能玩转免费显卡' : 'New in ColabHive v1.1 · Built for Everyone'}
+              </span>
+              <h2
+                className="text-[24px] sm:text-[31px] font-bold tracking-tight text-fg"
+                style={{ fontFamily: "'Bricolage Grotesque', var(--font-sans)" }}
+              >
+                {zh
+                  ? '4 大全民向 AI 杀手级体验，让闲置云端显卡真正为你所用'
+                  : 'Four Everyday AI Superpowers Powered by Your Free GPU Pool'}
+              </h2>
+            </div>
+            <StatusPill tone="emerald" size="sm" dot>
+              {zh ? '零公网穿透 · 零封号风险 · 完全免费开源' : 'Zero Public Tunnels · Zero Ban Risk · 100% Free'}
+            </StatusPill>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-5">
+            {/* Pillar 1: Private AI Chat */}
+            <div className="ui-card p-5 sm:p-6 flex flex-col justify-between gap-4">
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span
+                    className="w-10 h-10 rounded-2xl inline-flex items-center justify-center"
+                    style={{ backgroundColor: 'var(--emerald-soft)', color: 'var(--emerald-text)' }}
+                  >
+                    <MessageCircle className="w-5 h-5" />
+                  </span>
+                  <StatusPill tone="emerald" size="xs" mono>
+                    127.0.0.1:7860/v1 · Ollama
+                  </StatusPill>
+                </div>
+                <h3 className="text-[18px] font-bold text-fg">
+                  {zh
+                    ? '无审查开源大模型一键部署 & 本机 /v1 网关'
+                    : 'Uncensored Open-Weight LLM Deployer & Local /v1 Gateway'}
+                </h3>
+                <p className="text-[13.5px] leading-relaxed text-fg-secondary">
+                  {zh
+                    ? '精选 2026 年 11 月社区最热 Heretic / Abliterated 正交去审查 GGUF 模型（DeepSeek-V4.1-Flash-1017、GLM-5.3-Flash、Qwen3.8-Flash-Next、Qwen3.8-27B、Gemma 4 及任意 Hugging Face 链接），一键部署到池内免费 T4 或 96GB G4 显卡，本机直接暴露标准 OpenAI / Anthropic / Ollama /v1 接口，直连 SillyTavern 酒馆、Cherry Studio 与 Cursor。'
+                    : '1-click top Nov 2026 uncensored GGUFs (DeepSeek-V4.1-Flash-1017, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B, Gemma 4, or any hf.co repo) on Free T4 to 96GB G4 GPUs, exposing private OpenAI / Anthropic / Ollama /v1 endpoints for SillyTavern, Cherry Studio & Cursor.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => navigate('/apps/llm')}
+                className="ui-btn ui-btn-secondary ui-btn-md w-full justify-between"
+              >
+                <span>{zh ? '进入无审查大模型部署 (/apps/llm)' : 'Open Uncensored LLM Deployer (/apps/llm)'}</span>
+                <ArrowRight className="w-3.5 h-3.5 text-[var(--emerald-text)]" />
+              </button>
+            </div>
+
+            {/* Pillar 2: 1-Click Video / Image App Store */}
+            <div className="ui-card p-5 sm:p-6 flex flex-col justify-between gap-4">
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span
+                    className="w-10 h-10 rounded-2xl inline-flex items-center justify-center"
+                    style={{ backgroundColor: 'var(--amber-soft)', color: 'var(--amber-text)' }}
+                  >
+                    <Rocket className="w-5 h-5" />
+                  </span>
+                  <StatusPill tone="amber" size="xs" mono>
+                    127.0.0.1:8188 直连
+                  </StatusPill>
+                </div>
+                <h3 className="text-[18px] font-bold text-fg">
+                  {zh
+                    ? '🎬 一键 AI 视频/画图商店 & 零穿透私有端口桥'
+                    : '🎬 1-Click AI Video/Image Store & Localhost Bridge'}
+                </h3>
+                <p className="text-[13.5px] leading-relaxed text-fg-secondary">
+                  {zh
+                    ? '像手机应用商店一样一键拉起 Wan 2.2 图生视频、Flux 超清画图、CosyVoice 声音克隆与 Open WebUI。独创本机私有端口桥 (127.0.0.1:8188)，Krita / PS 画图插件直接连云端大显存，无需 ngrok 公网穿透，彻底告别封号焦虑。'
+                    : 'Launch Wan 2.2 Video, Flux ComfyUI, WhisperX + CosyVoice & Open WebUI in one click. Binds private 127.0.0.1 ports locally so Krita / Photoshop plugins connect directly with zero public ngrok tunnels.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => navigate('/apps')}
+                className="ui-btn ui-btn-secondary ui-btn-md w-full justify-between"
+              >
+                <span>{zh ? '逛逛一键 AI 应用商店 (/apps)' : 'Browse 1-Click App Store (/apps)'}</span>
+                <ArrowRight className="w-3.5 h-3.5 text-[var(--amber-text)]" />
+              </button>
+            </div>
+
+            {/* Pillar 3: Multi-Account Colab Pool (Free-First & Waste-Zero) */}
+            <div className="ui-card p-5 sm:p-6 flex flex-col justify-between gap-4">
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span
+                    className="w-10 h-10 rounded-2xl inline-flex items-center justify-center"
+                    style={{ backgroundColor: 'var(--sky-soft)', color: 'var(--sky-text)' }}
+                  >
+                    <Gift className="w-5 h-5" />
+                  </span>
+                  <StatusPill tone="sky" size="xs" mono>
+                    Free-First · Waste-Zero
+                  </StatusPill>
+                </div>
+                <h3 className="text-[18px] font-bold text-fg">
+                  {zh
+                    ? '🎁 多账号 Colab 聚合算力池 (Free-First)'
+                    : '🎁 Multi-Account Colab Pool (Free-First)'}
+                </h3>
+                <p className="text-[13.5px] leading-relaxed text-fg-secondary">
+                  {zh
+                    ? '把多个 Google Colab 免费与 Pro / Pro+ / Ultra 账号汇成同一个本地算力池。开启「优先烧免费额度」先用满所有 $0 T4 窗口，再按快到期批次优先（Waste-Zero）自动分配大显存 G4 / H100 / A100，彻底告别额度过期浪费。'
+                    : 'Aggregate multiple Google Colab Free, Pro, Pro+, and Ultra accounts into a single pool. Enable Free-First to drain $0 T4 windows first, then automatically route expiring CU batches to G4 / H100 / A100 GPUs.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => navigate('/pool')}
+                className="ui-btn ui-btn-secondary ui-btn-md w-full justify-between"
+              >
+                <span>{zh ? '前往账号算力池 (/pool)' : 'Manage Account Pool (/pool)'}</span>
+                <ArrowRight className="w-3.5 h-3.5 text-[var(--sky-text)]" />
+              </button>
+            </div>
+
+            {/* Pillar 4: Auto-Resume & Savings Receipt */}
+            <div className="ui-card p-5 sm:p-6 flex flex-col justify-between gap-4">
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span
+                    className="w-10 h-10 rounded-2xl inline-flex items-center justify-center"
+                    style={{ backgroundColor: 'var(--coral-soft)', color: 'var(--coral-text)' }}
+                  >
+                    <Sparkles className="w-5 h-5" />
+                  </span>
+                  <StatusPill tone="coral" size="xs">
+                    {zh ? '断线续跑 · 省钱海报' : 'Auto-Relay · Poster'}
+                  </StatusPill>
+                </div>
+                <h3 className="text-[18px] font-bold text-fg">
+                  {zh
+                    ? '🛡️ 掉线自动换号接着跑 & 🏆 算力省钱晒单海报'
+                    : '🛡️ Auto-Checkpoint Relay & 🏆 Savings Receipt'}
+                </h3>
+                <p className="text-[13.5px] leading-relaxed text-fg-secondary">
+                  {zh
+                    ? '后台定时把作品与训练快照同步回本机：前一个免费账号时长耗尽被踢下线瞬间，自动换下一个空闲号从 82% 接着跑完！更支持一键生成零隐私泄露的高清「算力省钱账单」晒图卡片，直观记录累计省下多少租卡费。'
+                    : 'Periodically snapshots progress locally: when a free VM hits timeout, ColabHive automatically restores onto the next account so hours of work never vanish — plus a 1-click PII-free Compute Savings Poster.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => navigate(consolePath)}
+                className="ui-btn ui-btn-secondary ui-btn-md w-full justify-between"
+              >
+                <span>{zh ? '查看实时省钱账单与控制台 →' : 'View Savings & Live Console →'}</span>
+                <ArrowRight className="w-3.5 h-3.5 text-[var(--coral-text)]" />
+              </button>
+            </div>
+          </div>
+        </section>
+
+        {/* ====================================================================
          * 3. Embedded Interactive Live Sandbox (The Showstopper!)
          * ================================================================== */}
         <section id="sandbox" className="max-w-[1260px] mx-auto px-4 sm:px-6 py-6 scroll-mt-20">
@@ -661,7 +836,7 @@ export function LandingPage() {
                 <h2 className="ui-title text-[19px] sm:text-[21px] font-bold text-fg">
                   {zh
                     ? '无需安装，直接在下方拨动开关、试算多卡提速或触发 429 容灾漂移'
-                    : 'Try the Real Magpie Tray, 4× Shard Calculator & 429 Auto-Failover Right Here'}
+                    : 'Try the Live System Tray, 4× Shard Calculator & 429 Auto-Failover Right Here'}
                 </h2>
               </div>
 
@@ -678,7 +853,7 @@ export function LandingPage() {
                   [
                     {
                       key: 'tray' as SandboxStageKey,
-                      label: zh ? '🐝 Magpie 托盘四栏实机交互' : '🐝 Magpie 4-Tab Live Tray',
+                      label: zh ? '托盘四栏实机交互' : '4-Tab Live Tray',
                     },
                     {
                       key: 'pool' as SandboxStageKey,
@@ -897,8 +1072,8 @@ export function LandingPage() {
                   <div className="flex items-center justify-between">
                     <div className="text-[13.5px] font-bold text-fg">
                       {zh
-                        ? `4 个异构 Google 账号汇聚一池 · 合计 ${formatCU(snap.summary.total_available_cu, 0)} CU`
-                        : `4 Pooled Google Accounts · ${formatCU(snap.summary.total_available_cu, 0)} CU Total`}
+                        ? `${snap.accounts.length} 个 Google Colab 账号汇聚一池 · 合计 ${formatCU(snap.summary.total_available_cu, 0)} CU`
+                        : `${snap.accounts.length} Pooled Colab Accounts · ${formatCU(snap.summary.total_available_cu, 0)} CU Total`}
                     </div>
                     <button
                       type="button"
@@ -915,7 +1090,7 @@ export function LandingPage() {
                       const isFree = acc.subscription_tier === 'FREE';
                       const cap = isFree ? 15 : acc.reference_cycle_cu || 500;
                       const bal = isFree
-                        ? (acc.free_quota?.remaining_free_cu ?? 15)
+                        ? (acc.free_quota?.remaining_free_cu ?? 0)
                         : acc.paid_cu_balance;
                       const pct = Math.min(100, Math.round((bal / Math.max(1, cap)) * 100));
                       const tone = acc.expiring_soon_cu > 0
@@ -1717,8 +1892,9 @@ export function LandingPage() {
                         color: isOn ? 'var(--emerald-text)' : 'var(--text-secondary)',
                       }}
                     >
-                      <span className="w-1.5 h-1.5 rounded-full bg-current" />
+                      <AgentBrandIcon id={ide.id} size={14} className="text-fg" />
                       <span>{ide.name}</span>
+                      {isOn && <span className="w-1.5 h-1.5 rounded-full bg-current" />}
                     </button>
                   );
                 })}
@@ -1762,7 +1938,7 @@ export function LandingPage() {
               </div>
             </div>
 
-            {/* Bento Card 4: 30s Zero-Drive Guest Contributor Links */}
+            {/* Bento Card 4: Portable Encrypted Vault & Local CLI Auto-Scan */}
             <div className="ui-card p-5 sm:p-6 flex flex-col justify-between gap-4">
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
@@ -1773,30 +1949,30 @@ export function LandingPage() {
                       color: 'var(--emerald-text)',
                     }}
                   >
-                    <HeartHandshake className="w-5 h-5" />
+                    <Lock className="w-5 h-5" />
                   </span>
                   <StatusPill tone="emerald" size="xs">
-                    {zh ? '零云盘权限防火墙' : 'Zero-Drive Firewall'}
+                    {zh ? 'AES-256-GCM 本地加密' : 'AES-256-GCM Vault'}
                   </StatusPill>
                 </div>
                 <h3 className="text-[17px] font-bold text-fg">
-                  {zh ? '30 秒免密码好友算力安全共享' : '30s Zero-Drive Guest Contributor Links'}
+                  {zh ? '一键导入本机凭证与加密迁移' : '1-Click Local Scan & Vault Backup'}
                 </h3>
                 <p className="text-[13px] leading-relaxed text-fg-secondary">
                   {zh
-                    ? '朋友无需交出密码，仅授予基础 Colab 运行权限（严禁挂载 Google Drive），可自设保底留存水位，凭回执链接随时一键停机撤回。'
-                    : 'Teammates donate idle CUs in 30s without sharing passwords. Enforces Drive isolation, personal CU reserve floors & 1-click receipt revoke.'}
+                    ? '自动识别本机与 WSL2 已登录的 Colab CLI 账号邮箱，所有令牌均使用本地 AES-256-GCM 加密保存，并支持 .chvault 一键换机恢复。'
+                    : 'Automatically identifies signed-in local & WSL2 Colab CLI accounts, encrypts all tokens with AES-256-GCM, and supports portable .chvault backups.'}
                 </p>
               </div>
 
               <button
                 type="button"
-                onClick={() => navigate('/contribute/ch_inv_demo2026')}
+                onClick={() => navigate('/pool')}
                 className="ui-btn ui-btn-secondary ui-btn-md w-full justify-between"
               >
-                <span className="ch-num truncate">/contribute/ch_inv_demo2026</span>
+                <span className="ch-num truncate">/pool</span>
                 <span className="inline-flex items-center gap-1 font-semibold text-[var(--emerald-text)]">
-                  {zh ? '实机预览' : 'Live Preview'}
+                  {zh ? '管理账号池' : 'Open Account Pool'}
                   <ArrowRight className="w-3.5 h-3.5" />
                 </span>
               </button>
@@ -1913,13 +2089,13 @@ export function LandingPage() {
                 style={{ fontFamily: "'Bricolage Grotesque', var(--font-sans)" }}
               >
                 {zh
-                  ? '立即探索完整 6 大模块在线控制台'
-                  : 'Explore All 6 Modules in the Full Live Observatory'}
+                  ? '立即探索完整 8 大模块在线控制台'
+                  : 'Explore All 8 Modules in the Full Live Observatory'}
               </h2>
               <p className="text-[14px] text-fg-secondary leading-relaxed">
                 {zh
-                  ? '包含全局算力罗盘、账号池 4 步自检、远程 Jupyter 实时工作台、Bezier 路由拓扑图、AES-256-GCM 保险箱与好友免密共享页。'
-                  : 'Inspect the Compute Compass, 4-step account self-test, remote Jupyter workbench, Bezier router topology, AES-256-GCM vault & contributor portal.'}
+                  ? '包含私人开源大模型网关、一键 AI 视频/画图应用商店、Colab 多号算力池、全局算力罗盘、远程 Jupyter 工作台与 Bezier 智能路由拓扑图。'
+                  : 'Includes Private LLM Gateway, 1-Click AI App Store, Multi-Account Colab Pool, Compute Compass, Remote Jupyter Workbench & Bezier Smart Router.'}
               </p>
             </div>
 
@@ -1974,8 +2150,8 @@ export function LandingPage() {
             <span>·</span>
             <span>
               {zh
-                ? '凭证本地 AES-256-GCM 加密 · 好友云盘零权限隔离'
-                : 'AES-256-GCM Local Vault · Zero-Drive Contributor Firewall'}
+                ? '凭证本地 AES-256-GCM 加密 · 零公网穿透私有直连'
+                : 'AES-256-GCM Local Vault · Zero-Tunnel Private Bridge'}
             </span>
           </div>
 
@@ -1986,13 +2162,6 @@ export function LandingPage() {
               className="text-fg-secondary hover:text-fg font-medium cursor-pointer bg-transparent border-0 p-0"
             >
               {zh ? '在线控制台' : 'Live Console'}
-            </button>
-            <button
-              type="button"
-              onClick={() => navigate('/contribute/ch_inv_demo2026')}
-              className="text-fg-secondary hover:text-fg font-medium cursor-pointer bg-transparent border-0 p-0"
-            >
-              {zh ? '好友共享页' : 'Share Portal'}
             </button>
             <a
               href={GITHUB_ARCH_URL}

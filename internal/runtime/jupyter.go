@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -386,6 +387,62 @@ func isPostWriteExecError(err error) bool {
 	return errors.As(err, &pw)
 }
 
+// preAcceptWSDropError represents a transient Jupyter WebSocket disconnect (such as Colab's
+// reverse-proxy `websocket: close 1006 (abnormal closure): unexpected EOF` on a newly established
+// or idle tunnel) that occurred BEFORE the kernel accepted or acknowledged execute_request.
+// Reconnecting a fresh WebSocket and retrying ONCE is strictly idempotent because kernel execution
+// has not started yet.
+type preAcceptWSDropError struct {
+	phase string // "dial" | "write" | "read"
+	err   error
+}
+
+func (e *preAcceptWSDropError) Error() string {
+	return e.err.Error()
+}
+
+func (e *preAcceptWSDropError) Unwrap() error {
+	return e.err
+}
+
+func isPreAcceptWSDropError(err error) bool {
+	var pre *preAcceptWSDropError
+	return errors.As(err, &pre)
+}
+
+func isTransientWSCloseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if websocket.IsCloseError(
+		err,
+		websocket.CloseAbnormalClosure, // 1006
+		websocket.CloseGoingAway,       // 1001
+		websocket.CloseServiceRestart,  // 1012
+		websocket.CloseTryAgainLater,   // 1013
+	) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	for _, pat := range []string{
+		"close 1006",
+		"abnormal closure",
+		"unexpected eof",
+		"connection reset",
+		"broken pipe",
+		"forcibly closed by the remote host",
+		"use of closed network connection",
+	} {
+		if strings.Contains(lower, pat) {
+			return true
+		}
+	}
+	return lower == "eof" || strings.HasSuffix(lower, ": eof")
+}
+
 type jupyterWireMsg struct {
 	Channel      string                 `json:"channel,omitempty"`
 	Header       map[string]any         `json:"header"`
@@ -409,15 +466,29 @@ func (e *Engine) runSilentPrelude(
 	tok := firstNonEmpty(mem.proxyToken, sess.ProxyToken)
 	mem.mu.Unlock()
 
-	ctxShort, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	_, err := e.executeOverJupyterWS(ctxShort, wsDialer, acc, sess, tok, models.KernelExecRequest{
+	preludeReq := models.KernelExecRequest{
 		SessionID:      sess.ID,
 		Code:           "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')",
 		Silent:         true,
 		StoreHistory:   false,
 		IdleTimeoutSec: 8,
-	}, false)
+	}
+	ctxShort, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	_, err := e.executeOverJupyterWS(ctxShort, wsDialer, acc, sess, tok, preludeReq, false)
+	if err != nil && ctxShort.Err() == nil && isPreAcceptWSDropError(err) {
+		retryWait := e.opts.WSPreAcceptRetryDelay
+		if retryWait <= 0 || retryWait > 600*time.Millisecond {
+			retryWait = 500 * time.Millisecond
+		}
+		timer := time.NewTimer(retryWait)
+		select {
+		case <-ctxShort.Done():
+			timer.Stop()
+		case <-timer.C:
+			_, err = e.executeOverJupyterWS(ctxShort, wsDialer, acc, sess, tok, preludeReq, false)
+		}
+	}
 	if err == nil {
 		mem.mu.Lock()
 		mem.preludeDone = true
@@ -538,25 +609,78 @@ func (e *Engine) executeOnSession(
 	if e.isDemoSession(acc, sess) {
 		res, err = e.executeDemoCode(ctx, acc, sess, mem, req, code)
 	} else {
-		proxyTok, _, wsDialer, pErr := e.prepareSessionProxyClient(ctx, acc, sess, mem)
+		proxyTok, httpClient, wsDialer, pErr := e.prepareSessionProxyClient(ctx, acc, sess, mem)
 		if pErr != nil {
 			err = pErr
 		} else {
 			wsReq := models.KernelExecRequest{
-				SessionID:      sess.ID,
-				Code:           code,
-				IdleTimeoutSec: req.IdleTimeoutSec,
-				Silent:         req.Silent,
-				StoreHistory:   req.StoreHistory,
-				AllowStdin:     req.AllowStdin,
-				InlineImages:   req.InlineImages,
+				SessionID:               sess.ID,
+				Code:                    code,
+				IdleTimeoutSec:          req.IdleTimeoutSec,
+				Silent:                  req.Silent,
+				StoreHistory:            req.StoreHistory,
+				AllowStdin:              req.AllowStdin,
+				InlineImages:            req.InlineImages,
+				SuppressOutputBroadcast: req.SuppressOutputBroadcast,
+				OnStdout:                req.OnStdout,
 			}
-			res, err = e.executeOverJupyterWS(ctx, wsDialer, acc, sess, proxyTok, wsReq, true)
+			broadcast := !req.SuppressOutputBroadcast
+			res, err = e.executeOverJupyterWS(ctx, wsDialer, acc, sess, proxyTok, wsReq, broadcast)
+			// Seamless idempotent WS reconnect when Colab's reverse proxy abruptly drops, returns an
+			// edge-propagation 404, or times out dialing a fresh/idle tunnel BEFORE the kernel
+			// has accepted/acknowledged execute_request. Allow up to 3 attempts for dial drops.
+			for retryAttempt := 0; retryAttempt < 3 && err != nil && ctx.Err() == nil && isPreAcceptWSDropError(err); retryAttempt++ {
+				var preDrop *preAcceptWSDropError
+				if retryAttempt > 0 && (!errors.As(err, &preDrop) || (preDrop.phase != "dial" && preDrop.phase != "probe")) {
+					break
+				}
+				retryDelay := e.opts.WSPreAcceptRetryDelay
+				if retryDelay <= 0 {
+					retryDelay = time.Duration(1200*(retryAttempt+1)) * time.Millisecond
+				}
+				timer := time.NewTimer(retryDelay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					err = ctx.Err()
+				case <-timer.C:
+					_, _ = e.mutateSessionState(ctx, sess, false, func(cur *models.RuntimeSession) bool {
+						cur.ZMQReconnectCount++
+						cur.UpdatedAt = time.Now().UTC()
+						return true
+					})
+					res, err = e.executeOverJupyterWS(ctx, wsDialer, acc, sess, proxyTok, wsReq, broadcast)
+				}
+			}
+			// On Jupyter WS handshake 404 (kernel restarted/culled or still registering on a live VM),
+			// attempt ONE idempotent kernel re-bootstrap before declaring SessionLost!
+			var st404 *httpStatusError
+			if err != nil && ctx.Err() == nil && !isPostWriteExecError(err) &&
+				errors.As(err, &st404) && st404.StatusCode == http.StatusNotFound &&
+				!strings.Contains(strings.ToLower(err.Error()), "no longer present") &&
+				httpClient != nil && sess.ProxyURL != "" {
+				if newKernelID, newJupSessID, kErr := e.bootstrapJupyterKernel(ctx, httpClient, sess.ProxyURL, proxyTok); kErr == nil && newKernelID != "" {
+					_, _ = e.mutateSessionState(ctx, sess, false, func(cur *models.RuntimeSession) bool {
+						cur.KernelID = newKernelID
+						if newJupSessID != "" {
+							cur.JupyterSessionID = newJupSessID
+						}
+						cur.ZMQReconnectCount++
+						cur.UpdatedAt = time.Now().UTC()
+						return true
+					})
+					sess.KernelID = newKernelID
+					if newJupSessID != "" {
+						sess.JupyterSessionID = newJupSessID
+					}
+					res, err = e.executeOverJupyterWS(ctx, wsDialer, acc, sess, proxyTok, wsReq, broadcast)
+				}
+			}
 			// On Jupyter WS handshake 401/403 (expired runtimeProxyInfo token), refresh proxy token instead of marking Google account HealthAuthExpired!
 			var proxyAuthErr *jupyterProxyAuthError
 			if err != nil && ctx.Err() == nil && errors.As(err, &proxyAuthErr) {
 				if refreshedTok, wsDialer2, rErr := e.forceRefreshSessionProxyToken(ctx, acc, sess, mem); rErr == nil && refreshedTok != "" {
-					res, err = e.executeOverJupyterWS(ctx, wsDialer2, acc, sess, refreshedTok, wsReq, true)
+					res, err = e.executeOverJupyterWS(ctx, wsDialer2, acc, sess, refreshedTok, wsReq, broadcast)
 				} else if rErr != nil {
 					err = rErr
 				}
@@ -565,8 +689,8 @@ func (e *Engine) executeOnSession(
 	}
 
 	doneAt := time.Now().UTC()
-	if err != nil && ctx.Err() == nil && isPostWriteExecError(err) {
-		// Post-write drop: only mark LOST if the VM actually disappeared upstream!
+	if err != nil && ctx.Err() == nil && (isPostWriteExecError(err) || isPreAcceptWSDropError(err)) {
+		// Transient WS drop: only mark LOST if the VM actually disappeared upstream!
 		if !e.confirmEndpointGoneBestEffort(ctx, acc, sess) {
 			_, _ = e.mutateSessionState(ctx, sess, false, func(cur *models.RuntimeSession) bool {
 				cur.ZMQReconnectCount++
@@ -783,6 +907,152 @@ func flattenNotebookSource(src any) string {
 	}
 }
 
+// probeJupyterWSKernelInfo sends a strictly read-only, 100%-idempotent Jupyter v5.3
+// `kernel_info_request` BEFORE transmitting user code (`execute_request`).
+// If Colab's reverse proxy drops a freshly established or idle WebSocket with
+// `websocket: close 1006 (abnormal closure): unexpected EOF` on the first frame, this probe
+// absorbs the disconnect cleanly so `executeOnSession` can reconnect and retry with mathematical
+// idempotency (zero risk of double-executing user code).
+//
+// Returns:
+//   - timedOut=true, err=nil when a non-standard/mock server silently ignores `kernel_info_request`
+//     (caller MUST close `conn` rather than reusing a Gorilla WebSocket after read timeout!).
+//   - err=*preAcceptWSDropError on transient 1006/EOF/reset before `kernel_info_reply`.
+func (e *Engine) probeJupyterWSKernelInfo(
+	ctx context.Context,
+	conn *websocket.Conn,
+	clientSession string,
+) (timedOut bool, err error) {
+	probeMsgID := uuid.NewString()
+	probeReq := jupyterWireMsg{
+		Channel: "shell",
+		Header: map[string]any{
+			"msg_id":   probeMsgID,
+			"session":  clientSession,
+			"username": "colabhive",
+			"date":     time.Now().UTC().Format(time.RFC3339Nano),
+			"msg_type": "kernel_info_request",
+			"version":  "5.3",
+		},
+		ParentHeader: map[string]any{},
+		Metadata:     map[string]any{},
+		Content:      map[string]any{},
+	}
+
+	probeTimeout := e.opts.WSProbeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = 4 * time.Second
+	}
+	dl := time.Now().Add(probeTimeout)
+	if ctxDL, ok := ctx.Deadline(); ok && ctxDL.Before(dl) {
+		dl = ctxDL
+	}
+	_ = conn.SetWriteDeadline(dl)
+	if wErr := conn.WriteJSON(probeReq); wErr != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		wrapped := fmt.Errorf("jupyter websocket probe write error: %w", wErr)
+		if isTransientWSCloseError(wErr) {
+			return false, &preAcceptWSDropError{phase: "probe", err: wrapped}
+		}
+		return false, wrapped
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
+
+	for {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		_ = conn.SetReadDeadline(dl)
+		msgType, rawFrame, rErr := conn.ReadMessage()
+		if rErr != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			if netErr, ok := rErr.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+				return true, nil
+			}
+			wrapped := fmt.Errorf("jupyter websocket read error: %w", rErr)
+			if isTransientWSCloseError(rErr) {
+				return false, &preAcceptWSDropError{phase: "probe", err: wrapped}
+			}
+			return false, wrapped
+		}
+		msg, parseErr := decodeJupyterFrame(msgType, rawFrame)
+		if parseErr != nil {
+			continue
+		}
+		wireType := asString(msg.Header["msg_type"])
+		parentID := asString(msg.ParentHeader["msg_id"])
+		if wireType == "status" && parentID == "" {
+			st := asString(msg.Content["execution_state"])
+			if st == "dead" || st == "restarting" {
+				return false, &postWriteExecError{err: fmt.Errorf("jupyter kernel entered %s state", st)}
+			}
+		}
+		if parentID == probeMsgID && (wireType == "kernel_info_reply" || (wireType == "status" && asString(msg.Content["execution_state"]) == "idle")) {
+			_ = conn.SetReadDeadline(time.Time{})
+			return false, nil
+		}
+	}
+}
+
+func (e *Engine) dialJupyterChannelsWS(
+	ctx context.Context,
+	wsDialer *websocket.Dialer,
+	sess *models.RuntimeSession,
+	wsURL string,
+	headers http.Header,
+) (*websocket.Conn, error) {
+	conn, resp, err := wsDialer.DialContext(ctx, wsURL, headers)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		statusCode := 0
+		var bodySnippet string
+		if resp != nil {
+			statusCode = resp.StatusCode
+			if resp.Body != nil {
+				rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+				bodySnippet = strings.TrimSpace(string(rawBody))
+				_ = resp.Body.Close()
+			}
+		}
+		if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+			return nil, &jupyterProxyAuthError{StatusCode: statusCode, Endpoint: sess.Endpoint}
+		}
+		if statusCode > 0 {
+			detail := fmt.Sprintf("Jupyter WebSocket HTTP %d", statusCode)
+			if bodySnippet != "" {
+				detail += ": " + bodySnippet
+			}
+			wrapped := fmt.Errorf(
+				"failed to connect Jupyter WebSocket %s (HTTP %d): %w",
+				sess.Endpoint,
+				statusCode,
+				&httpStatusError{StatusCode: statusCode, Body: detail},
+			)
+			if statusCode == http.StatusBadGateway || statusCode == http.StatusServiceUnavailable || statusCode == http.StatusGatewayTimeout ||
+				(statusCode == http.StatusNotFound && bodySnippet == "") {
+				return nil, &preAcceptWSDropError{phase: "dial", err: wrapped}
+			}
+			return nil, wrapped
+		}
+		wrapped := fmt.Errorf("failed to connect Jupyter WebSocket %s: %w", sess.Endpoint, err)
+		var netErr net.Error
+		if isTransientWSCloseError(err) ||
+			errors.Is(err, websocket.ErrBadHandshake) ||
+			(errors.As(err, &netErr) && netErr.Timeout()) ||
+			strings.Contains(strings.ToLower(err.Error()), "i/o timeout") {
+			return nil, &preAcceptWSDropError{phase: "dial", err: wrapped}
+		}
+		return nil, wrapped
+	}
+	return conn, nil
+}
+
 func (e *Engine) executeOverJupyterWS(
 	ctx context.Context,
 	wsDialer *websocket.Dialer,
@@ -793,7 +1063,11 @@ func (e *Engine) executeOverJupyterWS(
 	broadcast bool,
 ) (*models.KernelExecResult, error) {
 	start := time.Now()
-	wsURL, err := buildJupyterChannelsWSURL(sess.ProxyURL, sess.KernelID, proxyToken)
+	clientSession := sess.JupyterSessionID
+	if clientSession == "" {
+		clientSession = uuid.NewString()
+	}
+	wsURL, err := buildJupyterChannelsWSURL(sess.ProxyURL, sess.KernelID, proxyToken, clientSession)
 	if err != nil {
 		return nil, err
 	}
@@ -803,29 +1077,38 @@ func (e *Engine) executeOverJupyterWS(
 	headers.Set("Authorization", "Bearer "+proxyToken)
 	headers.Set("X-Colab-Client-Agent", "colab-cli")
 
-	conn, resp, err := wsDialer.DialContext(ctx, wsURL, headers)
+	conn, err := e.dialJupyterChannelsWS(ctx, wsDialer, sess, wsURL, headers)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		statusCode := 0
-		if resp != nil {
-			statusCode = resp.StatusCode
-			_ = resp.Body.Close()
-		}
-		if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
-			return nil, &jupyterProxyAuthError{StatusCode: statusCode, Endpoint: sess.Endpoint}
-		}
-		if statusCode > 0 {
-			return nil, fmt.Errorf(
-				"failed to connect Jupyter WebSocket %s (HTTP %d): %w",
-				sess.Endpoint,
-				statusCode,
-				&httpStatusError{StatusCode: statusCode, Body: fmt.Sprintf("Jupyter WebSocket HTTP %d", statusCode)},
-			)
-		}
-		return nil, fmt.Errorf("failed to connect Jupyter WebSocket %s: %w", sess.Endpoint, err)
+		return nil, err
 	}
+
+	// Pre-flight 100%-idempotent `kernel_info_request` liveness probe BEFORE sending user code!
+	// If the server ignores `kernel_info_request` (read timeout), close the timed-out Gorilla WS
+	// and open a fresh connection straight to `execute_request` (never reuse a timed-out Gorilla WS).
+	stopProbeCancel := context.AfterFunc(ctx, func() {
+		if nc := conn.UnderlyingConn(); nc != nil {
+			_ = nc.SetDeadline(time.Now())
+		}
+		_ = conn.Close()
+	})
+	probeTimedOut, probeErr := e.probeJupyterWSKernelInfo(ctx, conn, clientSession)
+	stopProbeCancel()
+	if probeErr != nil {
+		_ = conn.Close()
+		return nil, probeErr
+	}
+	if probeTimedOut {
+		_ = conn.Close()
+		freshURL, uErr := buildJupyterChannelsWSURL(sess.ProxyURL, sess.KernelID, proxyToken, clientSession)
+		if uErr != nil {
+			return nil, uErr
+		}
+		conn, err = e.dialJupyterChannelsWS(ctx, wsDialer, sess, freshURL, headers)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// _own_kernel = false: closing WebSocket leaves Python kernel & VRAM weights alive!
 	defer conn.Close()
 	stopCancelWatch := context.AfterFunc(ctx, func() {
@@ -837,10 +1120,6 @@ func (e *Engine) executeOverJupyterWS(
 	defer stopCancelWatch()
 
 	msgID := uuid.NewString()
-	clientSession := sess.JupyterSessionID
-	if clientSession == "" {
-		clientSession = uuid.NewString()
-	}
 
 	execReq := jupyterWireMsg{
 		Channel: "shell",
@@ -873,7 +1152,11 @@ func (e *Engine) executeOverJupyterWS(
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("failed to write execute_request: %w", err)
+		wrapped := fmt.Errorf("failed to write execute_request: %w", err)
+		if isTransientWSCloseError(err) {
+			return nil, &preAcceptWSDropError{phase: "write", err: wrapped}
+		}
+		return nil, wrapped
 	}
 	_ = conn.SetWriteDeadline(time.Time{})
 
@@ -881,6 +1164,9 @@ func (e *Engine) executeOverJupyterWS(
 	if req.IdleTimeoutSec < 0 {
 		idleTimeout = 0
 	}
+
+	const maxInlineStreamBytes = 512 * 1024
+	effectiveBroadcast := broadcast && !req.SuppressOutputBroadcast
 
 	var stdoutBuf, stderrBuf strings.Builder
 	var resultStr string
@@ -979,7 +1265,7 @@ func (e *Engine) executeOverJupyterWS(
 					"account_id": sess.AccountID,
 					"reason":     firewallMsg,
 				})
-				if broadcast {
+				if effectiveBroadcast {
 					e.publishStreamChunk(sess, "stderr", firewallMsg+"\n", nil)
 				}
 				continue
@@ -1005,9 +1291,24 @@ func (e *Engine) executeOverJupyterWS(
 			if streamName == "stderr" {
 				stderrBuf.WriteString(txt)
 			} else {
-				stdoutBuf.WriteString(txt)
+				// Deliver stdout frame immediately to incremental streaming consumers (unbounded by 512 KiB).
+				if req.OnStdout != nil && txt != "" {
+					req.OnStdout(txt)
+				}
+				// Retain at most maxInlineStreamBytes+1 bytes in inline stdoutBuf to detect OutputTruncated
+				// without buffering arbitrarily large streaming outputs in RAM.
+				if !req.SuppressOutputBroadcast || req.OnStdout == nil {
+					if stdoutBuf.Len() <= maxInlineStreamBytes {
+						rem := maxInlineStreamBytes + 1 - stdoutBuf.Len()
+						if len(txt) > rem {
+							stdoutBuf.WriteString(txt[:rem])
+						} else {
+							stdoutBuf.WriteString(txt)
+						}
+					}
+				}
 			}
-			if broadcast && txt != "" {
+			if effectiveBroadcast && txt != "" {
 				e.publishStreamChunk(sess, streamName, txt, nil)
 			}
 
@@ -1029,7 +1330,7 @@ func (e *Engine) executeOverJupyterWS(
 				ro := e.captureRichDisplayData(sess, execCount, len(richOutputs), dataMap, req.InlineImages)
 				if ro != nil {
 					richOutputs = append(richOutputs, *ro)
-					if broadcast {
+					if effectiveBroadcast {
 						e.publishStreamChunk(sess, "colab", fmt.Sprintf("[artifact] %s\n", firstNonEmpty(ro.ArtifactURL, ro.FilePath)), ro)
 					}
 				}
@@ -1076,7 +1377,6 @@ func (e *Engine) executeOverJupyterWS(
 		}
 	}
 
-	const maxInlineStreamBytes = 512 * 1024
 	stdoutStr := stdoutBuf.String()
 	stderrStr := stderrBuf.String()
 	truncated := false
@@ -1100,7 +1400,7 @@ func (e *Engine) executeOverJupyterWS(
 	}, nil
 }
 
-func buildJupyterChannelsWSURL(proxyBaseURL string, kernelID string, proxyToken string) (string, error) {
+func buildJupyterChannelsWSURL(proxyBaseURL string, kernelID string, proxyToken string, sessionID string) (string, error) {
 	parsed, err := url.Parse(strings.TrimRight(proxyBaseURL, "/"))
 	if err != nil {
 		return "", err
@@ -1116,7 +1416,10 @@ func buildJupyterChannelsWSURL(proxyBaseURL string, kernelID string, proxyToken 
 	}
 	parsed.Path = path.Join(parsed.Path, "/api/kernels", kernelID, "channels")
 	q := parsed.Query()
-	q.Set("session_id", uuid.NewString())
+	if strings.TrimSpace(sessionID) == "" {
+		sessionID = uuid.NewString()
+	}
+	q.Set("session_id", sessionID)
 	q.Set("token", proxyToken)
 	q.Set("colab-runtime-proxy-token", proxyToken)
 	parsed.RawQuery = q.Encode()

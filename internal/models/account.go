@@ -23,16 +23,8 @@ const (
 	ColabXSSIPrefix      = ")]}'\n"
 )
 
-// Standard and least-privilege Contributor OAuth2 scope sets.
+// Standard Colab OAuth2 scope set.
 var (
-	// ContributorOAuthScopes requests strictly Colaboratory + identity (ZERO Google Drive or GCP billing scopes).
-	ContributorOAuthScopes = []string{
-		"openid",
-		"https://www.googleapis.com/auth/userinfo.profile",
-		"https://www.googleapis.com/auth/userinfo.email",
-		"https://www.googleapis.com/auth/colaboratory",
-	}
-
 	// OwnerOAuthScopes matches google-colab-cli v0.8.0 full owner scopes.
 	OwnerOAuthScopes = []string{
 		"openid",
@@ -235,6 +227,8 @@ type Account struct {
 	AvatarURL              string                                  `json:"avatar_url,omitempty"`
 	Alias                  string                                  `json:"alias,omitempty"`
 	Notes                  string                                  `json:"notes,omitempty"`
+	Provider               ProviderType                            `json:"provider,omitempty"`
+	ProviderMeta           *ProviderAccountMeta                    `json:"provider_meta,omitempty"`
 	SubscriptionTier       SubscriptionTier                        `json:"subscription_tier"`
 	Health                 AccountHealth                           `json:"health"`
 	HealthReason           string                                  `json:"health_reason,omitempty"`
@@ -276,11 +270,34 @@ type Account struct {
 	UpdatedAt              time.Time                               `json:"updated_at"`
 
 	// Vault-encrypted credentials — NEVER serialized to API responses.
-	EncryptedRefreshToken string `json:"-"`
-	EncryptedAccessToken  string `json:"-"`
-	OAuthClientID         string `json:"-"`
-	OAuthClientSecret     string `json:"-"`
-	ReceiptTokenHash      string `json:"-"`
+	EncryptedRefreshToken   string `json:"-"`
+	EncryptedAccessToken    string `json:"-"`
+	EncryptedProviderSecret string `json:"-"`
+	OAuthClientID           string `json:"-"`
+	OAuthClientSecret       string `json:"-"`
+	ReceiptTokenHash        string `json:"-"`
+}
+
+// EffectiveProvider returns the canonical ProviderType for an account (defaulting legacy rows to ProviderColab).
+func (a *Account) EffectiveProvider() ProviderType {
+	if a == nil {
+		return ProviderColab
+	}
+	return NormalizeProviderType(string(a.Provider))
+}
+
+// IsZeroCostFreeAvailable reports whether this account currently has $0 free GPU quota ready to spend.
+func (a *Account) IsZeroCostFreeAvailable() bool {
+	if a == nil || !a.Enabled || !a.Health.IsSchedulable() {
+		return false
+	}
+	if a.EffectiveProvider() != ProviderColab {
+		return false
+	}
+	if a.FreeQuota != nil && (a.FreeQuota.RemainingFreeCU > 0.1 || a.FreeQuota.RemainingMilliCCU > 100) {
+		return true
+	}
+	return a.SubscriptionTier == TierFree
 }
 
 // OAuthAuthMode enumerates supported Google OAuth2 onboarding flows.
@@ -328,80 +345,6 @@ type OAuthPendingSession struct {
 	CreatedAt     time.Time              `json:"created_at"`
 }
 
-// ContributorInvite represents a shareable Guest Portal invitation (`/contribute/:code`).
-type ContributorInvite struct {
-	Code              string                `json:"code"` // ch_inv_...
-	PoolTitle         string                `json:"pool_title"`
-	MaintainerName    string                `json:"maintainer_name"`
-	WelcomeNote       string                `json:"welcome_note,omitempty"`
-	TargetGroups      []string              `json:"target_groups"`
-	DefaultProxyID    string                `json:"default_proxy_id,omitempty"`
-	DefaultGuardrails ContributorGuardrails `json:"default_guardrails"`
-	MaxUses           int                   `json:"max_uses"` // 0 = unlimited
-	UsedCount         int                   `json:"used_count"`
-	SupportedModes    []OAuthAuthMode       `json:"supported_modes"`
-	RequiredScopes    []string              `json:"required_scopes"`
-	ShareURL          string                `json:"share_url,omitempty"`
-	Revoked           bool                  `json:"revoked"`
-	ExpiresAt         *time.Time            `json:"expires_at,omitempty"`
-	CreatedAt         time.Time             `json:"created_at"`
-}
-
-// CreateInviteRequest creates a new ContributorInvite.
-type CreateInviteRequest struct {
-	PoolTitle         string                `json:"pool_title"`
-	MaintainerName    string                `json:"maintainer_name"`
-	WelcomeNote       string                `json:"welcome_note,omitempty"`
-	TargetGroups      []string              `json:"target_groups,omitempty"`
-	DefaultProxyID    string                `json:"default_proxy_id,omitempty"`
-	DefaultGuardrails ContributorGuardrails `json:"default_guardrails"`
-	MaxUses           int                   `json:"max_uses,omitempty"`
-	TTLHours          int                   `json:"ttl_hours,omitempty"`
-}
-
-// ContributionReceipt is returned once upon completing the Guest Contributor OAuth flow.
-type ContributionReceipt struct {
-	ReceiptToken string                   `json:"receipt_token"` // ch_rcpt_...
-	ManageURL    string                   `json:"manage_url"`
-	Status       ContributorReceiptStatus `json:"status"`
-}
-
-// ContributorActiveVM exposes safe hardware/uptime telemetry to a contributor without leaking user code.
-type ContributorActiveVM struct {
-	SessionID    string          `json:"session_id"`
-	Accelerator  AcceleratorType `json:"accelerator"`
-	BurnRateCUHr float64         `json:"burn_rate_cu_hr"`
-	UptimeSec    int64           `json:"uptime_sec"`
-	StartedAt    time.Time       `json:"started_at"`
-}
-
-// ContributorReceiptStatus powers the self-service `/contribute/manage/:receipt_token` portal.
-type ContributorReceiptStatus struct {
-	AccountID        string                `json:"account_id"`
-	MaskedEmail      string                `json:"masked_email"`
-	SubscriptionTier SubscriptionTier      `json:"subscription_tier"`
-	Health           AccountHealth         `json:"health"`
-	PaidCUBalance    float64               `json:"paid_cu_balance"`
-	SchedulableCU    float64               `json:"schedulable_cu"`
-	LiveBurnRateCUHr float64               `json:"live_burn_rate_cu_hr"`
-	Guardrails       ContributorGuardrails `json:"guardrails"`
-	ActiveVMs        []ContributorActiveVM `json:"active_vms"`
-	LastPolledAt     *time.Time            `json:"last_polled_at,omitempty"`
-}
-
-// ContributorGuardrailsPatch allows contributors to update safety caps or pause/resume in real time.
-type ContributorGuardrailsPatch struct {
-	MinReserveCU         *float64          `json:"min_reserve_cu,omitempty"`
-	MaxDonatedCUTotal    *float64          `json:"max_donated_cu_total,omitempty"`
-	MaxDonatedCUDaily    *float64          `json:"max_donated_cu_daily,omitempty"`
-	AllowPaidCUBurn      *bool             `json:"allow_paid_cu_burn,omitempty"`
-	AllowedGPUs          []AcceleratorType `json:"allowed_gpus,omitempty"`
-	MaxConcurrentVMs     *int              `json:"max_concurrent_vms,omitempty"`
-	ScheduleWindow       *ScheduleWindow   `json:"schedule_window,omitempty"`
-	MaskEmailInDashboard *bool             `json:"mask_email_in_dashboard,omitempty"`
-	Paused               *bool             `json:"paused,omitempty"`
-}
-
 // QuotaSummary powers the Observatory Hero Telemetry Strip & Cloud GPU Equivalence Matrix.
 type QuotaSummary struct {
 	AccountsTotal          int                                    `json:"accounts_total"`
@@ -428,13 +371,19 @@ type QuotaSummary struct {
 
 // DiscoveredLocalCredential represents a read-only local/WSL2 credential candidate found on disk.
 type DiscoveredLocalCredential struct {
-	ID           string   `json:"id"`
-	SourceType   string   `json:"source_type"` // "keyring_plaintext" | "colab_token_json" | "gcloud_adc"
-	SourcePath   string   `json:"source_path"`
-	Environment  string   `json:"environment"` // "host" | "wsl2"
-	EmailPreview string   `json:"email_preview,omitempty"`
-	TokenPreview string   `json:"token_preview"`
-	Scopes       []string `json:"scopes,omitempty"`
+	ID                string   `json:"id"`
+	SourceType        string   `json:"source_type"` // "keyring_plaintext" | "colab_token_json" | "gcloud_adc"
+	SourcePath        string   `json:"source_path"`
+	Environment       string   `json:"environment"` // "host" | "wsl2"
+	Email             string   `json:"email,omitempty"`
+	EmailPreview      string   `json:"email_preview,omitempty"`
+	DisplayName       string   `json:"display_name,omitempty"`
+	SourceLabel       string   `json:"source_label,omitempty"`
+	AlreadyInPool     bool     `json:"already_in_pool,omitempty"`
+	ExistingAccountID string   `json:"existing_account_id,omitempty"`
+	Status            string   `json:"status,omitempty"` // "ready" | "in_pool" | "expired" | "unverified"
+	TokenPreview      string   `json:"token_preview"`
+	Scopes            []string `json:"scopes,omitempty"`
 }
 
 // ImportConflictStrategy governs duplicate email resolution when importing `.chvault` / JSON bundles.
@@ -525,6 +474,7 @@ type AccountPatch struct {
 	MaxConcurrentVMs *int                   `json:"max_concurrent_vms,omitempty"`
 	SubscriptionTier *SubscriptionTier      `json:"subscription_tier,omitempty"`
 	ReferenceCycleCU *float64               `json:"reference_cycle_cu,omitempty"`
+	ProviderMeta     *ProviderAccountMeta   `json:"provider_meta,omitempty"`
 	Guardrails       *ContributorGuardrails `json:"guardrails,omitempty"`
 }
 

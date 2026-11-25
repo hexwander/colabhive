@@ -11,6 +11,7 @@ const (
 	StrategyStickySession     RoutingStrategy = "sticky-session"     // Reuse warm kernel bound to agent/session
 	StrategyRoundRobin        RoutingStrategy = "round-robin"        // Spread concurrent VMs evenly across healthy accounts
 	StrategyFreeOpportunistic RoutingStrategy = "free-opportunistic" // Try Free T4/CPU windows first before touching Paid CUs
+	StrategyFreeFirst         RoutingStrategy = "free-first"         // Drain $0 Free Colab T4 quota first, then expiring paid Colab CU
 )
 
 // RouterPolicy configures global account routing, sticky affinity, and hardware fallback waterfalls.

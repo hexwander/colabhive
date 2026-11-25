@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/jchv/go-webview2/webviewloader"
@@ -239,6 +240,23 @@ type iCoreWebView2NavigationCompletedEventArgs struct {
 	vtbl *iCoreWebView2NavigationCompletedEventArgsVtbl
 }
 
+// ICoreWebView2ProcessFailedEventArgs
+type iCoreWebView2ProcessFailedEventArgsVtbl struct {
+	iUnknownVtbl
+	GetProcessFailedKind comProc
+}
+
+type iCoreWebView2ProcessFailedEventArgs struct {
+	vtbl *iCoreWebView2ProcessFailedEventArgsVtbl
+}
+
+const (
+	wv2ProcessFailedBrowserExited       = 0
+	wv2ProcessFailedRenderExited        = 1
+	wv2ProcessFailedRenderUnresponsive  = 2
+	wv2ProcessFailedFrameRenderExited   = 3
+)
+
 // ICoreWebView2AcceleratorKeyPressedEventArgs
 type iCoreWebView2AcceleratorKeyPressedEventArgsVtbl struct {
 	iUnknownVtbl
@@ -308,6 +326,18 @@ type navCompletedHandler struct {
 
 var navCompletedVtblSingleton *navCompletedHandlerVtbl
 
+type processFailedHandlerVtbl struct {
+	iUnknownVtbl
+	Invoke comProc
+}
+
+type processFailedHandler struct {
+	vtbl *processFailedHandlerVtbl
+	surf *webviewSurface
+}
+
+var processFailedVtblSingleton *processFailedHandlerVtbl
+
 type accelKeyHandlerVtbl struct {
 	iUnknownVtbl
 	Invoke comProc
@@ -372,7 +402,17 @@ func ensureComCallbackVtbls() {
 			iUnknownVtbl: baseUnk,
 			Invoke: comProc(windows.NewCallback(func(this *navCompletedHandler, sender *iCoreWebView2, args *iCoreWebView2NavigationCompletedEventArgs) uintptr {
 				if this != nil && this.surf != nil {
-					this.surf.onNavigationCompleted()
+					this.surf.onNavigationCompleted(args)
+				}
+				return 0
+			})),
+		}
+
+		processFailedVtblSingleton = &processFailedHandlerVtbl{
+			iUnknownVtbl: baseUnk,
+			Invoke: comProc(windows.NewCallback(func(this *processFailedHandler, sender *iCoreWebView2, args *iCoreWebView2ProcessFailedEventArgs) uintptr {
+				if this != nil && this.surf != nil {
+					this.surf.onProcessFailed(args)
 				}
 				return 0
 			})),
@@ -516,26 +556,32 @@ func (m *webviewManager) closeAll() {
 }
 
 type webviewSurface struct {
-	hwnd         uintptr
-	isTray       bool
-	initialURL   string
-	pendingRoute string
-	visible      bool
-	ready        bool
-	failed       bool
-	navigated    bool
-	autostart    bool
+	hwnd             uintptr
+	isTray           bool
+	initialURL       string
+	pendingRoute     string
+	visible          bool
+	ready            bool
+	failed           bool
+	navigated        bool
+	navFailed        bool
+	navRetries       int
+	recoverCount     int
+	lastRecoverAt    time.Time
+	autostart        bool
 
-	ctrl        *iCoreWebView2Controller
-	webview     *iCoreWebView2
-	ctrlHandler *ctrlCompletedHandler
-	msgHandler  *webMsgHandler
-	navHandler  *navCompletedHandler
-	keyHandler  *accelKeyHandler
+	ctrl          *iCoreWebView2Controller
+	webview       *iCoreWebView2
+	ctrlHandler   *ctrlCompletedHandler
+	msgHandler    *webMsgHandler
+	navHandler    *navCompletedHandler
+	procHandler   *processFailedHandler
+	keyHandler    *accelKeyHandler
 
-	onMessage func(raw string)
-	onEscape  func()
-	onFail    func()
+	onMessage     func(raw string)
+	onEscape      func()
+	onFail        func()
+	onNavRetryReq func(delay time.Duration)
 }
 
 func newWebviewSurface(
@@ -547,21 +593,24 @@ func newWebviewSurface(
 	onMessage func(raw string),
 	onEscape func(),
 	onFail func(),
+	onNavRetryReq func(delay time.Duration),
 ) *webviewSurface {
 	ensureComCallbackVtbls()
 	s := &webviewSurface{
-		hwnd:       hwnd,
-		isTray:     isTray,
-		initialURL: initialURL,
-		visible:    initialVisible,
-		autostart:  autostart,
-		onMessage:  onMessage,
-		onEscape:   onEscape,
-		onFail:    onFail,
+		hwnd:          hwnd,
+		isTray:        isTray,
+		initialURL:    initialURL,
+		visible:       initialVisible,
+		autostart:     autostart,
+		onMessage:     onMessage,
+		onEscape:      onEscape,
+		onFail:        onFail,
+		onNavRetryReq: onNavRetryReq,
 	}
 	s.ctrlHandler = &ctrlCompletedHandler{vtbl: ctrlCompletedVtblSingleton, surf: s}
 	s.msgHandler = &webMsgHandler{vtbl: webMsgVtblSingleton, surf: s}
 	s.navHandler = &navCompletedHandler{vtbl: navCompletedVtblSingleton, surf: s}
+	s.procHandler = &processFailedHandler{vtbl: processFailedVtblSingleton, surf: s}
 	s.keyHandler = &accelKeyHandler{vtbl: accelKeyVtblSingleton, surf: s}
 	return s
 }
@@ -645,6 +694,11 @@ func (s *webviewSurface) onControllerReady(errCode uintptr, ctrl *iCoreWebView2C
 		uintptr(unsafe.Pointer(s.navHandler)),
 		uintptr(unsafe.Pointer(&tok)),
 	)
+	_, _, _ = wv.vtbl.AddProcessFailed.Call(
+		uintptr(unsafe.Pointer(wv)),
+		uintptr(unsafe.Pointer(s.procHandler)),
+		uintptr(unsafe.Pointer(&tok)),
+	)
 	_, _, _ = ctrl.vtbl.AddAcceleratorKeyPressed.Call(
 		uintptr(unsafe.Pointer(ctrl)),
 		uintptr(unsafe.Pointer(s.keyHandler)),
@@ -716,8 +770,29 @@ func (s *webviewSurface) onWebMessageReceived(args *iCoreWebView2WebMessageRecei
 	}
 }
 
-func (s *webviewSurface) onNavigationCompleted() {
+func (s *webviewSurface) onNavigationCompleted(args *iCoreWebView2NavigationCompletedEventArgs) {
+	isSuccess := int32(1)
+	if args != nil {
+		hr, _, _ := args.vtbl.GetIsSuccess.Call(
+			uintptr(unsafe.Pointer(args)),
+			uintptr(unsafe.Pointer(&isSuccess)),
+		)
+		if int32(hr) < 0 {
+			isSuccess = 1
+		}
+	}
+	if isSuccess == 0 {
+		s.navFailed = true
+		if !s.navigated && s.onNavRetryReq != nil && s.navRetries < 3 {
+			s.navRetries++
+			backoff := time.Duration(s.navRetries*700) * time.Millisecond
+			s.onNavRetryReq(backoff)
+		}
+		return
+	}
 	s.navigated = true
+	s.navFailed = false
+	s.navRetries = 0
 	s.syncAutostartState(s.autostart)
 	if !s.isTray && s.hwnd != 0 {
 		s.syncWindowState(isWindowMaximized(s.hwnd))
@@ -727,6 +802,49 @@ func (s *webviewSurface) onNavigationCompleted() {
 		s.pendingRoute = ""
 		s.openSPARoute(r)
 	}
+}
+
+func (s *webviewSurface) onProcessFailed(args *iCoreWebView2ProcessFailedEventArgs) {
+	kind := uint32(wv2ProcessFailedRenderExited)
+	if args != nil {
+		_, _, _ = args.vtbl.GetProcessFailedKind.Call(
+			uintptr(unsafe.Pointer(args)),
+			uintptr(unsafe.Pointer(&kind)),
+		)
+	}
+	if kind == wv2ProcessFailedBrowserExited {
+		s.markFailed()
+		return
+	}
+	if kind == wv2ProcessFailedRenderExited ||
+		kind == wv2ProcessFailedRenderUnresponsive ||
+		kind == wv2ProcessFailedFrameRenderExited {
+		s.navigated = false
+		s.navFailed = true
+		now := time.Now()
+		if s.recoverCount < 4 && (s.lastRecoverAt.IsZero() || now.Sub(s.lastRecoverAt) >= 1500*time.Millisecond) {
+			s.recoverCount++
+			s.lastRecoverAt = now
+			if s.ready && s.webview != nil {
+				target := s.initialURL
+				if s.pendingRoute != "" {
+					target = joinBaseAndRoute(s.initialURL, s.pendingRoute)
+				}
+				s.navigateRaw(target)
+			}
+		}
+	}
+}
+
+func (s *webviewSurface) retryInitialNavigation() {
+	if s == nil || s.failed || !s.ready || s.webview == nil || s.navigated {
+		return
+	}
+	target := s.initialURL
+	if s.pendingRoute != "" {
+		target = joinBaseAndRoute(s.initialURL, s.pendingRoute)
+	}
+	s.navigateRaw(target)
 }
 
 func (s *webviewSurface) syncWindowState(maximized bool) {
@@ -774,6 +892,9 @@ func (s *webviewSurface) resizeToClientRect() {
 	}
 	var rc winRect
 	_, _, _ = procGetClientRect.Call(s.hwnd, uintptr(unsafe.Pointer(&rc)))
+	if rc.Right <= rc.Left || rc.Bottom <= rc.Top {
+		return
+	}
 	s.putBounds(rc)
 }
 
@@ -875,7 +996,30 @@ func (s *webviewSurface) syncAutostartState(enabled bool) {
 	s.evalJS(fmt.Sprintf(`(function(v){
   window.__COLABHIVE_DESKTOP__ = window.__COLABHIVE_DESKTOP__ || { shell: true };
   window.__COLABHIVE_DESKTOP__.autostart = v;
+  window.dispatchEvent(new CustomEvent('colabhive:autostart-state', { detail: { autostart: v } }));
 })(%s);`, lit))
+}
+
+func (s *webviewSurface) setTrayMode(mode string) {
+	if s == nil || !s.isTray || !s.ready || s.webview == nil {
+		return
+	}
+	m := "panel"
+	if strings.EqualFold(strings.TrimSpace(mode), "menu") {
+		m = "menu"
+	}
+	modeJSON, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	s.evalJS(fmt.Sprintf(`(function(mode){
+  window.__COLABHIVE_TRAY_MODE__ = mode;
+  if (typeof window.__COLABHIVE_SET_TRAY_MODE__ === 'function') {
+    window.__COLABHIVE_SET_TRAY_MODE__(mode);
+  } else {
+    window.dispatchEvent(new CustomEvent('colabhive:tray-mode', { detail: { mode: mode } }));
+  }
+})(%s);`, string(modeJSON)))
 }
 
 func (s *webviewSurface) evalJS(script string) {

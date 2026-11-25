@@ -31,6 +31,7 @@ import { navigate } from '../components/layout/navigation';
 import {
   formatRelativeCountdown,
   HardwareTierBadge,
+  PlatformProviderBadge,
 } from '../components/layout/telemetryUi';
 import {
   ActionButton,
@@ -157,6 +158,10 @@ function computeAccountCycleMax(account: Account): number {
 }
 
 function computeAccountRemainPct(account: Account): number {
+  if (account.subscription_tier === 'FREE' && account.paid_cu_balance <= 0) {
+    const freeCu = Math.max(0, account.free_quota?.remaining_free_cu ?? 0);
+    return Math.max(0, Math.min(100, (freeCu / 15) * 100));
+  }
   const cycleMax = computeAccountCycleMax(account);
   const usable = account.is_contributor
     ? Math.max(0, account.schedulable_cu ?? account.paid_cu_balance - (account.guardrails?.min_reserve_cu || 0))
@@ -199,7 +204,7 @@ function deriveBannerAccountName(account: Account, index: number, zh: boolean): 
   if (account.subscription_tier === 'AI_ULTRA') return 'Lab Ultra';
   if (account.subscription_tier === 'PRO_PLUS') return `Pro+ #${index + 1}`;
   if (account.subscription_tier === 'PRO') return `Pro #${index + 1}`;
-  return account.email.split('@')[0] || `#${index + 1}`;
+  return (account.email || '').split('@')[0] || `#${index + 1}`;
 }
 
 /** Friendly "how was this rate measured" pill for a GPU tile. */
@@ -320,8 +325,11 @@ export function ObservatoryPage({
   }, [specByAcc, summary]);
 
   const totalCycleQuotaCu = useMemo(() => {
-    if (accounts.length === 0) return 0;
-    const sum = accounts.reduce((acc, a) => acc + computeAccountCycleTotal(a), 0);
+    const colabAccounts = accounts.filter(
+      (a) => !a.provider || a.provider.toLowerCase() === 'colab',
+    );
+    if (colabAccounts.length === 0) return summary.total_available_cu;
+    const sum = colabAccounts.reduce((acc, a) => acc + computeAccountCycleTotal(a), 0);
     return Math.max(sum, summary.total_available_cu);
   }, [accounts, summary.total_available_cu]);
 
@@ -367,13 +375,14 @@ export function ObservatoryPage({
         const acct = effectiveSelectedAccount;
         const ent = acct.gpu_entitlements?.[acc];
         const precomputed = acct.gpu_equivalence?.[acc];
+        const allowedGPUs = acct.guardrails?.allowed_gpus ?? [];
         const isLocked =
           Boolean(precomputed?.locked) ||
           ent?.status === 'TIER_RESTRICTED' ||
           ent?.status === 'INELIGIBLE' ||
           (acct.is_contributor &&
-            acct.guardrails.allowed_gpus.length > 0 &&
-            !acct.guardrails.allowed_gpus.includes(acc));
+            allowedGPUs.length > 0 &&
+            !allowedGPUs.includes(acc));
 
         const rate =
           ent?.calibrated_burn_rate ||
@@ -383,7 +392,7 @@ export function ObservatoryPage({
           ent?.calibration_source || precomputed?.calibration_source || 'reference';
 
         const usableCu = deductReserves
-          ? Math.max(0, acct.schedulable_cu ?? acct.paid_cu_balance - acct.guardrails.min_reserve_cu)
+          ? Math.max(0, acct.schedulable_cu ?? acct.paid_cu_balance - (acct.guardrails?.min_reserve_cu ?? 0))
           : Math.max(0, acct.paid_cu_balance);
 
         const hours = isLocked ? 0 : rate > 0 ? usableCu / rate : 0;
@@ -428,7 +437,7 @@ export function ObservatoryPage({
         lockReason: undefined,
       };
     });
-  }, [deductReserves, effectiveSelectedAccount, matrixScope, specByAcc, summary]);
+  }, [deductReserves, effectiveSelectedAccount, matrixScope, specByAcc, summary, zh]);
 
   // Calculator maths (`1 GPU x 8h == 4 GPUs x 2h`)
   const simMetrics = useMemo(() => {
@@ -481,7 +490,6 @@ export function ObservatoryPage({
     { key: 'AI_ULTRA', label: 'AI Ultra', count: tierCounts.AI_ULTRA },
     { key: 'PRO_PLUS', label: 'Colab Pro+', count: tierCounts.PRO_PLUS },
     { key: 'PRO', label: 'Colab Pro', count: tierCounts.PRO },
-    { key: 'CONTRIBUTOR', label: zh ? '好友共享' : 'Shared', count: tierCounts.CONTRIBUTOR },
   ];
 
   // Ordered banner summary pills: expiring/warning (Coral) -> contributor (Sky) -> healthy (Emerald)
@@ -554,7 +562,12 @@ export function ObservatoryPage({
       return {
         id: acct.id,
         tone: 'emerald' as SemanticTone,
-        text: `${name} · ${fmtSmartCU(acct.paid_cu_balance)} / ${fmtSmartCU(computeAccountCycleTotal(acct))} CU · ${stateWord}`,
+        text:
+          acct.subscription_tier === 'FREE' && acct.paid_cu_balance <= 0
+            ? zh
+              ? `${name} · 免费动态 T4 · 空闲就绪`
+              : `${name} · Free T4 Window · Ready`
+            : `${name} · ${fmtSmartCU(acct.paid_cu_balance)} / ${fmtSmartCU(computeAccountCycleTotal(acct))} CU · ${stateWord}`,
       };
     });
   }, [accounts, zh]);
@@ -733,8 +746,8 @@ export function ObservatoryPage({
                 title={zh ? '还没有添加任何 Colab 账号' : 'No Colab accounts added yet'}
                 description={
                   zh
-                    ? '用 Google 登录添加自己的账号（无需填密码），一键扫描导入本机 CLI 凭证，或发一条零云盘权限链接请朋友共享闲置算力。'
-                    : 'Sign in with Google (no password), import local CLI credentials, or share a zero-Drive safety link with friends.'
+                    ? '用 Google 登录添加自己的账号（无需填密码），或一键扫描导入本机已登录的 CLI 凭证。'
+                    : 'Sign in with Google (no password) or auto-scan local CLI credentials.'
                 }
                 action={
                   <ActionButton variant="primary" icon={<Plus />} onClick={() => go('/pool')}>
@@ -1266,10 +1279,7 @@ function AccountQuotaCard({
   const cycleTotalCu = computeAccountCycleTotal(account);
   const cycleMax = computeAccountCycleMax(account);
   const reserveCu = Math.max(0, account.guardrails?.min_reserve_cu || 0);
-  const schedulableCu = Math.max(
-    0,
-    account.schedulable_cu ?? account.paid_cu_balance - reserveCu,
-  );
+  const schedulableCu = Math.max(0, account.schedulable_cu ?? account.paid_cu_balance - reserveCu);
 
   const paidPct = Math.max(0, Math.min(100, (account.paid_cu_balance / cycleMax) * 100));
   const remainPct = computeAccountRemainPct(account);
@@ -1423,10 +1433,11 @@ function AccountQuotaCard({
             </span>
 
             <div className="min-w-0">
-              <div className="flex items-center gap-2 min-w-0">
+              <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                 <h3 className="text-[15.5px] font-bold tracking-tight text-fg truncate">
                   {cardTitle}
                 </h3>
+                <PlatformProviderBadge account={account} showHours={false} />
                 <StatusPill tone={semanticTone} size="xs" className="shrink-0">
                   {semanticLabel}
                 </StatusPill>
@@ -1456,7 +1467,7 @@ function AccountQuotaCard({
 
         {/* Middle Dual Segmented Bars (22 micro-segments each) */}
         <div className="space-y-3.5 py-0.5">
-          {/* Row A: Paid Compute Pool (`剩余 633.24 / 总额 2,500 CU`) */}
+          {/* Row A: Paid Compute Pool */}
           <div className="space-y-1.5">
             <div className="flex items-baseline justify-between gap-2 text-[12px]">
               <span className="text-fg-secondary truncate">
@@ -1488,7 +1499,11 @@ function AccountQuotaCard({
                 {Math.round(paidPct)}%
               </span>
             </div>
-            <SegmentedQuotaBar value={paidPct} segments={22} tone={paidBarTone} />
+            <SegmentedQuotaBar
+              value={paidPct}
+              segments={22}
+              tone={paidBarTone}
+            />
           </div>
 
           {/* Row B: Schedulable Ratio / Reserve Floor OR Free T4 Refresh Window */}

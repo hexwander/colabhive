@@ -33,9 +33,13 @@ const (
 	DefaultMainLogicalWidth  = 1380
 	DefaultMainLogicalHeight = 880
 
-	// DefaultFlyoutLogicalWidth and DefaultFlyoutLogicalHeight define the 96-DPI Magpie tray popover size.
+	// DefaultFlyoutLogicalWidth and DefaultFlyoutLogicalHeight define the 96-DPI tray popover size.
 	DefaultFlyoutLogicalWidth  = 396
 	DefaultFlyoutLogicalHeight = 580
+
+	// DefaultMenuLogicalWidth and DefaultMenuLogicalHeight define the 96-DPI Stardust right-click tray menu size.
+	DefaultMenuLogicalWidth  = 256
+	DefaultMenuLogicalHeight = 302
 
 	// DefaultFlyoutGapPx is the logical pixel gap between the taskbar edge and the tray flyout.
 	DefaultFlyoutGapPx = 8
@@ -55,13 +59,15 @@ type Config struct {
 	DataDir         string
 	DBPath          string
 	WebDir          string
-	AttachURL       string
-	AdminToken      string
-	MasterKey       string
-	DefaultStrategy string
-	KeepaliveSec    int
-	Demo            bool
-	StartMinimized  bool
+	AttachURL           string
+	AdminToken          string
+	MCPTrustedWorkspace string
+	MasterKey           string
+	DefaultStrategy     string
+	KeepaliveSec        int
+	FallbackProbeSec    int
+	Demo                bool
+	StartMinimized      bool
 }
 
 // NormalizeRoute sanitizes an SPA route string from WebView2/WKWebView or `/api/v1/desktop/action`
@@ -219,6 +225,7 @@ func parsePlainActionToken(token string) (req server.DesktopActionRequest, exter
 func isSupportedDesktopAction(action string) bool {
 	switch action {
 	case "open-main", "open-route", "hide-tray", "show-tray", "toggle-tray",
+		"sync-now", "copy-mcp",
 		"quit", "toggle-autostart", "set-autostart", "state",
 		"window-drag", "start-drag", "window-minimize",
 		"window-maximize", "window-toggle-maximize", "window-close",

@@ -1,15 +1,20 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertOctagon,
+  Check,
+  ChevronDown,
+  Copy,
   Cpu,
   ExternalLink,
   FolderOpen,
   Image as ImageIcon,
+  Lock,
   NotebookPen,
   Pin,
   Plus,
   RefreshCw,
   RotateCcw,
+  ShieldCheck,
   Square,
   Terminal as TerminalIcon,
   X,
@@ -26,6 +31,13 @@ import {
   type WSEvent,
 } from '../types';
 import { api, formatBytes, useColabHiveEvents } from '../lib/api';
+import { v11Api } from '../lib/apiV11';
+import { getFriendlySessionDisplay, isLLMGatewaySession } from '../lib/sessionLabels';
+import {
+  buildSmartColabWebUrl,
+  canOpenColabWebForSession,
+  findSessionAccount,
+} from '../lib/colabUrl';
 import { useI18n } from '../i18n';
 import {
   ActionButton,
@@ -77,6 +89,7 @@ type CenterViewTab = 'terminal' | 'cells' | 'plots' | 'files';
 export function WorkbenchPage({
   experimentId: propExperimentId,
   sessionId: propSessionId,
+  onNavigate,
   onSessionsSynced,
 }: WorkbenchPageProps = {}) {
   const { locale, t, displayEmail, displaySecret } = useI18n();
@@ -238,10 +251,31 @@ export function WorkbenchPage({
 
   // Workspace tab (one full-width panel at a time)
   const [activeTab, setActiveTab] = useState<CenterViewTab>('terminal');
+  const [colabMenuOpen, setColabMenuOpen] = useState(false);
+  const [copiedColabUrl, setCopiedColabUrl] = useState(false);
 
   // Modals
   const [showProvisionModal, setShowProvisionModal] = useState(false);
   const [showShardedModal, setShowShardedModal] = useState(false);
+
+  useEffect(() => {
+    if (!colabMenuOpen) return;
+    const handlePointer = (e: PointerEvent) => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target?.closest('[data-dismiss-scope="colab-web-menu"]')) {
+        setColabMenuOpen(false);
+      }
+    };
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setColabMenuOpen(false);
+    };
+    document.addEventListener('pointerdown', handlePointer);
+    document.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointer);
+      document.removeEventListener('keydown', handleKey);
+    };
+  }, [colabMenuOpen]);
 
   // Live 1-second clock tick for elapsed timers & keepalive pulse seconds
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -453,6 +487,14 @@ export function WorkbenchPage({
     () => (experiments.length === 0 ? liveSessions : standaloneSessions),
     [experiments.length, liveSessions, standaloneSessions],
   );
+  const displayedLLMSessions = useMemo(
+    () => displayedKernelSessions.filter(isLLMGatewaySession),
+    [displayedKernelSessions],
+  );
+  const displayedRegularSessions = useMemo(
+    () => displayedKernelSessions.filter((s) => !isLLMGatewaySession(s)),
+    [displayedKernelSessions],
+  );
 
   const activeSession = useMemo<RuntimeSession | null>(() => {
     if (activeExperiment) {
@@ -519,23 +561,62 @@ export function WorkbenchPage({
     [activeSession, activeExperiment, selectedShardFilter],
   );
 
+  const activeSessionAccount = useMemo(
+    () => findSessionAccount(activeSession, accounts),
+    [activeSession, accounts],
+  );
+  const colabWebAccess = useMemo(
+    () => canOpenColabWebForSession(activeSession, activeSessionAccount),
+    [activeSession, activeSessionAccount],
+  );
+
   // Operational Safety Actions
+  const resolveSessionColabUrl = async (): Promise<string | null> => {
+    if (!activeSession) return null;
+    let targetUrl = activeSession.colab_web_url;
+    if (!isOfflineDemo) {
+      const res = await api.getSessionWebUrl(activeSession.id).catch(() => null);
+      if (res?.url) targetUrl = res.url;
+    }
+    return buildSmartColabWebUrl(targetUrl, activeSession.account_email);
+  };
+
   const handleOpenInColabWeb = async () => {
-    if (!activeSession) return;
+    if (!activeSession || !colabWebAccess.allowed) return;
+    setColabMenuOpen(false);
     setActionBusy('open-web');
     try {
-      let targetUrl = activeSession.colab_web_url;
-      if (!isOfflineDemo) {
-        const res = await api.getSessionWebUrl(activeSession.id).catch(() => null);
-        if (res?.url) targetUrl = res.url;
-      }
+      const targetUrl = await resolveSessionColabUrl();
       window.open(targetUrl || 'https://colab.research.google.com', '_blank', 'noopener,noreferrer');
       setToastBanner({
         tone: 'emerald',
         text: isZh
-          ? `已在浏览器打开 Colab 网页（请切换到 ${displayEmail(activeSession.account_email)} 账号，即可查看并操作同一个云端实例）`
-          : `Opened Colab in your browser — switch to ${displayEmail(activeSession.account_email)} to see this exact runtime`,
+          ? `已附带 authuser 打开 Colab 网页（需本机浏览器已登录 ${displayEmail(activeSession.account_email)}；若未登录请直接在下方免登录终端/文件区操作）`
+          : `Opened Colab with authuser=${displayEmail(activeSession.account_email)} (requires that Google account signed in locally; otherwise use the cookie-free Workbench below)`,
       });
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const handleCopyColabWebUrl = async () => {
+    if (!activeSession || !colabWebAccess.allowed) return;
+    setActionBusy('copy-web');
+    try {
+      const targetUrl = await resolveSessionColabUrl();
+      if (targetUrl && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(targetUrl);
+        setCopiedColabUrl(true);
+        window.setTimeout(() => setCopiedColabUrl(false), 1800);
+        setToastBanner({
+          tone: 'emerald',
+          text: isZh
+            ? `已复制 Colab 实例链接（可粘贴到已登录 ${displayEmail(activeSession.account_email)} 的浏览器窗口中打开）`
+            : `Copied Colab runtime URL — paste it into a browser profile signed into ${displayEmail(activeSession.account_email)}`,
+        });
+      }
+    } catch {
+      // Fallback silently if clipboard unavailable
     } finally {
       setActionBusy(null);
     }
@@ -572,7 +653,17 @@ export function WorkbenchPage({
   };
 
   const handleStopAndRelease = async () => {
-    if (!(activeExperiment && selectedShardFilter === 'all') && activeSession?.adopted_external) {
+    const isSingleLLM =
+      !(activeExperiment && selectedShardFilter === 'all') && isLLMGatewaySession(activeSession);
+    if (isSingleLLM && activeSession) {
+      const llmDisp = getFriendlySessionDisplay(activeSession, isZh);
+      const confirmed = window.confirm(
+        isZh
+          ? `【防误释放确认】\n\n「${llmDisp.title}」正在为【无审查大模型一键部署】提供本机 /v1 推理接口（供 Cherry Studio、酒馆与 Cursor 调用）。\n\n确认立即停止并释放该 ${activeSession.accelerator} 显卡吗？停止后外部客户端对话会立刻中断。`
+          : `[Confirm LLM GPU Release]\n\n"${llmDisp.title}" is actively serving your local /v1 LLM endpoint (Cherry Studio, SillyTavern, Cursor).\n\nStop and release this ${activeSession.accelerator} GPU now? Connected clients will disconnect immediately.`,
+      );
+      if (!confirmed) return;
+    } else if (!(activeExperiment && selectedShardFilter === 'all') && activeSession?.adopted_external) {
       const confirmed = window.confirm(
         isZh
           ? '该实例是你在外部启动并同步进来的任务，确定要远程停止并释放显卡吗？'
@@ -614,7 +705,20 @@ export function WorkbenchPage({
         });
       } else if (activeSession) {
         if (!isOfflineDemo) {
-          await api.stopSession(activeSession.id);
+          if (isSingleLLM) {
+            try {
+              const gwSt = await v11Api.getLLMStatus();
+              if (gwSt.session_id === activeSession.id) {
+                await v11Api.stopLLM();
+              } else {
+                await api.stopSession(activeSession.id);
+              }
+            } catch {
+              await api.stopSession(activeSession.id);
+            }
+          } else {
+            await api.stopSession(activeSession.id);
+          }
           await fetchWorkbenchState();
           onSessionsSynced?.();
         } else {
@@ -765,10 +869,16 @@ export function WorkbenchPage({
 
   // Workspace header derivations
   const viewingAllShards = Boolean(activeExperiment) && selectedShardFilter === 'all';
+  const activeSessionDisplay = useMemo(
+    () => getFriendlySessionDisplay(activeSession, isZh),
+    [activeSession, isZh],
+  );
   const workspaceTitle =
     activeExperiment && selectedShardFilter === 'all'
       ? activeExperiment.title
-      : activeSession?.name || 'Colab Runtime';
+      : activeSessionDisplay.isLLM
+        ? activeSessionDisplay.prefixedTitle
+        : activeSession?.name || 'Colab Runtime';
   const acceleratorLabel = activeSession?.accelerator || activeExperiment?.accelerator || 'G4';
   const hardwareLabel =
     activeExperiment && selectedShardFilter === 'all'
@@ -1215,22 +1325,107 @@ export function WorkbenchPage({
                   )}
                 </section>
 
+                {displayedLLMSessions.length > 0 && (
+                  <>
+                    <div className="border-t border-line-faint" />
+
+                    {/* Group 1.5 — Dedicated AI LLM Inference Services (clearly separated to prevent accidental release) */}
+                    <section data-testid="workbench-llm-section">
+                      <RailHeading
+                        label={isZh ? '大模型推理服务' : 'LLM Inference Nodes'}
+                        count={displayedLLMSessions.length}
+                      />
+
+                      <div className="space-y-2 ui-stagger">
+                        {displayedLLMSessions.map((sess) => {
+                          const isFocused = !selectedExperimentId && selectedSessionId === sess.id;
+                          const disp = getFriendlySessionDisplay(sess, isZh);
+
+                          return (
+                            <button
+                              key={sess.id}
+                              type="button"
+                              aria-current={isFocused ? 'true' : undefined}
+                              onClick={() => {
+                                setSelectedExperimentId(null);
+                                setSelectedShardFilter('all');
+                                setSelectedSessionId(sess.id);
+                              }}
+                              className={cn(
+                                'block w-full text-left rounded-2xl p-3 transition-all cursor-pointer border',
+                                isFocused
+                                  ? 'border-[1.5px] shadow-[var(--shadow-card)]'
+                                  : 'hover:border-[var(--amber-border)]',
+                              )}
+                              style={{
+                                backgroundColor: isFocused
+                                  ? 'var(--amber-soft)'
+                                  : 'color-mix(in srgb, var(--amber-soft) 55%, var(--surface-1))',
+                                borderColor: isFocused
+                                  ? 'var(--amber)'
+                                  : 'var(--amber-border)',
+                              }}
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span data-tone="amber" className="ui-dot" />
+                                  <span
+                                    className="text-[12.5px] font-semibold text-fg truncate"
+                                    title={`${disp.title} (${sess.name})`}
+                                  >
+                                    {disp.title}
+                                  </span>
+                                </div>
+                                <StatusPill
+                                  size="xs"
+                                  tone="amber"
+                                  mono
+                                  className="shrink-0"
+                                >
+                                  {sess.accelerator}
+                                </StatusPill>
+                              </div>
+
+                              <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                                <StatusPill tone="amber" size="xs" dot>
+                                  {disp.badge}
+                                </StatusPill>
+                              </div>
+
+                              <div className="ch-num mt-1.5 flex items-center justify-between gap-2 text-[11px] text-fg-muted">
+                                <span className="truncate">{displayEmail(sess.account_email)}</span>
+                                <span className="inline-flex items-center gap-1.5 shrink-0">
+                                  <AnimatedNumber
+                                    value={sess.burn_rate_cu_hr}
+                                    decimals={2}
+                                    suffix=" CU/h"
+                                  />
+                                </span>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  </>
+                )}
+
                 <div className="border-t border-line-faint" />
 
                 {/* Group 2 — Standalone GPU sessions */}
                 <section>
                   <RailHeading
                     label={isZh ? '独立 GPU 实例' : 'GPU Sessions'}
-                    count={displayedKernelSessions.length}
+                    count={displayedRegularSessions.length}
                   />
 
-                  {displayedKernelSessions.length === 0 ? (
+                  {displayedRegularSessions.length === 0 ? (
                     <RailNote>
                       {isZh ? '暂无独立运行的 GPU 实例' : 'No standalone GPU sessions'}
                     </RailNote>
                   ) : (
                     <div className="space-y-2 ui-stagger">
-                      {displayedKernelSessions.map((sess) => {
+                      {displayedRegularSessions.map((sess) => {
                         const isFocused = !selectedExperimentId && selectedSessionId === sess.id;
                         const isZombie =
                           sess.status === 'ZOMBIE_ALERT' || Boolean(sess.worker?.zombie_detected);
@@ -1399,6 +1594,25 @@ export function WorkbenchPage({
                       {hardwareLabel}
                     </StatusPill>
 
+                    {!viewingAllShards && activeSessionDisplay.isLLM && (
+                      <>
+                        <StatusPill tone="amber" dot>
+                          {activeSessionDisplay.badge}
+                        </StatusPill>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (onNavigate) onNavigate('/apps/llm');
+                            else if (typeof window !== 'undefined') window.location.assign('/apps/llm');
+                          }}
+                          className="inline-flex items-center gap-1 h-6.5 px-2.5 rounded-full border text-[11px] font-semibold cursor-pointer bg-surface-1 hover:bg-surface-2 transition-colors"
+                          style={{ borderColor: 'var(--amber-border)', color: 'var(--amber-text)' }}
+                        >
+                          {isZh ? '前往大模型部署页管理 →' : 'Manage in LLM Deployer →'}
+                        </button>
+                      </>
+                    )}
+
                     {!viewingAllShards && activeSession?.adopted_external && (
                       <StatusPill tone="sky" dot>
                         {isZh ? '云端在跑实例（已自动同步）' : 'Synced Cloud VM'}
@@ -1501,21 +1715,196 @@ export function WorkbenchPage({
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2 shrink-0">
-                  <ActionButton
-                    variant="secondary"
-                    size="sm"
-                    icon={<ExternalLink />}
-                    loading={actionBusy === 'open-web'}
-                    disabled={!activeSession || actionBusy !== null}
-                    onClick={() => void handleOpenInColabWeb()}
-                    title={
-                      isZh
-                        ? '在浏览器打开 Google Colab 网页端，直接查看并操作同一个云端实例'
-                        : 'Open this exact runtime in Google Colab web UI'
-                    }
-                  >
-                    {isZh ? '在 Colab 网页查看' : 'Open in Colab'}
-                  </ActionButton>
+                  {activeSession && colabWebAccess.reason !== 'non_colab' && (
+                    <div className="relative" data-dismiss-scope="colab-web-menu">
+                      <ActionButton
+                        variant="secondary"
+                        size="sm"
+                        icon={
+                          colabWebAccess.reason === 'contributor' ? (
+                            <ShieldCheck />
+                          ) : (
+                            <ExternalLink />
+                          )
+                        }
+                        loading={actionBusy === 'open-web' || actionBusy === 'copy-web'}
+                        disabled={!activeSession || actionBusy !== null}
+                        onClick={() => setColabMenuOpen((v) => !v)}
+                        title={
+                          colabWebAccess.reason === 'contributor'
+                            ? isZh
+                              ? '好友共享账号已由 ColabHive 免登录直连，无需浏览器登录对方 Google 账号'
+                              : 'Friend-shared OAuth account connected cookie-free via ColabHive'
+                            : isZh
+                              ? '免登录操作实例，或在已登录对应账号的浏览器打开 Colab 网页'
+                              : 'Operate cookie-free in Workbench or open in Google Colab web UI'
+                        }
+                      >
+                        <span className="inline-flex items-center gap-1">
+                          <span>
+                            {colabWebAccess.reason === 'contributor'
+                              ? isZh
+                                ? '免登录直连'
+                                : 'Cookie-Free Direct'
+                              : isZh
+                                ? '打开实例'
+                                : 'Open Runtime'}
+                          </span>
+                          <ChevronDown
+                            className={cn(
+                              'w-3 h-3 opacity-70 transition-transform duration-150',
+                              colabMenuOpen && 'rotate-180',
+                            )}
+                          />
+                        </span>
+                      </ActionButton>
+
+                      {colabMenuOpen && (
+                        <div className="ui-float ui-float-pop ui-anim-pop absolute left-0 xl:left-auto xl:right-0 top-full mt-2 z-40 w-[328px] max-w-[calc(100vw-28px)] rounded-2xl p-3 space-y-2.5 text-left">
+                          {/* 1. Cookie-free built-in Workbench controls (works for ALL accounts including friend-shared OAuth!) */}
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-fg">
+                                <ShieldCheck
+                                  className="w-3.5 h-3.5 shrink-0"
+                                  style={{ color: 'var(--emerald-text)' }}
+                                />
+                                <span>
+                                  {isZh ? '本页免登录直连（推荐）' : 'Built-In Cookie-Free Access'}
+                                </span>
+                              </span>
+                              <span
+                                className="px-1.5 py-0.5 rounded-full text-[10px] font-semibold"
+                                style={{
+                                  backgroundColor: 'var(--emerald-soft)',
+                                  color: 'var(--emerald-text)',
+                                }}
+                              >
+                                {isZh ? '无需登录 Google' : 'No Login Needed'}
+                              </span>
+                            </div>
+                            <p className="text-[11px] leading-relaxed text-fg-muted">
+                              {isZh
+                                ? '无论本机浏览器是否登录该 Google 账号（含好友授权共享号），都可直接在此实时看日志、跑代码和传文件：'
+                                : 'Works even when your browser is not signed into this Google account (including shared OAuth accounts):'}
+                            </p>
+                            <div className="grid grid-cols-3 gap-1.5 pt-0.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveTab('terminal');
+                                  setColabMenuOpen(false);
+                                }}
+                                className="inline-flex items-center justify-center gap-1 h-7 px-2 rounded-lg border text-[11px] font-medium text-fg bg-surface-2 hover:border-line-strong cursor-pointer transition-colors"
+                                style={{ borderColor: 'var(--border-subtle)' }}
+                              >
+                                <TerminalIcon className="w-3 h-3 shrink-0" />
+                                <span>{isZh ? '实时日志' : 'Logs'}</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveTab('cells');
+                                  setColabMenuOpen(false);
+                                }}
+                                className="inline-flex items-center justify-center gap-1 h-7 px-2 rounded-lg border text-[11px] font-medium text-fg bg-surface-2 hover:border-line-strong cursor-pointer transition-colors"
+                                style={{ borderColor: 'var(--border-subtle)' }}
+                              >
+                                <NotebookPen className="w-3 h-3 shrink-0" />
+                                <span>{isZh ? '执行代码' : 'Run Code'}</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveTab('files');
+                                  setColabMenuOpen(false);
+                                }}
+                                className="inline-flex items-center justify-center gap-1 h-7 px-2 rounded-lg border text-[11px] font-medium text-fg bg-surface-2 hover:border-line-strong cursor-pointer transition-colors"
+                                style={{ borderColor: 'var(--border-subtle)' }}
+                              >
+                                <FolderOpen className="w-3 h-3 shrink-0" />
+                                <span>{isZh ? '云端文件' : 'Files'}</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          <div
+                            className="border-t pt-2.5 space-y-1.5"
+                            style={{ borderColor: 'var(--border-faint)' }}
+                          >
+                            {colabWebAccess.reason === 'contributor' ? (
+                              <div className="rounded-xl px-2.5 py-2 bg-[var(--neutral-soft)] text-[11px] leading-relaxed text-fg-muted space-y-1">
+                                <div className="inline-flex items-center gap-1.5 font-semibold text-fg-secondary">
+                                  <Lock className="w-3 h-3 shrink-0" />
+                                  <span>
+                                    {isZh
+                                      ? '好友共享账号已禁用 Colab 网页跳转'
+                                      : 'Colab Web UI unavailable for shared account'}
+                                  </span>
+                                </div>
+                                <div>
+                                  {isZh
+                                    ? `此实例运行在好友授权账号（${displayEmail(activeSession.account_email)}）上。Google Colab 网页端强校验本人浏览器 Cookie，无法跨号登录，请直接使用上方免登录工作台。`
+                                    : `Running on friend-shared account (${displayEmail(activeSession.account_email)}). Google Colab Web requires the owner's browser cookie, so use the cookie-free tabs above instead.`}
+                                </div>
+                              </div>
+                            ) : (
+                              <>
+                                <div className="text-[11px] font-semibold text-fg-secondary">
+                                  {isZh ? '外部 Google Colab 网页（可选）' : 'External Google Colab Web (Optional)'}
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleOpenInColabWeb()}
+                                    className="flex-1 inline-flex items-center justify-center gap-1.5 h-8 px-2.5 rounded-lg border text-[11.5px] font-semibold text-fg bg-surface-2 hover:border-line-strong cursor-pointer transition-colors"
+                                    style={{ borderColor: 'var(--border-subtle)' }}
+                                  >
+                                    <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                                    <span>{isZh ? '在 Colab 网页打开' : 'Open in Colab Web'}</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleCopyColabWebUrl()}
+                                    title={
+                                      isZh
+                                        ? '复制带 authuser 参数的链接，粘贴到已登录该账号的其他浏览器窗口'
+                                        : 'Copy link with authuser param to open in another browser profile'
+                                    }
+                                    className="inline-flex items-center justify-center gap-1 h-8 px-2.5 rounded-lg border text-[11.5px] font-medium text-fg-secondary hover:text-fg bg-surface-2 hover:border-line-strong cursor-pointer transition-colors shrink-0"
+                                    style={{ borderColor: 'var(--border-subtle)' }}
+                                  >
+                                    {copiedColabUrl ? (
+                                      <Check
+                                        className="w-3.5 h-3.5"
+                                        style={{ color: 'var(--emerald-text)' }}
+                                      />
+                                    ) : (
+                                      <Copy className="w-3.5 h-3.5" />
+                                    )}
+                                    <span>
+                                      {copiedColabUrl
+                                        ? isZh
+                                          ? '已复制'
+                                          : 'Copied'
+                                        : isZh
+                                          ? '复制链接'
+                                          : 'Copy URL'}
+                                    </span>
+                                  </button>
+                                </div>
+                                <p className="text-[10.5px] leading-relaxed text-fg-muted">
+                                  {isZh
+                                    ? `已自动附带 authuser=${displayEmail(activeSession.account_email)}。若本机浏览器未登录该号，可复制链接去已登录的 Chrome 配置打开，或直接留在本页免登录操作。`
+                                    : `Auto-appends authuser=${displayEmail(activeSession.account_email)}. If not signed in locally, copy the URL to a matching browser profile or use the cookie-free tabs above.`}
+                                </p>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <ActionButton
                     variant="secondary"
                     size="sm"

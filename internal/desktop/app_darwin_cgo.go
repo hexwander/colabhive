@@ -259,6 +259,21 @@ func (a *darwinDesktopApp) executeAction(action string, route string, explicitEn
 		if a.debouncer.ShouldExecute("toggle-tray", time.Now()) {
 			C.ch_cocoa_toggle_tray()
 		}
+	case "sync-now":
+		if a.debouncer.ShouldExecute("sync-now", time.Now()) {
+			C.ch_cocoa_hide_tray()
+			a.triggerManualCloudSync()
+		}
+	case "copy-mcp":
+		if a.debouncer.ShouldExecute("copy-mcp", time.Now()) {
+			C.ch_cocoa_hide_tray()
+			if cp := a.cp.Load(); cp != nil && cp.BaseURL != "" {
+				mcpURL := strings.TrimRight(cp.BaseURL, "/") + "/mcp"
+				cText := C.CString(mcpURL)
+				C.ch_cocoa_copy_clipboard(cText)
+				C.free(unsafe.Pointer(cText))
+			}
+		}
 	case "toggle-autostart":
 		if a.debouncer.ShouldExecute("toggle-autostart", time.Now()) {
 			next := !IsAutoStartEnabled()

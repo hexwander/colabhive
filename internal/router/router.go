@@ -26,6 +26,9 @@ import (
 var (
 	// ErrNoEligibleAccount indicates no pooled account can satisfy the requested compute spec.
 	ErrNoEligibleAccount = errors.New("no eligible pooled account available for requested accelerator")
+	// ErrProviderNotInteractive indicates a non-Colab account or provider selector was explicitly
+	// requested for interactive Colab runtime allocation.
+	ErrProviderNotInteractive = errors.New("provider is not supported for interactive Colab sessions")
 	// ErrInvalidAPIKey indicates an unrecognized, disabled, or expired ch_sk_... key.
 	ErrInvalidAPIKey = errors.New("invalid, disabled, or expired API key")
 	// ErrAPIKeyBudgetExceeded indicates an Agent API key has exhausted its CU budget or VM cap.
@@ -122,6 +125,8 @@ func NormalizeStrategy(raw models.RoutingStrategy, fallback models.RoutingStrate
 		return models.StrategyRoundRobin
 	case "free-opportunistic", "free_opportunistic", "free", "cheapest":
 		return models.StrategyFreeOpportunistic
+	case "free-first", "free_first", "zero-cost", "zero_cost":
+		return models.StrategyFreeFirst
 	default:
 		if fallback != "" {
 			return fallback
@@ -305,7 +310,19 @@ func (s *Service) selectAccountAndTierLocked(
 		}
 	}
 
-	// Filter accounts by administrative enablement, explicit selector, exclusions, and group ACLs.
+	// Reject explicit non-Colab provider selectors up front: ColabHive schedules Google Colab runtimes only.
+	if nonColabProv, isNonColab := parseNonInteractiveProviderSelector(req.AccountSelector); isNonColab {
+		return nil, "", nil, fmt.Errorf(
+			"%w (%w): provider %q is not supported for interactive Colab sessions",
+			ErrProviderNotInteractive, ErrNoEligibleAccount, nonColabProv,
+		)
+	}
+
+	// Filter accounts by administrative enablement, strict Colab-only interactive runtime isolation,
+	// explicit selector, exclusions, and group ACLs BEFORE tier evaluation or slot reservation.
+	selTrimmed := strings.TrimSpace(req.AccountSelector)
+	hasExplicitSelector := selTrimmed != "" && !strings.EqualFold(selTrimmed, "all")
+	var nonColabSelectorMatch *models.Account
 	baseAccounts := make([]*models.Account, 0, len(accounts))
 	for _, acc := range accounts {
 		if acc == nil || !acc.Enabled {
@@ -317,12 +334,24 @@ func (s *Service) selectAccountAndTierLocked(
 		if !matchesAccountSelector(acc, req.AccountSelector) {
 			continue
 		}
+		if acc.EffectiveProvider() != models.ProviderColab {
+			if hasExplicitSelector && nonColabSelectorMatch == nil {
+				nonColabSelectorMatch = acc
+			}
+			continue
+		}
 		if len(allowedGroups) > 0 && !hasAnyGroup(acc.Groups, allowedGroups) {
 			continue
 		}
 		baseAccounts = append(baseAccounts, acc)
 	}
 	if len(baseAccounts) == 0 {
+		if nonColabSelectorMatch != nil {
+			return nil, "", nil, fmt.Errorf(
+				"%w (%w): account %q uses unsupported non-Colab provider %q",
+				ErrProviderNotInteractive, ErrNoEligibleAccount, nonColabSelectorMatch.ID, nonColabSelectorMatch.EffectiveProvider(),
+			)
+		}
 		return nil, "", nil, fmt.Errorf(
 			"%w: zero enabled accounts match selector=%q groups=%v excluded=%v",
 			ErrNoEligibleAccount, req.AccountSelector, allowedGroups, req.ExcludedAccountIDs,
@@ -374,6 +403,30 @@ func (s *Service) selectAccountAndTierLocked(
 	}
 
 	rejectionReasons := make([]string, 0, 6)
+
+	// StrategyFreeFirst enforces strict 2-Tier Zero-Dollar Priority across candidate tiers:
+	//   Priority Tier 1 ($0 Zero-Cost Free): Colab Free T4 accounts, automatically preferring GPU_T4
+	//                   whenever T4 is requested or allowed via fallback!
+	//   Priority Tier 2 (Expiring Paid Colab CU): Healthy paid Colab accounts ordered by waste-zero (earliest expiring CU first).
+	if effectiveStrategy == models.StrategyFreeFirst {
+		if chosen, chosenTier := s.selectFreeFirstAcrossTiersLocked(
+			baseAccounts,
+			candidateTiers,
+			excludedPairs,
+			pinnedAccountID,
+			req.APIKeyID != "",
+			&rejectionReasons,
+			now,
+		); chosen != nil {
+			return chosen, chosenTier, makeReservation(chosen), nil
+		}
+		detail := strings.Join(rejectionReasons, "; ")
+		if detail == "" {
+			detail = "all candidate tiers exhausted"
+		}
+		return nil, "", nil, fmt.Errorf("%w (%s)", ErrNoEligibleAccount, detail)
+	}
+
 	for _, tier := range candidateTiers {
 		eligible := make([]*models.Account, 0, len(baseAccounts))
 		for idx, acc := range baseAccounts {
@@ -422,6 +475,96 @@ func (s *Service) selectAccountAndTierLocked(
 	return nil, "", nil, fmt.Errorf("%w (%s)", ErrNoEligibleAccount, detail)
 }
 
+func (s *Service) selectFreeFirstAcrossTiersLocked(
+	baseAccounts []*models.Account,
+	candidateTiers []models.AcceleratorType,
+	excludedPairs map[string]bool,
+	pinnedAccountID string,
+	redactLabels bool,
+	rejectionReasons *[]string,
+	now time.Time,
+) (*models.Account, models.AcceleratorType) {
+	recordRej := func(idx int, acc *models.Account, tier models.AcceleratorType, reason string) {
+		if rejectionReasons == nil || len(*rejectionReasons) >= 6 || reason == "" {
+			return
+		}
+		label := acc.Email
+		if redactLabels {
+			label = fmt.Sprintf("pool-slot-%d", idx+1)
+		}
+		*rejectionReasons = append(*rejectionReasons, fmt.Sprintf("%s(%s): %s", label, tier, reason))
+	}
+
+	collectForBucketAndTier := func(bucket int, tier models.AcceleratorType) []*models.Account {
+		eligible := make([]*models.Account, 0, len(baseAccounts))
+		for idx, acc := range baseAccounts {
+			if freeFirstBucket(acc) != bucket {
+				continue
+			}
+			if excludedPairs[acc.ID+":"+string(tier)] {
+				recordRej(idx, acc, tier, "excluded after failed attempt")
+				continue
+			}
+			ok, reason := s.canScheduleAccountForTierLocked(acc, tier, now)
+			if !ok {
+				recordRej(idx, acc, tier, reason)
+				continue
+			}
+			eligible = append(eligible, acc)
+		}
+		return eligible
+	}
+
+	pickWithSticky := func(eligible []*models.Account, tier models.AcceleratorType) *models.Account {
+		if len(eligible) == 0 {
+			return nil
+		}
+		if pinnedAccountID != "" && !excludedPairs[pinnedAccountID+":"+string(tier)] {
+			for _, acc := range eligible {
+				if acc.ID == pinnedAccountID {
+					return acc
+				}
+			}
+		}
+		return s.pickByStrategyLocked(eligible, tier, models.StrategyFreeFirst, now)
+	}
+
+	// Priority Tier 1 ($0 Zero-Cost Free Accounts): prefer GPU_T4 if requested GPU allows fallback or is T4!
+	tier1Order := make([]models.AcceleratorType, 0, len(candidateTiers))
+	if containsAccelerator(candidateTiers, models.AcceleratorT4) {
+		tier1Order = append(tier1Order, models.AcceleratorT4)
+	}
+	for _, t := range candidateTiers {
+		if t == models.AcceleratorT4 {
+			continue
+		}
+		if spec, ok := models.GetHardwareSpec(t); ok && spec.FreeTierEligible {
+			tier1Order = append(tier1Order, t)
+		}
+	}
+	for _, tier := range tier1Order {
+		if chosen := pickWithSticky(collectForBucketAndTier(1, tier), tier); chosen != nil {
+			return chosen, tier
+		}
+	}
+
+	// Priority Tier 2 (Expiring Paid Colab CU): ordered by waste-zero (earliest expiring CU first).
+	for _, tier := range candidateTiers {
+		if chosen := pickWithSticky(collectForBucketAndTier(2, tier), tier); chosen != nil {
+			return chosen, tier
+		}
+	}
+
+	// Fallback bucket (if any legacy tier reaches here): lowest priority.
+	for _, tier := range candidateTiers {
+		if chosen := pickWithSticky(collectForBucketAndTier(3, tier), tier); chosen != nil {
+			return chosen, tier
+		}
+	}
+
+	return nil, ""
+}
+
 func (s *Service) loadAccounts(ctx context.Context) ([]*models.Account, error) {
 	if s.pool != nil {
 		return s.pool.ListAccounts(ctx)
@@ -439,6 +582,9 @@ func (s *Service) canScheduleAccountForTierLocked(
 ) (bool, string) {
 	if !acc.Enabled {
 		return false, "account disabled"
+	}
+	if acc.EffectiveProvider() != models.ProviderColab {
+		return false, fmt.Sprintf("provider %s is not supported for interactive Colab sessions", acc.EffectiveProvider())
 	}
 	effectiveActive := s.effectiveActiveForLocked(acc)
 	if !acc.Health.IsSchedulable() {
@@ -474,6 +620,11 @@ func (s *Service) canScheduleAccountForTierLocked(
 		return false, fmt.Errorf("unknown accelerator %s", tier).Error()
 	}
 
+	prov := acc.EffectiveProvider()
+	if prov != models.ProviderColab {
+		return false, fmt.Sprintf("provider %q is not schedulable on Colab runtime", prov)
+	}
+
 	// Enforce hard Contributor Guardrails.
 	if acc.IsContributor {
 		g := acc.Guardrails
@@ -507,7 +658,7 @@ func (s *Service) canScheduleAccountForTierLocked(
 			}
 		}
 	} else {
-		// Standard owner account check: Free accounts without Paid CUs can only run Free-eligible tiers.
+		// Standard Colab owner account check: Free accounts without Paid CUs can only run Free-eligible tiers.
 		freeReady := isFreeWindowReady(acc, spec) || (spec.FreeTierEligible && acc.SubscriptionTier == models.TierFree)
 		availCU := effectiveAccountSchedulableCUAt(acc, now)
 		if !freeReady && availCU <= 0.25 {
@@ -582,6 +733,9 @@ func (s *Service) pickByStrategyLocked(
 		actA := s.effectiveActiveForLocked(a)
 		actB := s.effectiveActiveForLocked(b)
 		switch strategy {
+		case models.StrategyFreeFirst:
+			return compareFreeFirstAccounts(a, b, spec, actA, actB, now)
+
 		case models.StrategyFreeOpportunistic:
 			aFree := isFreeWindowReady(a, spec) || (spec.FreeTierEligible && a.SubscriptionTier == models.TierFree)
 			bFree := isFreeWindowReady(b, spec) || (spec.FreeTierEligible && b.SubscriptionTier == models.TierFree)
@@ -632,6 +786,93 @@ func (s *Service) pickByStrategyLocked(
 	})
 
 	return candidates[0]
+}
+
+// freeFirstBucket classifies Colab accounts into the 2 Free-First priority tiers:
+//   1: $0 Zero-Cost Free Accounts (acc.IsZeroCostFreeAvailable() — Colab Free T4)
+//   2: Expiring Paid Colab CU Accounts
+func freeFirstBucket(acc *models.Account) int {
+	if acc == nil {
+		return 3
+	}
+	if acc.IsZeroCostFreeAvailable() {
+		return 1
+	}
+	return 2
+}
+
+func freeRemainingHoursEquivalent(acc *models.Account) float64 {
+	if acc == nil || acc.EffectiveProvider() != models.ProviderColab {
+		return 0
+	}
+	t4Rate := 1.96
+	if spec, ok := models.GetHardwareSpec(models.AcceleratorT4); ok && spec.DefaultBurnRateCUHr > 0 {
+		t4Rate = spec.DefaultBurnRateCUHr
+	}
+	if cu := freeQuotaCU(acc); cu > 0 {
+		return cu / t4Rate
+	}
+	if acc.SubscriptionTier == models.TierFree {
+		return 0.5
+	}
+	return 0
+}
+
+func compareFreeFirstAccounts(
+	a, b *models.Account,
+	spec models.HardwareSpec,
+	actA, actB int,
+	now time.Time,
+) bool {
+	bucketA := freeFirstBucket(a)
+	bucketB := freeFirstBucket(b)
+	if bucketA != bucketB {
+		return bucketA < bucketB
+	}
+
+	if bucketA == 1 { // Tier 1: $0 Zero-Cost Free — largest remaining free hours / milli-CCU first
+		remA := freeRemainingHoursEquivalent(a)
+		remB := freeRemainingHoursEquivalent(b)
+		if math.Abs(remA-remB) > 1e-4 {
+			return remA > remB
+		}
+		if actA != actB {
+			return actA < actB
+		}
+		if a.Priority != b.Priority {
+			return a.Priority > b.Priority
+		}
+		return a.ID < b.ID
+	}
+
+	// Tier 2: Paid Colab CU — waste-zero (earliest expiring CU first)
+	if actA == actB {
+		aExpFuture := a.EarliestBatchExpiresAt != nil && a.EarliestBatchExpiresAt.After(now)
+		bExpFuture := b.EarliestBatchExpiresAt != nil && b.EarliestBatchExpiresAt.After(now)
+		if aExpFuture && bExpFuture && !a.EarliestBatchExpiresAt.Equal(*b.EarliestBatchExpiresAt) {
+			return a.EarliestBatchExpiresAt.Before(*b.EarliestBatchExpiresAt)
+		}
+		if aExpFuture != bExpFuture {
+			if aExpFuture && b.ExpiringSoonCU <= 0 {
+				return true
+			}
+			if bExpFuture && a.ExpiringSoonCU <= 0 {
+				return false
+			}
+		}
+	}
+	scoreA := wasteZeroScore(a, spec, actA, now)
+	scoreB := wasteZeroScore(b, spec, actB, now)
+	if math.Abs(scoreA-scoreB) > 1e-6 {
+		return scoreA > scoreB
+	}
+	if actA != actB {
+		return actA < actB
+	}
+	if a.Priority != b.Priority {
+		return a.Priority > b.Priority
+	}
+	return a.ID < b.ID
 }
 
 // wasteZeroScore assigns higher urgency to:
@@ -817,12 +1058,39 @@ func parseHHMM(s string) (int, bool) {
 	return h*60 + m, true
 }
 
+func parseNonInteractiveProviderSelector(selector string) (models.ProviderType, bool) {
+	lower := strings.ToLower(strings.TrimSpace(selector))
+	if !strings.HasPrefix(lower, "provider:") {
+		return "", false
+	}
+	want := strings.TrimSpace(strings.TrimPrefix(lower, "provider:"))
+	if want == "" {
+		return "", false
+	}
+	norm := models.NormalizeProviderType(want)
+	if norm == models.ProviderColab {
+		return "", false
+	}
+	return norm, true
+}
+
 func matchesAccountSelector(acc *models.Account, selector string) bool {
 	sel := strings.TrimSpace(selector)
 	if sel == "" || strings.EqualFold(sel, "all") {
 		return true
 	}
 	lower := strings.ToLower(sel)
+	if strings.HasPrefix(lower, "provider:") {
+		want := strings.TrimSpace(strings.TrimPrefix(lower, "provider:"))
+		if want == "" {
+			return false
+		}
+		return acc.EffectiveProvider() == models.NormalizeProviderType(want)
+	}
+	if strings.HasPrefix(lower, "id:") {
+		want := strings.TrimSpace(sel[3:])
+		return want != "" && acc.ID == want
+	}
 	if strings.HasPrefix(lower, "tag:") {
 		want := strings.TrimPrefix(lower, "tag:")
 		for _, t := range acc.Tags {

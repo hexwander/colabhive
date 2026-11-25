@@ -1009,6 +1009,11 @@ func (e *Engine) LaunchShardedExperiment(
 	}
 
 	strategy := req.Strategy
+	if strategy == "" && e.rtr != nil {
+		if pol, pErr := e.rtr.GetPolicy(ctx); pErr == nil && pol != nil && pol.DefaultStrategy != "" {
+			strategy = pol.DefaultStrategy
+		}
+	}
 	if strategy == "" {
 		strategy = models.StrategyWasteZero
 	}

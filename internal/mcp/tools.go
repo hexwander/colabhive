@@ -104,7 +104,7 @@ func (s *Server) registerAllTools() {
 				"accelerator":   map[string]any{"type": "string", "enum": []string{"G4", "H100", "A100", "L4", "T4", "V6E1", "V5E1", "CPU"}, "default": "G4"},
 				"gpu":           map[string]any{"type": "string", "enum": []string{"G4", "H100", "A100", "L4", "T4"}},
 				"high_mem":      map[string]any{"type": "boolean", "default": true},
-				"strategy":      map[string]any{"type": "string", "enum": []string{"waste-zero", "max-balance", "sticky-session", "round-robin", "free-opportunistic"}},
+				"strategy":      map[string]any{"type": "string", "enum": []string{"free-first", "waste-zero", "max-balance", "sticky-session", "round-robin", "free-opportunistic"}},
 				"account":       map[string]any{"type": "string", "description": "Optional account ID, email, or tag:<name>."},
 				"auto_fallback": map[string]any{"type": "boolean", "default": true},
 			},
@@ -347,13 +347,13 @@ func (s *Server) registerAllTools() {
 
 	s.registerTool(ToolDefinition{
 		Name:        "colab_exec",
-		Description: "Execute Python code or a local `.py`/`.ipynb` file on a named Colab session with optional env vars.",
+		Description: "Execute Python code (or a local `.py`/`.ipynb` file over local stdio / loopback trusted workspace) on a named Colab session with optional env vars. Over HTTP/API-key MCP, pass inline 'code'.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"session":     map[string]any{"type": "string"},
-				"code":        map[string]any{"type": "string"},
-				"local_file":  map[string]any{"type": "string"},
+				"code":        map[string]any{"type": "string", "description": "Inline Python/IPython code to execute (recommended over HTTP/API-key MCP)."},
+				"local_file":  map[string]any{"type": "string", "description": "Host .py/.ipynb file path (local keyless stdio or 127.0.0.1 --mcp-trusted-workspace only; omit over remote/API-key MCP)."},
 				"env":         map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
 				"timeout_sec": map[string]any{"type": "number", "default": 120},
 			},
@@ -363,15 +363,15 @@ func (s *Server) registerAllTools() {
 
 	s.registerTool(ToolDefinition{
 		Name:        "colab_file_upload",
-		Description: "Upload inline content/base64 (or a local file over local stdio) to `/content/...` on a Colab VM.",
+		Description: "Upload inline 'content'/'content_base64' (recommended over HTTP/API-key MCP) or a local file (local stdio / loopback trusted workspace only) to `/content/...` on a Colab VM.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"session":        map[string]any{"type": "string"},
-				"local_path":     map[string]any{"type": "string"},
+				"local_path":     map[string]any{"type": "string", "description": "Host file path (local keyless stdio or 127.0.0.1 --mcp-trusted-workspace only; omit and pass content/content_base64 over remote/API-key MCP)."},
 				"remote_path":    map[string]any{"type": "string"},
-				"content":        map[string]any{"type": "string", "description": "Optional inline UTF-8 content when local_path is omitted."},
-				"content_base64": map[string]any{"type": "string", "description": "Optional base64 bytes when local_path is omitted."},
+				"content":        map[string]any{"type": "string", "description": "Inline UTF-8 file content (preferred over HTTP/API-key MCP)."},
+				"content_base64": map[string]any{"type": "string", "description": "Inline base64-encoded binary file bytes (preferred for binary uploads over HTTP/API-key MCP)."},
 			},
 			"required": []string{"remote_path"},
 		},
@@ -379,13 +379,13 @@ func (s *Server) registerAllTools() {
 
 	s.registerTool(ToolDefinition{
 		Name:        "colab_file_download",
-		Description: "Download a remote file from `/content/...` on a Colab VM.",
+		Description: "Download a remote file from `/content/...` on a Colab VM. Omit 'local_path' over HTTP/API-key MCP to receive file bytes inline (content_preview + content_base64).",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"session":     map[string]any{"type": "string"},
 				"remote_path": map[string]any{"type": "string"},
-				"local_path":  map[string]any{"type": "string"},
+				"local_path":  map[string]any{"type": "string", "description": "Optional host save path (local keyless stdio or 127.0.0.1 --mcp-trusted-workspace only; omit over remote/API-key MCP to receive bytes inline)."},
 			},
 			"required": []string{"remote_path"},
 		},
@@ -430,14 +430,14 @@ func (s *Server) registerAllTools() {
 
 	s.registerTool(ToolDefinition{
 		Name:        "colab_install_packages",
-		Description: "Install Python packages on a Colab VM via fast `uv pip install --system`.",
+		Description: "Install Python packages on a Colab VM via fast `uv pip install --system`. Over HTTP/API-key MCP, pass 'packages' or inline 'requirements_txt'.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"session":           map[string]any{"type": "string"},
 				"packages":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"requirements_path": map[string]any{"type": "string"},
-				"requirements_txt":  map[string]any{"type": "string"},
+				"requirements_path": map[string]any{"type": "string", "description": "Host requirements.txt path (local keyless stdio or 127.0.0.1 --mcp-trusted-workspace only; use requirements_txt over remote/API-key MCP)."},
+				"requirements_txt":  map[string]any{"type": "string", "description": "Inline requirements.txt content or remote /content/... path."},
 			},
 		},
 	}, s.toolInstallPackages)
@@ -471,14 +471,14 @@ func (s *Server) registerAllTools() {
 
 	s.registerTool(ToolDefinition{
 		Name:        "experiment_launch_sharded",
-		Description: "Allocate K parallel GPU VMs across pooled accounts, upload scripts/files, inject COLABHIVE_SHARD_ID=0..K-1, and attach anti-zombie watchdogs.",
+		Description: "Allocate K parallel GPU VMs across pooled accounts, upload scripts/files, inject COLABHIVE_SHARD_ID=0..K-1, and attach anti-zombie watchdogs. Over HTTP/API-key MCP, pass inline 'script_code' and inline 'upload_files[].content'/'content_base64'.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"experiment_id":         map[string]any{"type": "string"},
 				"title":                 map[string]any{"type": "string"},
-				"script_path":           map[string]any{"type": "string"},
-				"script_code":           map[string]any{"type": "string"},
+				"script_path":           map[string]any{"type": "string", "description": "Host script path (local keyless stdio or 127.0.0.1 --mcp-trusted-workspace only; use script_code over remote/API-key MCP)."},
+				"script_code":           map[string]any{"type": "string", "description": "Inline Python script source (recommended over HTTP/API-key MCP)."},
 				"script_args":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 				"upload_files":          map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 				"packages":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
@@ -486,7 +486,7 @@ func (s *Server) registerAllTools() {
 				"high_mem":              map[string]any{"type": "boolean", "default": true},
 				"num_shards":            map[string]any{"type": "integer", "default": 4},
 				"strategy":              map[string]any{"type": "string", "default": "waste-zero"},
-				"local_output_dir":      map[string]any{"type": "string"},
+				"local_output_dir":      map[string]any{"type": "string", "description": "Optional host output dir (local keyless stdio or 127.0.0.1 --mcp-trusted-workspace only)."},
 				"auto_stop_on_complete": map[string]any{"type": "boolean", "default": true},
 				"env":                   map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
 			},
@@ -1422,9 +1422,30 @@ func (s *Server) toolExecuteCode(ctx context.Context, cctx callContext, args map
 }
 
 func (s *Server) toolColabExec(ctx context.Context, cctx callContext, args map[string]any) (*CallToolResult, traceSummary, error) {
+	const blockedMsg = "host filesystem 'local_file' is not permitted over remote or API-key MCP; pass inline 'code' instead"
 	localFile := strings.TrimSpace(argStr(args, "local_file"))
-	if localFile != "" && !s.canAccessHostFS(cctx) {
-		return nil, traceSummary{}, errors.New("host filesystem 'local_file' is not permitted over remote or API-key MCP; pass inline 'code' instead")
+	code := argStr(args, "code")
+	execLocalPath := localFile
+	if localFile != "" {
+		switch s.hostFSAccessMode(cctx) {
+		case hostFSBlocked:
+			return nil, traceSummary{}, errors.New(blockedMsg)
+		case hostFSTrustedWorkspace:
+			raw, _, rErr := s.readHostFile(cctx, localFile, blockedMsg)
+			if rErr != nil {
+				return nil, traceSummary{}, rErr
+			}
+			loadedCode, pErr := parseScriptOrNotebookBytes(raw, localFile)
+			if pErr != nil {
+				return nil, traceSummary{}, pErr
+			}
+			if code == "" {
+				code = loadedCode
+			} else {
+				code = loadedCode + "\n" + code
+			}
+			execLocalPath = ""
+		}
 	}
 	sid, err := s.resolveTargetSessionID(ctx, cctx, args)
 	if err != nil {
@@ -1433,8 +1454,8 @@ func (s *Server) toolColabExec(ctx context.Context, cctx callContext, args map[s
 	envMap := argStringMap(args, "env")
 	res, err := s.runtime.ExecuteCode(ctx, models.KernelExecRequest{
 		SessionID:       sid,
-		Code:            argStr(args, "code"),
-		LocalFilePath:   localFile,
+		Code:            code,
+		LocalFilePath:   execLocalPath,
 		Env:             envMap,
 		IdleTimeoutSec:  argFloat(args, "timeout_sec", 120),
 		StoreHistory:    true,
@@ -1642,9 +1663,12 @@ func (s *Server) toolKernelInterrupt(ctx context.Context, cctx callContext, args
 }
 
 func (s *Server) toolFileUpload(ctx context.Context, cctx callContext, args map[string]any) (*CallToolResult, traceSummary, error) {
+	const blockedMsg = "host filesystem 'local_path' is not permitted over remote or API-key MCP; pass inline 'content' or 'content_base64' instead"
 	localPath := strings.TrimSpace(argStr(args, "local_path"))
-	if localPath != "" && !s.canAccessHostFS(cctx) {
-		return nil, traceSummary{}, errors.New("host filesystem 'local_path' is not permitted over remote or API-key MCP; pass inline 'content' or 'content_base64' instead")
+	if localPath != "" {
+		if err := s.validateHostPathAccess(cctx, localPath, false, blockedMsg); err != nil {
+			return nil, traceSummary{}, err
+		}
 	}
 	sid, err := s.resolveTargetSessionID(ctx, cctx, args)
 	if err != nil {
@@ -1669,12 +1693,12 @@ func (s *Server) toolFileUpload(ctx context.Context, cctx callContext, args map[
 	}
 	if data == nil {
 		if localPath != "" {
-			data, err = os.ReadFile(localPath)
+			data, _, err = s.readHostFile(cctx, localPath, blockedMsg)
 			if err != nil {
 				return nil, traceSummary{sessionID: sid}, err
 			}
 		} else {
-			return nil, traceSummary{sessionID: sid}, errors.New("supply content or content_base64 (or local_path over local stdio)")
+			return nil, traceSummary{sessionID: sid}, errors.New("supply content or content_base64 (or local_path over local stdio / loopback trusted workspace)")
 		}
 	}
 
@@ -1689,9 +1713,12 @@ func (s *Server) toolFileUpload(ctx context.Context, cctx callContext, args map[
 }
 
 func (s *Server) toolFileDownload(ctx context.Context, cctx callContext, args map[string]any) (*CallToolResult, traceSummary, error) {
+	const blockedMsg = "host filesystem 'local_path' is not permitted over remote or API-key MCP; omit 'local_path' to receive file bytes inline"
 	localPath := strings.TrimSpace(argStr(args, "local_path"))
-	if localPath != "" && !s.canAccessHostFS(cctx) {
-		return nil, traceSummary{}, errors.New("host filesystem 'local_path' is not permitted over remote or API-key MCP; omit 'local_path' to receive file bytes inline")
+	if localPath != "" {
+		if err := s.validateHostPathAccess(cctx, localPath, false, blockedMsg); err != nil {
+			return nil, traceSummary{}, err
+		}
 	}
 	sid, err := s.resolveTargetSessionID(ctx, cctx, args)
 	if err != nil {
@@ -1702,18 +1729,17 @@ func (s *Server) toolFileDownload(ctx context.Context, cctx callContext, args ma
 	if err != nil {
 		return nil, traceSummary{sessionID: sid}, err
 	}
+	writtenPath := localPath
 	if localPath != "" {
-		if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
-			return nil, traceSummary{sessionID: sid}, err
-		}
-		if err := os.WriteFile(localPath, data, 0o644); err != nil {
+		writtenPath, err = s.writeHostFile(cctx, localPath, data, blockedMsg)
+		if err != nil {
 			return nil, traceSummary{sessionID: sid}, err
 		}
 	}
 	resp := map[string]any{
 		"downloaded":  true,
 		"remote_path": remotePath,
-		"local_path":  localPath,
+		"local_path":  writtenPath,
 		"bytes":       len(data),
 	}
 	if localPath == "" {
@@ -1756,9 +1782,12 @@ func (s *Server) toolFileRemove(ctx context.Context, cctx callContext, args map[
 }
 
 func (s *Server) toolInstallPackages(ctx context.Context, cctx callContext, args map[string]any) (*CallToolResult, traceSummary, error) {
+	const blockedMsg = "host filesystem 'requirements_path' is not permitted over remote or API-key MCP; pass 'requirements_txt' or 'packages' instead"
 	reqPath := strings.TrimSpace(argStr(args, "requirements_path"))
-	if reqPath != "" && !s.canAccessHostFS(cctx) {
-		return nil, traceSummary{}, errors.New("host filesystem 'requirements_path' is not permitted over remote or API-key MCP; pass 'requirements_txt' or 'packages' instead")
+	if reqPath != "" {
+		if err := s.validateHostPathAccess(cctx, reqPath, false, blockedMsg); err != nil {
+			return nil, traceSummary{}, err
+		}
 	}
 	sid, err := s.resolveTargetSessionID(ctx, cctx, args)
 	if err != nil {
@@ -1767,7 +1796,7 @@ func (s *Server) toolInstallPackages(ctx context.Context, cctx callContext, args
 	pkgs := argStringSlice(args, "packages")
 	reqTxt := argStr(args, "requirements_txt")
 	if reqTxt == "" && reqPath != "" {
-		raw, rErr := os.ReadFile(reqPath)
+		raw, _, rErr := s.readHostFile(cctx, reqPath, blockedMsg)
 		if rErr != nil {
 			return nil, traceSummary{sessionID: sid}, rErr
 		}
@@ -1825,18 +1854,36 @@ func (s *Server) toolExperimentLaunchSharded(ctx context.Context, cctx callConte
 		}
 	}
 
-	hostAllowed := s.canAccessHostFS(cctx)
+	fsMode := s.hostFSAccessMode(cctx)
 	scriptPath := strings.TrimSpace(argStr(args, "script_path"))
 	scriptCode := argStr(args, "script_code")
 	localOutDir := strings.TrimSpace(argStr(args, "local_output_dir"))
 
-	if !hostAllowed {
-		if scriptPath != "" {
-			return nil, traceSummary{}, errors.New("host filesystem 'script_path' is not permitted over remote or API-key MCP; pass inline 'script_code' instead")
+	const blockedScriptMsg = "host filesystem 'script_path' is not permitted over remote or API-key MCP; pass inline 'script_code' instead"
+	const blockedOutDirMsg = "host filesystem 'local_output_dir' is not permitted over remote or API-key MCP"
+	const blockedUploadMsg = "host filesystem 'upload_files[].local_path' is not permitted over remote or API-key MCP; pass inline 'content' or 'content_base64'"
+
+	if scriptPath != "" {
+		switch fsMode {
+		case hostFSBlocked:
+			return nil, traceSummary{}, errors.New(blockedScriptMsg)
+		case hostFSTrustedWorkspace:
+			raw, _, rErr := s.readHostFile(cctx, scriptPath, blockedScriptMsg)
+			if rErr != nil {
+				return nil, traceSummary{}, rErr
+			}
+			if scriptCode == "" {
+				scriptCode = string(raw)
+			}
+			scriptPath = ""
 		}
-		if localOutDir != "" {
-			return nil, traceSummary{}, errors.New("host filesystem 'local_output_dir' is not permitted over remote or API-key MCP")
+	}
+	if localOutDir != "" {
+		preparedOutDir, pErr := s.prepareHostOutputDir(cctx, localOutDir, blockedOutDirMsg)
+		if pErr != nil {
+			return nil, traceSummary{}, pErr
 		}
+		localOutDir = preparedOutDir
 	}
 
 	accel, err := models.NormalizeAccelerator(firstStr(argStr(args, "gpu"), argStr(args, "accelerator"), "G4"))
@@ -1863,20 +1910,36 @@ func (s *Server) toolExperimentLaunchSharded(ctx context.Context, cctx callConte
 			b64 := firstStr(argStr(m, "content_base64"), argStr(m, "content_b64"))
 			inlineTxt, hasInlineTxt := m["content"].(string)
 
-			if !hostAllowed && lp != "" {
-				return nil, traceSummary{}, errors.New("host filesystem 'upload_files[].local_path' is not permitted over remote or API-key MCP; pass inline 'content' or 'content_base64'")
-			}
-
 			var inlineBytes []byte
 			hasInline := false
-			if b64 != "" {
+			if lp != "" {
+				switch fsMode {
+				case hostFSBlocked:
+					return nil, traceSummary{}, errors.New(blockedUploadMsg)
+				case hostFSTrustedWorkspace:
+					if b64 == "" && !hasInlineTxt {
+						raw, _, rErr := s.readHostFile(cctx, lp, blockedUploadMsg)
+						if rErr != nil {
+							return nil, traceSummary{}, rErr
+						}
+						inlineBytes = raw
+						b64 = base64.StdEncoding.EncodeToString(raw)
+						hasInline = true
+					} else if err := s.validateHostPathAccess(cctx, lp, false, blockedUploadMsg); err != nil {
+						return nil, traceSummary{}, err
+					}
+					lp = ""
+				}
+			}
+
+			if !hasInline && b64 != "" {
 				decoded, dErr := base64.StdEncoding.DecodeString(b64)
 				if dErr != nil {
 					return nil, traceSummary{}, fmt.Errorf("invalid upload_files[%d].content_base64: %w", idx, dErr)
 				}
 				inlineBytes = decoded
 				hasInline = true
-			} else if hasInlineTxt {
+			} else if !hasInline && hasInlineTxt {
 				inlineBytes = []byte(inlineTxt)
 				b64 = base64.StdEncoding.EncodeToString(inlineBytes)
 				hasInline = true
@@ -1919,7 +1982,7 @@ func (s *Server) toolExperimentLaunchSharded(ctx context.Context, cctx callConte
 		Accelerator:          accel,
 		HighMem:              argBool(args, "high_mem", true),
 		NumShards:            int(argFloat(args, "num_shards", 4)),
-		Strategy:             models.RoutingStrategy(firstStr(argStr(args, "strategy"), string(cctx.defaultStrategy), "waste-zero")),
+		Strategy:             models.RoutingStrategy(firstStr(argStr(args, "strategy"), string(cctx.defaultStrategy))),
 		RemoteCheckpointGlob: argStr(args, "remote_checkpoint_glob"),
 		LocalOutputDir:       localOutDir,
 		AutoStopOnComplete:   argBool(args, "auto_stop_on_complete", true),

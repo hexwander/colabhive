@@ -2,9 +2,12 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"math"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -89,22 +92,7 @@ func TestSQLiteStoreFullLifecycleAndSecrets(t *testing.T) {
 		t.Fatalf("GetProxy unexpected bound count or URL: %+v (%v)", loadedPrx, err)
 	}
 
-	// 3. Invites CRUD
-	inv := &models.ContributorInvite{
-		Code:           "ch_inv_lab2026",
-		PoolTitle:      "ICML Cluster",
-		MaintainerName: "Dr. Lin",
-		MaxUses:        10,
-	}
-	if err := st.SaveInvite(ctx, inv); err != nil {
-		t.Fatalf("SaveInvite: %v", err)
-	}
-	gotInv, err := st.GetInvite(ctx, inv.Code)
-	if err != nil || gotInv.PoolTitle != "ICML Cluster" {
-		t.Fatalf("GetInvite failed: %+v (%v)", gotInv, err)
-	}
-
-	// 4. Runtime Sessions (preserving ProxyToken json:"-")
+	// 3. Runtime Sessions (preserving ProxyToken json:"-")
 	sess := &models.RuntimeSession{
 		ID:          "sess_g4_01",
 		Name:        "eval_g4_0",
@@ -325,5 +313,217 @@ func TestConcurrentOpenSQLiteAndTerminalSessionGuard(t *testing.T) {
 	got, err := st.GetSession(ctx, "sess_terminal_guard")
 	if err != nil || got.Status != models.SessionStopped {
 		t.Fatalf("expected STOPPED session to resist stale IDLE resurrection, got %+v (%v)", got, err)
+	}
+}
+
+func TestEncryptedProviderSecretRoundTripAndDefaultProvider(t *testing.T) {
+	ctx := context.Background()
+	dbFile := filepath.Join(t.TempDir(), "provider_secret.db")
+	st, err := OpenSQLite(dbFile)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+
+	legacyExtAcc := &models.Account{
+		ID:                      "acc_legacy_secret_1",
+		Email:                   "alice@legacy.pool",
+		Alias:                   "Legacy · alice",
+		Provider:                models.ProviderType("legacy_external"),
+		ProviderMeta:            &models.ProviderAccountMeta{Username: "alice"},
+		SubscriptionTier:        models.TierFree,
+		Health:                  models.HealthHealthy,
+		Enabled:                 true,
+		IsContributor:           true,
+		ReceiptTokenHash:        "sha256_legacy_rcpt_hash_1",
+		EncryptedProviderSecret: "v1:aes_gcm_sealed_legacy_secret_payload",
+	}
+	if err := st.SaveAccount(ctx, legacyExtAcc); err != nil {
+		t.Fatalf("SaveAccount(legacyExt): %v", err)
+	}
+
+	legacyColab := &models.Account{
+		ID:                    "acc_legacy_empty_provider",
+		Email:                 "owner.colab@gmail.com",
+		SubscriptionTier:      models.TierPro,
+		Health:                models.HealthHealthy,
+		Enabled:               true,
+		EncryptedRefreshToken: "v1:colab_refresh_tok",
+	}
+	if err := st.SaveAccount(ctx, legacyColab); err != nil {
+		t.Fatalf("SaveAccount(legacyColab): %v", err)
+	}
+
+	// Verify JSON serialization NEVER leaks EncryptedProviderSecret.
+	wireBytes, err := json.Marshal(legacyExtAcc)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if strings.Contains(string(wireBytes), "aes_gcm_sealed_legacy_secret_payload") {
+		t.Fatalf("EncryptedProviderSecret leaked in JSON payload: %s", string(wireBytes))
+	}
+
+	// Verify round-trip across GetAccount, GetAccountByEmail, GetAccountByReceiptHash, and ListAccounts.
+	byID, err := st.GetAccount(ctx, legacyExtAcc.ID)
+	if err != nil {
+		t.Fatalf("GetAccount: %v", err)
+	}
+	if byID.EncryptedProviderSecret != "v1:aes_gcm_sealed_legacy_secret_payload" || byID.Provider != models.ProviderType("legacy_external") {
+		t.Fatalf("GetAccount mismatch: secret=%q provider=%q", byID.EncryptedProviderSecret, byID.Provider)
+	}
+
+	byEmail, err := st.GetAccountByEmail(ctx, "ALICE@LEGACY.POOL")
+	if err != nil {
+		t.Fatalf("GetAccountByEmail: %v", err)
+	}
+	if byEmail.EncryptedProviderSecret != "v1:aes_gcm_sealed_legacy_secret_payload" || byEmail.Provider != models.ProviderType("legacy_external") {
+		t.Fatalf("GetAccountByEmail mismatch: secret=%q provider=%q", byEmail.EncryptedProviderSecret, byEmail.Provider)
+	}
+
+	byReceipt, err := st.GetAccountByReceiptHash(ctx, "sha256_legacy_rcpt_hash_1")
+	if err != nil {
+		t.Fatalf("GetAccountByReceiptHash: %v", err)
+	}
+	if byReceipt.EncryptedProviderSecret != "v1:aes_gcm_sealed_legacy_secret_payload" || byReceipt.Provider != models.ProviderType("legacy_external") {
+		t.Fatalf("GetAccountByReceiptHash mismatch: secret=%q provider=%q", byReceipt.EncryptedProviderSecret, byReceipt.Provider)
+	}
+
+	all, err := st.ListAccounts(ctx)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("ListAccounts expected 2 accounts, got %d (%v)", len(all), err)
+	}
+	foundLegacyExt := false
+	foundColab := false
+	for _, a := range all {
+		switch a.ID {
+		case legacyExtAcc.ID:
+			foundLegacyExt = true
+			if a.EncryptedProviderSecret != "v1:aes_gcm_sealed_legacy_secret_payload" || a.Provider != models.ProviderType("legacy_external") {
+				t.Fatalf("ListAccounts legacyExt mismatch: secret=%q provider=%q", a.EncryptedProviderSecret, a.Provider)
+			}
+		case legacyColab.ID:
+			foundColab = true
+			if a.Provider != models.ProviderColab {
+				t.Fatalf("expected empty Provider to default to %q, got %q", models.ProviderColab, a.Provider)
+			}
+		}
+	}
+	if !foundLegacyExt || !foundColab {
+		t.Fatalf("missing expected accounts in ListAccounts: legacyExt=%v colab=%v", foundLegacyExt, foundColab)
+	}
+}
+
+func TestLegacySQLiteProdDBMigrationPreservesExistingAccounts(t *testing.T) {
+	ctx := context.Background()
+	dbFile := filepath.Join(t.TempDir(), "legacy_colabhive_prod.db")
+
+	// 1. Construct a pre-v1.1 SQLite schema (version 1 WITHOUT encrypted_provider_secret column).
+	rawDB, err := sql.Open("sqlite", dbFile)
+	if err != nil {
+		t.Fatalf("sql.Open legacy db: %v", err)
+	}
+	legacyDDL := []string{
+		`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);`,
+		`INSERT INTO schema_migrations (version, applied_at) VALUES (1, '2026-06-01T00:00:00Z');`,
+		`CREATE TABLE proxies (id TEXT PRIMARY KEY, name TEXT NOT NULL, protocol TEXT NOT NULL, url TEXT NOT NULL, created_at TEXT NOT NULL, payload_json TEXT NOT NULL);`,
+		`CREATE TABLE accounts (
+			id TEXT PRIMARY KEY,
+			email TEXT NOT NULL,
+			subscription_tier TEXT NOT NULL,
+			health TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			priority INTEGER NOT NULL DEFAULT 0,
+			proxy_id TEXT NOT NULL DEFAULT '',
+			is_contributor INTEGER NOT NULL DEFAULT 0,
+			invite_code TEXT NOT NULL DEFAULT '',
+			encrypted_refresh_token TEXT NOT NULL DEFAULT '',
+			encrypted_access_token TEXT NOT NULL DEFAULT '',
+			oauth_client_id TEXT NOT NULL DEFAULT '',
+			oauth_client_secret TEXT NOT NULL DEFAULT '',
+			receipt_token_hash TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			payload_json TEXT NOT NULL
+		);`,
+		`CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, account_id TEXT NOT NULL, experiment_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, proxy_token TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL);`,
+		`CREATE TABLE experiments (id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL);`,
+		`INSERT INTO accounts (
+			id, email, subscription_tier, health, enabled, priority,
+			encrypted_refresh_token, encrypted_access_token, receipt_token_hash,
+			created_at, updated_at, payload_json
+		) VALUES (
+			'acc_prod_colab_1',
+			'legacy.owner@gmail.com',
+			'AI_ULTRA',
+			'HEALTHY',
+			1,
+			100,
+			'v1:legacy_refresh_token',
+			'v1:legacy_access_token',
+			'legacy_rcpt_hash',
+			'2026-06-01T00:00:00Z',
+			'2026-06-01T00:00:00Z',
+			'{"id":"acc_prod_colab_1","email":"legacy.owner@gmail.com","subscription_tier":"AI_ULTRA","health":"HEALTHY","enabled":true,"paid_cu_balance":2500}'
+		);`,
+	}
+	for _, stmt := range legacyDDL {
+		if _, eErr := rawDB.ExecContext(ctx, stmt); eErr != nil {
+			_ = rawDB.Close()
+			t.Fatalf("exec legacy DDL failed: %v", eErr)
+		}
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close legacy rawDB: %v", err)
+	}
+
+	// 2. Open with OpenSQLite -> idempotent migration adds encrypted_provider_secret without touching existing rows.
+	st, err := OpenSQLite(dbFile)
+	if err != nil {
+		t.Fatalf("OpenSQLite on legacy v1 db failed: %v", err)
+	}
+
+	legacyAcc, err := st.GetAccount(ctx, "acc_prod_colab_1")
+	if err != nil {
+		_ = st.Close()
+		t.Fatalf("GetAccount(legacy): %v", err)
+	}
+	if legacyAcc.EncryptedRefreshToken != "v1:legacy_refresh_token" || legacyAcc.PaidCUBalance != 2500 {
+		_ = st.Close()
+		t.Fatalf("legacy account fields corrupted during migration: %+v", legacyAcc)
+	}
+	if legacyAcc.Provider != models.ProviderColab || legacyAcc.EffectiveProvider() != models.ProviderColab {
+		_ = st.Close()
+		t.Fatalf("expected legacy account Provider=%q, got %q", models.ProviderColab, legacyAcc.Provider)
+	}
+	if legacyAcc.EncryptedProviderSecret != "" {
+		_ = st.Close()
+		t.Fatalf("expected empty EncryptedProviderSecret on legacy row, got %q", legacyAcc.EncryptedProviderSecret)
+	}
+
+	// 3. Save a second account on the upgraded DB and re-open to verify migration idempotency.
+	newAcc := &models.Account{
+		ID:                      "acc_colab_migrated",
+		Email:                   "ops@gmail.com",
+		Provider:                models.ProviderColab,
+		SubscriptionTier:        models.TierPAYG,
+		Health:                  models.HealthHealthy,
+		Enabled:                 true,
+		EncryptedProviderSecret: "v1:sealed_secret_compat",
+	}
+	if err := st.SaveAccount(ctx, newAcc); err != nil {
+		_ = st.Close()
+		t.Fatalf("SaveAccount(newAcc) after migration: %v", err)
+	}
+	_ = st.Close()
+
+	st2, err := OpenSQLite(dbFile)
+	if err != nil {
+		t.Fatalf("second idempotent OpenSQLite failed: %v", err)
+	}
+	defer st2.Close()
+
+	reloadedAcc, err := st2.GetAccount(ctx, "acc_colab_migrated")
+	if err != nil || reloadedAcc.EncryptedProviderSecret != "v1:sealed_secret_compat" || reloadedAcc.Provider != models.ProviderColab {
+		t.Fatalf("reloaded migrated account mismatch: %+v (%v)", reloadedAcc, err)
 	}
 }

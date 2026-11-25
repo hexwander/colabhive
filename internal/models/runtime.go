@@ -1,6 +1,13 @@
 package models
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+// ErrSessionNotFound is the canonical sentinel returned ONLY when a requested runtime session
+// definitively does not exist (never for database I/O outages or account lookup failures).
+var ErrSessionNotFound = errors.New("runtime session not found")
 
 // SessionStatus represents the lifecycle state of a Colab RuntimeSession.
 type SessionStatus string
@@ -110,22 +117,24 @@ type KernelExecResult struct {
 
 // KernelExecRequest describes a Python/IPython cell execution against a Colab runtime.
 type KernelExecRequest struct {
-	SessionID          string            `json:"session_id"`
-	Code               string            `json:"code"`
-	LocalFilePath      string            `json:"local_file_path,omitempty"`
-	Env                map[string]string `json:"env,omitempty"`
-	IdleTimeoutSec     float64           `json:"idle_timeout_sec"` // 0 = unlimited
-	Silent             bool              `json:"silent,omitempty"`
-	StoreHistory       bool              `json:"store_history"`
-	AllowStdin         bool              `json:"allow_stdin,omitempty"`
-	InlineImages       bool              `json:"inline_images,omitempty"`
-	AutoProvisionGPU   AcceleratorType   `json:"auto_provision_gpu,omitempty"`
-	StickyKey          string            `json:"sticky_key,omitempty"`
-	CallerName         string            `json:"caller_name,omitempty"`
-	APIKeyID           string            `json:"api_key_id,omitempty"`
-	Strategy           RoutingStrategy   `json:"strategy,omitempty"`
-	AccountSelector    string            `json:"account_selector,omitempty"`
-	ExcludedAccountIDs []string          `json:"excluded_account_ids,omitempty"`
+	SessionID               string             `json:"session_id"`
+	Code                    string             `json:"code"`
+	LocalFilePath           string             `json:"local_file_path,omitempty"`
+	Env                     map[string]string  `json:"env,omitempty"`
+	IdleTimeoutSec          float64            `json:"idle_timeout_sec"` // 0 = unlimited
+	Silent                  bool               `json:"silent,omitempty"`
+	StoreHistory            bool               `json:"store_history"`
+	AllowStdin              bool               `json:"allow_stdin,omitempty"`
+	InlineImages            bool               `json:"inline_images,omitempty"`
+	AutoProvisionGPU        AcceleratorType    `json:"auto_provision_gpu,omitempty"`
+	StickyKey               string             `json:"sticky_key,omitempty"`
+	CallerName              string             `json:"caller_name,omitempty"`
+	APIKeyID                string             `json:"api_key_id,omitempty"`
+	Strategy                RoutingStrategy    `json:"strategy,omitempty"`
+	AccountSelector         string             `json:"account_selector,omitempty"`
+	ExcludedAccountIDs      []string           `json:"excluded_account_ids,omitempty"`
+	SuppressOutputBroadcast bool               `json:"-"`
+	OnStdout                func(chunk string) `json:"-"`
 }
 
 // NotebookCell backs ColabHive's headless virtual `.ipynb` notebook for `googlecolab/colab-mcp` tools.
@@ -211,8 +220,9 @@ type SessionAllocRequest struct {
 	StickyKey            string            `json:"sticky_key,omitempty"`
 	APIKeyID             string            `json:"api_key_id,omitempty"`
 	CallerName           string            `json:"caller_name,omitempty"`
-	ExperimentID         string            `json:"experiment_id,omitempty"`
-	ShardIndex           *int              `json:"shard_index,omitempty"`
+	ExperimentID         string                        `json:"experiment_id,omitempty"`
+	ShardIndex           *int                          `json:"shard_index,omitempty"`
+	OnProgress           func(stepEn, stepZh string)   `json:"-"`
 }
 
 // SessionFilter filters active/historical RuntimeSessions.

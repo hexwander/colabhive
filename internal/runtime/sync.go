@@ -85,6 +85,9 @@ func (e *Engine) SyncRemoteAssignments(ctx context.Context) (*models.SessionSync
 		if acc == nil || !acc.Enabled || acc.Health == models.HealthRevokedByUser {
 			continue
 		}
+		if acc.EffectiveProvider() != models.ProviderColab {
+			continue
+		}
 		if e.isDemoSession(acc, nil) {
 			continue
 		}

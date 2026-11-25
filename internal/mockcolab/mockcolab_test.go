@@ -254,12 +254,6 @@ func TestSeedDemoClusterIdempotency(t *testing.T) {
 		t.Fatalf("unexpected seeded cluster: %+v", seeded)
 	}
 
-	// Verify contributor demo receipt works immediately via GetContributionByReceipt
-	rcptStatus, err := poolSvc.GetContributionByReceipt(ctx, seeded.DemoReceiptToken)
-	if err != nil || rcptStatus.Guardrails.MinReserveCU != 50.0 {
-		t.Fatalf("GetContributionByReceipt on demo cluster failed: %+v (%v)", rcptStatus, err)
-	}
-
 	// Second call must be idempotent
 	seeded2, err := mockcolab.SeedDemoCluster(ctx, st, poolSvc, srv)
 	if err != nil || len(seeded2.Accounts) != 4 {

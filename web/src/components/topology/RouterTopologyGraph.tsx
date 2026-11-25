@@ -19,6 +19,7 @@ import {
 } from '../../types';
 import { formatHours } from '../../lib/api';
 import { useI18n } from '../../i18n';
+import { getFriendlySessionDisplay } from '../../lib/sessionLabels';
 import { AnimatedNumber, CircularQuotaRing, LayeredCard, StatusPill, cn } from '../ui';
 import { STRATEGY_METADATA } from '../terminal/workbenchMockData';
 
@@ -246,19 +247,18 @@ export function RouterTopologyGraph({
       }
     }
 
-    return Array.from(map.values()).slice(0, 5);
+    return Array.from(map.values());
   }, [bindings, traces, sessions]);
 
-  // Stage 3: cloud GPU instances (live active sessions + binding stubs)
+  // Stage 3: cloud GPU instances (ALL live active sessions + binding stubs — never silently capped at 5)
   const topologySessions = useMemo(() => {
     const byId = new Map<string, RuntimeSession>();
     sessions
       .filter((s) => s.status !== 'STOPPED' && s.status !== 'LOST')
-      .slice(0, 5)
       .forEach((s) => byId.set(s.id, s));
 
     bindings.forEach((b) => {
-      if (!byId.has(b.session_id) && byId.size < 5) {
+      if (!byId.has(b.session_id)) {
         byId.set(b.session_id, {
           id: b.session_id,
           name: b.session_name,
@@ -290,12 +290,18 @@ export function RouterTopologyGraph({
       }
     });
 
-    return Array.from(byId.values()).slice(0, 5);
+    return Array.from(byId.values()).sort((a, b) => {
+      const aBusy = a.status === 'BUSY' ? 0 : 1;
+      const bBusy = b.status === 'BUSY' ? 0 : 1;
+      if (aBusy !== bBusy) return aBusy - bBusy;
+      if (a.burn_rate_cu_hr !== b.burn_rate_cu_hr) return b.burn_rate_cu_hr - a.burn_rate_cu_hr;
+      return (a.name || a.id).localeCompare(b.name || b.id);
+    });
   }, [sessions, bindings]);
 
-  // Stage 4: pooled accounts
+  // Stage 4: ALL active pooled accounts (never silently capped at 5)
   const topologyAccounts = useMemo(() => {
-    return accounts.filter((a) => a.health !== 'REVOKED_BY_USER').slice(0, 5);
+    return accounts.filter((a) => a.health !== 'REVOKED_BY_USER');
   }, [accounts]);
 
   // Live header telemetry: calls in flight and the pool's current CU burn
@@ -399,7 +405,7 @@ export function RouterTopologyGraph({
     });
 
     setEdges(nextEdges);
-  }, [callerNodes, topologySessions]);
+  }, [callerNodes, topologySessions, topologyAccounts]);
 
   useEffect(() => {
     let raf = window.requestAnimationFrame(recomputeEdges);
@@ -981,12 +987,23 @@ export function RouterTopologyGraph({
                     />
 
                     <div className="flex items-center justify-between gap-2">
-                      <span className="truncate text-[12.5px] font-medium text-fg">
-                        {sess.name}
+                      <span
+                        className="truncate text-[12.5px] font-medium text-fg"
+                        title={getFriendlySessionDisplay(sess, isZh).prefixedTitle}
+                      >
+                        {getFriendlySessionDisplay(sess, isZh).prefixedTitle}
                       </span>
                       <StatusPill
                         size="xs"
-                        tone={sess.fallback_applied ? 'coral' : busy ? 'emerald' : 'neutral'}
+                        tone={
+                          sess.fallback_applied
+                            ? 'coral'
+                            : getFriendlySessionDisplay(sess, isZh).isLLM
+                              ? 'amber'
+                              : busy
+                                ? 'emerald'
+                                : 'neutral'
+                        }
                         mono
                         className="shrink-0"
                       >
@@ -1007,6 +1024,13 @@ export function RouterTopologyGraph({
                         >
                           {isZh ? '缺卡已切 ' : 'Switched '}
                           {sess.requested_accelerator} → {sess.accelerator}
+                        </span>
+                      ) : getFriendlySessionDisplay(sess, isZh).isLLM ? (
+                        <span
+                          className="truncate font-medium"
+                          style={{ color: 'var(--amber-text)' }}
+                        >
+                          {isZh ? '大模型推理服务 · /v1' : 'LLM Inference · /v1'}
                         </span>
                       ) : sess.sticky_key ? (
                         <span className="inline-flex items-center gap-1 truncate">

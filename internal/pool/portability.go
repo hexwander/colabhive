@@ -84,6 +84,7 @@ type colabTokenJSONWire struct {
 	Token        string   `json:"token"`
 	AccessToken  string   `json:"access_token"`
 	RefreshToken string   `json:"refresh_token"`
+	IDToken      string   `json:"id_token"`
 	TokenURI     string   `json:"token_uri"`
 	ClientID     string   `json:"client_id"`
 	ClientSecret string   `json:"client_secret"`
@@ -245,6 +246,17 @@ func parseColabTokenWireJSON(raw []byte) (*ParsedOAuthCredential, error) {
 	if email == "" && strings.Contains(w.Account, "@") {
 		email = strings.TrimSpace(w.Account)
 	}
+	alias := ""
+	if (email == "" || alias == "") && strings.TrimSpace(w.IDToken) != "" {
+		if jwtEmail, jwtName := parseOIDCClaimsOffline(w.IDToken); jwtEmail != "" || jwtName != "" {
+			if email == "" {
+				email = jwtEmail
+			}
+			if alias == "" {
+				alias = jwtName
+			}
+		}
+	}
 	clientID := strings.TrimSpace(w.ClientID)
 	if clientID == "" {
 		clientID = models.OfficialColabOAuthClientID
@@ -268,6 +280,7 @@ func parseColabTokenWireJSON(raw []byte) (*ParsedOAuthCredential, error) {
 
 	return &ParsedOAuthCredential{
 		Email:        email,
+		Alias:        alias,
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		TokenURI:     tokenURI,
@@ -278,19 +291,114 @@ func parseColabTokenWireJSON(raw []byte) (*ParsedOAuthCredential, error) {
 	}, nil
 }
 
+func parseOIDCClaimsOffline(idToken string) (email string, name string) {
+	parts := strings.Split(strings.TrimSpace(idToken), ".")
+	if len(parts) < 2 {
+		return "", ""
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", ""
+	}
+	var claims map[string]any
+	if json.Unmarshal(payloadBytes, &claims) != nil {
+		return "", ""
+	}
+	if v, ok := claims["email"].(string); ok {
+		email = strings.TrimSpace(v)
+	}
+	if v, ok := claims["name"].(string); ok {
+		name = strings.TrimSpace(v)
+	}
+	return email, name
+}
+
+func formatLocalSourceLabel(env string, sourcePath string) string {
+	if !strings.EqualFold(strings.TrimSpace(env), "wsl2") {
+		return ""
+	}
+	norm := strings.ReplaceAll(strings.TrimSpace(sourcePath), "/", `\`)
+	lower := strings.ToLower(norm)
+	for _, prefix := range []string{`\\wsl.localhost\`, `\\wsl$\`} {
+		if strings.HasPrefix(lower, prefix) {
+			rest := norm[len(prefix):]
+			segs := strings.Split(rest, `\`)
+			distro := ""
+			if len(segs) >= 1 {
+				distro = strings.TrimSpace(segs[0])
+			}
+			user := ""
+			if len(segs) >= 3 && strings.EqualFold(segs[1], "home") {
+				user = strings.TrimSpace(segs[2])
+			}
+			if distro != "" && user != "" {
+				return fmt.Sprintf("WSL2 · %s (%s)", distro, user)
+			}
+			if distro != "" {
+				return "WSL2 · " + distro
+			}
+		}
+	}
+	return "WSL2"
+}
+
 // ScanLocalCredentials inspects standard read-only local and WSL2 credential locations ONLY when
-// explicitly invoked by the user/API, returning masked previews without ever logging raw secrets.
+// explicitly invoked by the user/API, returning account identity and status without ever logging raw secrets.
 func (s *Service) ScanLocalCredentials(ctx context.Context) ([]models.DiscoveredLocalCredential, error) {
 	candidates := s.cfg.LocalScanRoots
 	if len(candidates) == 0 {
 		candidates = buildDefaultScanCandidates()
 	}
 
+	// Load existing pool accounts once for instant offline refresh-token & email matching.
+	byRefreshToken := make(map[string]*models.Account)
+	byEmailLower := make(map[string]*models.Account)
+	if s.st != nil {
+		if existingAccounts, lErr := s.st.ListAccounts(ctx); lErr == nil {
+			for _, acc := range existingAccounts {
+				if acc == nil {
+					continue
+				}
+				if em := strings.ToLower(strings.TrimSpace(acc.Email)); em != "" {
+					byEmailLower[em] = acc
+				}
+				if s.cipher != nil && acc.EncryptedRefreshToken != "" {
+					if dec, dErr := s.cipher.DecryptString(acc.EncryptedRefreshToken); dErr == nil && strings.TrimSpace(dec) != "" {
+						byRefreshToken[strings.TrimSpace(dec)] = acc
+					}
+				}
+			}
+		}
+	}
+
+	// Pick an optional fallback proxy URL if user configured proxies in ColabHive.
+	fallbackProxyURL := ""
+	if s.st != nil {
+		if proxies, pErr := s.st.ListProxies(ctx); pErr == nil {
+			for _, p := range proxies {
+				if p != nil && strings.TrimSpace(p.URL) != "" {
+					if p.Healthy || fallbackProxyURL == "" {
+						fallbackProxyURL = strings.TrimSpace(p.URL)
+						if p.Healthy {
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	scanBudgetCtx, scanCancel := context.WithTimeout(ctx, 8*time.Second)
+	defer scanCancel()
+
 	results := make([]models.DiscoveredLocalCredential, 0)
 	records := make(map[string]discoveredRecord)
 
 	for _, cand := range candidates {
-		if ctx != nil && ctx.Err() != nil {
+		if ctx.Err() != nil {
 			break
 		}
 		if strings.TrimSpace(cand.SourcePath) == "" {
@@ -330,6 +438,67 @@ func (s *Service) ScanLocalCredentials(ctx context.Context) ([]models.Discovered
 			continue
 		}
 
+		email := strings.TrimSpace(parsed.Email)
+		displayName := strings.TrimSpace(parsed.Alias)
+		resolvedAccess := parsed.AccessToken
+		resolvedExp := parsed.Expiry
+		alreadyInPool := false
+		existingAccountID := ""
+		status := "ready"
+
+		// Tier 1: Match against already-imported pool accounts by refresh_token (0ms, works offline).
+		if parsed.RefreshToken != "" {
+			if matched, ok := byRefreshToken[strings.TrimSpace(parsed.RefreshToken)]; ok && matched != nil {
+				if email == "" {
+					email = strings.TrimSpace(matched.Email)
+				}
+				if displayName == "" {
+					displayName = strings.TrimSpace(matched.Alias)
+				}
+				alreadyInPool = true
+				existingAccountID = matched.ID
+				status = "in_pool"
+			}
+		}
+
+		// Tier 2: Check if in-file email already exists in the pool.
+		if !alreadyInPool && email != "" {
+			if matched, ok := byEmailLower[strings.ToLower(email)]; ok && matched != nil {
+				if displayName == "" {
+					displayName = strings.TrimSpace(matched.Alias)
+				}
+				alreadyInPool = true
+				existingAccountID = matched.ID
+				status = "in_pool"
+			}
+		}
+
+		// Tier 3: Resolve real Google account email via cached/live OAuth identity lookup when file omits email.
+		if email == "" {
+			rEmail, rName, rAcc, rExp, invalidGrant := s.resolveScanIdentityCached(scanBudgetCtx, *parsed, fallbackProxyURL)
+			if rEmail != "" {
+				email = rEmail
+				if displayName == "" {
+					displayName = rName
+				}
+				if rAcc != "" {
+					resolvedAccess = rAcc
+					resolvedExp = rExp
+				}
+				if matched, ok := byEmailLower[strings.ToLower(email)]; ok && matched != nil {
+					alreadyInPool = true
+					existingAccountID = matched.ID
+					status = "in_pool"
+				} else {
+					status = "ready"
+				}
+			} else if invalidGrant {
+				status = "expired"
+			} else {
+				status = "unverified"
+			}
+		}
+
 		sum := sha256.Sum256([]byte(cand.SourceType + "|" + cand.SourcePath))
 		discID := "disc_" + hex.EncodeToString(sum[:8])
 
@@ -339,19 +508,29 @@ func (s *Service) ScanLocalCredentials(ctx context.Context) ([]models.Discovered
 		}
 
 		meta := models.DiscoveredLocalCredential{
-			ID:           discID,
-			SourceType:   cand.SourceType,
-			SourcePath:   cand.SourcePath,
-			Environment:  cand.Environment,
-			EmailPreview: MaskEmail(parsed.Email),
-			TokenPreview: maskTokenPreview(secretSample),
-			Scopes:       parsed.Scopes,
+			ID:                discID,
+			SourceType:        cand.SourceType,
+			SourcePath:        cand.SourcePath,
+			Environment:       cand.Environment,
+			Email:             email,
+			EmailPreview:      MaskEmail(email),
+			DisplayName:       displayName,
+			SourceLabel:       formatLocalSourceLabel(cand.Environment, cand.SourcePath),
+			AlreadyInPool:     alreadyInPool,
+			ExistingAccountID: existingAccountID,
+			Status:            status,
+			TokenPreview:      maskTokenPreview(secretSample),
+			Scopes:            parsed.Scopes,
 		}
 		results = append(results, meta)
 		records[discID] = discoveredRecord{
-			meta:       meta,
-			sourcePath: cand.SourcePath,
-			sourceType: cand.SourceType,
+			meta:        meta,
+			sourcePath:  cand.SourcePath,
+			sourceType:  cand.SourceType,
+			resolvedEm:  email,
+			resolvedNm:  displayName,
+			accessToken: resolvedAccess,
+			expiry:      resolvedExp,
 		}
 	}
 
@@ -362,6 +541,53 @@ func (s *Service) ScanLocalCredentials(ctx context.Context) ([]models.Discovered
 	s.scanMu.Unlock()
 
 	return results, nil
+}
+
+const scanIdentityCacheTTL = 5 * time.Minute
+
+func (s *Service) resolveScanIdentityCached(
+	ctx context.Context,
+	cred ParsedOAuthCredential,
+	fallbackProxyURL string,
+) (email, displayName, accessToken string, expiry *time.Time, invalidGrant bool) {
+	keySeed := strings.TrimSpace(cred.RefreshToken) + "|" + strings.TrimSpace(cred.AccessToken)
+	keySum := sha256.Sum256([]byte(keySeed))
+	cacheKey := hex.EncodeToString(keySum[:12])
+
+	s.scanMu.RLock()
+	if s.scanIdentityCache != nil {
+		if entry, ok := s.scanIdentityCache[cacheKey]; ok && s.now().Sub(entry.cachedAt) < scanIdentityCacheTTL {
+			s.scanMu.RUnlock()
+			return entry.email, entry.displayName, entry.accessToken, entry.expiry, entry.invalidGrant
+		}
+	}
+	s.scanMu.RUnlock()
+
+	if ctx.Err() != nil {
+		return "", "", "", nil, false
+	}
+
+	em, tok, exp, nm, inv := s.tryResolveImportedIdentityWithStatus(ctx, cred, "")
+	if em == "" && !inv && fallbackProxyURL != "" && ctx.Err() == nil {
+		em, tok, exp, nm, inv = s.tryResolveImportedIdentityWithStatus(ctx, cred, fallbackProxyURL)
+	}
+
+	if em != "" || inv {
+		s.scanMu.Lock()
+		if s.scanIdentityCache == nil {
+			s.scanIdentityCache = make(map[string]cachedScanIdentity)
+		}
+		s.scanIdentityCache[cacheKey] = cachedScanIdentity{
+			email:        em,
+			displayName:  nm,
+			accessToken:  tok,
+			expiry:       exp,
+			invalidGrant: inv,
+			cachedAt:     s.now(),
+		}
+		s.scanMu.Unlock()
+	}
+	return em, nm, tok, exp, inv
 }
 
 func buildDefaultScanCandidates() []LocalScanCandidate {
@@ -528,6 +754,18 @@ func (s *Service) ImportCredentials(ctx context.Context, req models.CredentialIm
 			}
 			if err != nil {
 				return nil, err
+			}
+			if cred.Email == "" && rec.resolvedEm != "" {
+				cred.Email = rec.resolvedEm
+			}
+			if cred.Alias == "" && rec.resolvedNm != "" {
+				cred.Alias = rec.resolvedNm
+			}
+			if rec.accessToken != "" && (cred.AccessToken == "" || cred.Expiry == nil || cred.Expiry.Before(s.now().Add(tokenRefreshMargin))) {
+				cred.AccessToken = rec.accessToken
+				if rec.expiry != nil {
+					cred.Expiry = rec.expiry
+				}
 			}
 			parsedList = append(parsedList, *cred)
 		}
@@ -792,42 +1030,63 @@ func (s *Service) tryResolveImportedIdentity(
 	cred ParsedOAuthCredential,
 	proxyURL string,
 ) (email string, accessToken string, expiry *time.Time, displayName string) {
-	rCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	em, tok, exp, nm, _ := s.tryResolveImportedIdentityWithStatus(ctx, cred, proxyURL)
+	return em, tok, exp, nm
+}
+
+func (s *Service) tryResolveImportedIdentityWithStatus(
+	ctx context.Context,
+	cred ParsedOAuthCredential,
+	proxyURL string,
+) (email string, accessToken string, expiry *time.Time, displayName string, invalidGrant bool) {
+	rCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 
-	httpClient, err := s.transport.HTTPClient(proxyURL, 6*time.Second)
+	httpClient, err := s.transport.HTTPClient(proxyURL, 4*time.Second)
 	if err != nil {
-		return "", "", nil, ""
+		return "", "", nil, "", false
 	}
 
 	tok := cred.AccessToken
 	var exp *time.Time
-	if cred.RefreshToken != "" && (tok == "" || cred.Expiry == nil || cred.Expiry.Before(s.now().Add(tokenRefreshMargin))) {
-		if refreshedTok, expTime := s.refreshRawTokenOnce(
+	needsRefresh := tok == "" || cred.Expiry == nil || cred.Expiry.Before(s.now().Add(tokenRefreshMargin))
+
+	if !needsRefresh && tok != "" {
+		if em, nm, _, _ := s.fetchGoogleIdentity(rCtx, httpClient, tok, ""); em != "" {
+			return em, tok, cred.Expiry, nm, false
+		}
+	}
+
+	if cred.RefreshToken != "" {
+		refreshedTok, expTime, inv := s.refreshRawTokenWithStatus(
 			rCtx,
 			httpClient,
 			firstNonEmpty(cred.ClientID, models.OfficialColabOAuthClientID),
 			firstNonEmpty(cred.ClientSecret, models.OfficialColabOAuthClientSecret),
 			cred.RefreshToken,
-		); refreshedTok != "" {
+		)
+		if inv {
+			return "", "", nil, "", true
+		}
+		if refreshedTok != "" {
 			tok = refreshedTok
 			exp = expTime
 		}
 	}
 	if tok == "" {
-		return "", "", nil, ""
+		return "", "", nil, "", false
 	}
 	em, nm, _, _ := s.fetchGoogleIdentity(rCtx, httpClient, tok, "")
-	return em, tok, exp, nm
+	return em, tok, exp, nm, false
 }
 
-func (s *Service) refreshRawTokenOnce(
+func (s *Service) refreshRawTokenWithStatus(
 	ctx context.Context,
 	httpClient *http.Client,
 	clientID string,
 	clientSecret string,
 	refreshToken string,
-) (string, *time.Time) {
+) (string, *time.Time, bool) {
 	form := url.Values{}
 	form.Set("client_id", clientID)
 	form.Set("client_secret", clientSecret)
@@ -836,31 +1095,35 @@ func (s *Service) refreshRawTokenOnce(
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.GoogleTokenURI, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", nil
+		return "", nil, false
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", nil
+		return "", nil, false
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", nil
+		low := strings.ToLower(string(body))
+		isRevoked := resp.StatusCode == http.StatusUnauthorized ||
+			strings.Contains(low, "invalid_grant") ||
+			strings.Contains(low, "unauthorized_client")
+		return "", nil, isRevoked
 	}
 	var tok googleTokenResponse
 	if json.Unmarshal(body, &tok) != nil || tok.AccessToken == "" {
-		return "", nil
+		return "", nil, false
 	}
 	dur := time.Duration(tok.ExpiresIn) * time.Second
 	if dur <= 0 {
 		dur = 55 * time.Minute
 	}
 	exp := s.now().Add(dur)
-	return tok.AccessToken, &exp
+	return tok.AccessToken, &exp, false
 }
 
 // ExportVaultBundle exports owner accounts (never external contributor accounts!) into a

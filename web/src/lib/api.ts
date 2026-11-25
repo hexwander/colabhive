@@ -9,13 +9,7 @@ import type {
   AgentClientID,
   AgentInjectRequest,
   CellMutationRequest,
-  ContributionReceipt,
-  ContributorGuardrails,
-  ContributorGuardrailsPatch,
-  ContributorInvite,
-  ContributorReceiptStatus,
   CreateAPIKeyRequest,
-  CreateInviteRequest,
   CredentialBundle,
   CredentialExportRequest,
   CredentialImportRequest,
@@ -28,7 +22,6 @@ import type {
   KernelExecRequest,
   KernelExecResult,
   NotebookCell,
-  OAuthAuthMode,
   OAuthPendingSession,
   OAuthStartRequest,
   ProxyConfig,
@@ -38,6 +31,7 @@ import type {
   RouteBinding,
   RouterPolicy,
   RuntimeSession,
+  SavingsReceiptStats,
   SessionAllocRequest,
   SystemSelfTestResult,
   ToolTraceEvent,
@@ -252,6 +246,10 @@ export const api = {
       body: JSON.stringify({ state, raw_input: codeOrUrl, code: codeOrUrl }),
     }),
 
+  // v1.1 Savings Receipt
+  getSavingsReceipt: (signal?: AbortSignal) =>
+    request<SavingsReceiptStats>('/api/v1/stats/savings-card', { signal }),
+
   // Proxy Pool Management
   listProxies: () => request<ProxyConfig[]>('/api/v1/proxies'),
   saveProxy: (proxy: Partial<ProxyConfig> & { name: string; url: string }) =>
@@ -280,64 +278,21 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  // Contributor Invites (Admin)
-  listInvites: () => request<ContributorInvite[]>('/api/v1/contribute/invites'),
-  createInvite: (payload: CreateInviteRequest) =>
-    request<ContributorInvite>('/api/v1/contribute/invites', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
-  revokeInvite: (code: string) =>
-    request<void>(`/api/v1/contribute/invites/${encodeURIComponent(code)}`, {
-      method: 'DELETE',
-    }),
-
-  // Public Guest Contributor Portal (`/api/public/contribute/*`)
-  getPublicInvite: (code: string) =>
-    request<ContributorInvite>(`/api/public/contribute/${encodeURIComponent(code)}`),
-  startContribution: (
-    code: string,
-    guardrails: ContributorGuardrails,
-    mode: OAuthAuthMode = 'remote_copy_paste',
-  ) =>
-    request<OAuthPendingSession>(
-      `/api/public/contribute/${encodeURIComponent(code)}/start`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ guardrails, mode }),
-      },
-    ),
-  completeContribution: (code: string, state: string, codeOrUrl: string) =>
-    request<ContributionReceipt>(
-      `/api/public/contribute/${encodeURIComponent(code)}/complete`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ state, raw_input: codeOrUrl, code: codeOrUrl }),
-      },
-    ),
-  getContributionStatus: (receiptToken: string) =>
-    request<ContributorReceiptStatus>(
-      `/api/public/contribute/manage/${encodeURIComponent(receiptToken)}`,
-    ),
-  updateContributionGuardrails: (receiptToken: string, patch: ContributorGuardrailsPatch) =>
-    request<ContributorReceiptStatus>(
-      `/api/public/contribute/manage/${encodeURIComponent(receiptToken)}`,
-      {
-        method: 'PATCH',
-        body: JSON.stringify(patch),
-      },
-    ),
-  revokeContribution: (receiptToken: string) =>
-    request<{ revoked: boolean }>(
-      `/api/public/contribute/manage/${encodeURIComponent(receiptToken)}/revoke`,
-      { method: 'POST' },
-    ),
-
   // Runtime Sessions & Workbench
-  listSessions: (params?: { account_id?: string; experiment_id?: string; sync?: boolean }) => {
+  listSessions: (params?: {
+    account_id?: string;
+    experiment_id?: string;
+    active_only?: boolean;
+    limit?: number;
+    all?: boolean;
+    sync?: boolean;
+  }) => {
     const qs = new URLSearchParams();
     if (params?.account_id) qs.set('account_id', params.account_id);
     if (params?.experiment_id) qs.set('experiment_id', params.experiment_id);
+    if (params?.active_only) qs.set('active_only', 'true');
+    if (params?.all) qs.set('all', 'true');
+    else if (typeof params?.limit === 'number') qs.set('limit', String(params.limit));
     if (params?.sync) qs.set('sync', 'true');
     const query = qs.toString();
     return request<RuntimeSession[]>(`/api/v1/sessions${query ? `?${query}` : ''}`);

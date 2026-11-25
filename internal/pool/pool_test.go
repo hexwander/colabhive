@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -278,31 +277,29 @@ func TestCredentialPortabilityKeyringADCJSONAndChvault(t *testing.T) {
 	_ = st
 }
 
-func TestExternalContributorPortalGuardrailsAndRevoke(t *testing.T) {
+func TestAccountGuardrailsAndScheduleWindow(t *testing.T) {
 	fixedNow := time.Date(2026, 11, 21, 15, 0, 0, 0, time.UTC) // 23:00 Asia/Shanghai (inside 22:00->09:00 window)
 	currentNow := fixedNow
 
 	ctx := context.Background()
-	st, svc, mockSrv := setupTestPool(t, func(c *pool.Config) {
+	_, svc, _ := setupTestPool(t, func(c *pool.Config) {
 		c.NowFunc = func() time.Time { return currentNow }
 	})
 
-	inv, err := svc.CreateInvite(ctx, models.CreateInviteRequest{
-		PoolTitle:      "NeurIPS Evaluation Pool",
-		MaintainerName: "Prof. Zhang",
-		MaxUses:        5,
-		TTLHours:       48,
-	})
+	pending, err := svc.StartOAuth(ctx, models.OAuthStartRequest{Alias: "Guarded Pro+"})
 	if err != nil {
-		t.Fatalf("CreateInvite: %v", err)
+		t.Fatalf("StartOAuth: %v", err)
+	}
+	acc, err := svc.CompleteOAuth(ctx, pending.State, "4/0A_contrib_alice")
+	if err != nil {
+		t.Fatalf("CompleteOAuth: %v", err)
 	}
 
-	guardrails := models.ContributorGuardrails{
-		MinReserveCU:      50.0,
-		MaxDonatedCUTotal: 100.0,
-		AllowPaidCUBurn:   true,
-		AllowedGPUs:       []models.AcceleratorType{models.AcceleratorG4, models.AcceleratorL4, models.AcceleratorT4},
-		MaxConcurrentVMs:  1,
+	g := models.ContributorGuardrails{
+		MinReserveCU:     50.0,
+		AllowPaidCUBurn:  true,
+		AllowedGPUs:      []models.AcceleratorType{models.AcceleratorG4, models.AcceleratorL4, models.AcceleratorT4},
+		MaxConcurrentVMs: 1,
 		ScheduleWindow: &models.ScheduleWindow{
 			Enabled:    true,
 			Timezone:   "Asia/Shanghai",
@@ -311,112 +308,31 @@ func TestExternalContributorPortalGuardrailsAndRevoke(t *testing.T) {
 			EndHour:    "09:00",
 		},
 	}
-
-	pending, err := svc.StartContribution(ctx, inv.Code, guardrails, models.OAuthModeRemoteCopyPaste)
+	acc, err = svc.UpdateAccount(ctx, acc.ID, models.AccountPatch{Guardrails: &g})
 	if err != nil {
-		t.Fatalf("StartContribution: %v", err)
-	}
-	// Verify LEAST-PRIVILEGE scope: colaboratory included, drive & cloud-platform EXCLUDED!
-	if strings.Contains(pending.AuthURL, "drive") || strings.Contains(pending.AuthURL, "cloud-platform") {
-		t.Fatalf("security violation: contributor AuthURL requested Drive or GCP scope: %s", pending.AuthURL)
-	}
-	if !strings.Contains(pending.AuthURL, "colaboratory") {
-		t.Fatalf("expected colaboratory scope in AuthURL: %s", pending.AuthURL)
+		t.Fatalf("UpdateAccount guardrails: %v", err)
 	}
 
-	receipt, err := svc.CompleteContribution(ctx, inv.Code, pending.State, "4/0A_contrib_alice")
-	if err != nil {
-		t.Fatalf("CompleteContribution: %v", err)
-	}
-	if !strings.HasPrefix(receipt.ReceiptToken, "ch_rcpt_") {
-		t.Fatalf("expected ch_rcpt_ prefix, got %q", receipt.ReceiptToken)
-	}
-
-	contribAcc, err := svc.GetAccount(ctx, receipt.Status.AccountID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !contribAcc.Guardrails.BlockDrivePropagation {
-		t.Fatal("expected BlockDrivePropagation=true on contributor account")
-	}
-
-	// Verify contributor accounts are NEVER exported in .chvault bundles
-	exported, err := svc.ExportVaultBundle(ctx, models.CredentialExportRequest{Encrypt: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(exported.Accounts) != 0 {
-		t.Fatalf("security violation: contributor account leaked into ExportVaultBundle: %+v", exported.Accounts)
-	}
-
-	// Test CanScheduleAccount guardrails:
 	// 1. Inside 22:00->09:00 Asia/Shanghai window & allowed G4 -> allowed!
-	if ok, reason := svc.CanScheduleAccount(contribAcc, models.AcceleratorG4); !ok {
+	if ok, reason := svc.CanScheduleAccount(acc, models.AcceleratorG4); !ok {
 		t.Fatalf("expected G4 scheduling allowed, got false (%s)", reason)
 	}
 	// 2. Disallowed GPU (H100 not in AllowedGPUs) -> rejected!
-	if ok, _ := svc.CanScheduleAccount(contribAcc, models.AcceleratorH100); ok {
-		t.Fatal("expected H100 rejected by contributor AllowedGPUs")
+	if ok, _ := svc.CanScheduleAccount(acc, models.AcceleratorH100); ok {
+		t.Fatal("expected H100 rejected by AllowedGPUs")
 	}
 	// 3. Outside schedule window (06:00 UTC == 14:00 Asia/Shanghai) -> rejected!
 	currentNow = time.Date(2026, 11, 21, 6, 0, 0, 0, time.UTC)
-	if ok, reason := svc.CanScheduleAccount(contribAcc, models.AcceleratorG4); ok {
+	if ok, reason := svc.CanScheduleAccount(acc, models.AcceleratorG4); ok {
 		t.Fatalf("expected scheduling rejected outside window, got allowed (%s)", reason)
 	}
 	currentNow = fixedNow
 
-	// 4. Burn 99 CU out of 100 CU MaxDonatedCUTotal -> remaining 1 CU < 2.415 CU (15m G4 runway) -> rejected!
-	if err := svc.RecordAccountCUBurn(ctx, contribAcc.ID, 99.0); err != nil {
-		t.Fatal(err)
-	}
-	contribAfterBurn, _ := svc.GetAccount(ctx, contribAcc.ID)
-	if ok, _ := svc.CanScheduleAccount(contribAfterBurn, models.AcceleratorG4); ok {
-		t.Fatal("expected G4 rejected when remaining donation cap is below 15-minute safety runway")
-	}
-
-	// 5. Contributor self-service guardrail update via receipt token
-	paused := true
-	updatedStatus, err := svc.UpdateContributionGuardrails(ctx, receipt.ReceiptToken, models.ContributorGuardrailsPatch{
-		Paused: &paused,
-	})
-	if err != nil || !updatedStatus.Guardrails.Paused {
-		t.Fatalf("UpdateContributionGuardrails failed: %+v (%v)", updatedStatus, err)
-	}
-
-	// Seed an active session on this contributor account to verify revoke stops it
-	_ = st.SaveSession(ctx, &models.RuntimeSession{
-		ID:        "sess_contrib_vm1",
-		Name:      "contrib_vm1",
-		AccountID: contribAcc.ID,
-		Status:    models.SessionBusy,
-	})
-
-	// 6. 1-Click Self-Service Revoke -> calls oauth2.googleapis.com/revoke + wipes tokens + stops session
-	if err := svc.RevokeContribution(ctx, receipt.ReceiptToken); err != nil {
-		t.Fatalf("RevokeContribution failed: %v", err)
-	}
-	if mockSrv.RevokeCalls() != 1 {
-		t.Fatalf("expected 1 call to Google /revoke endpoint, got %d", mockSrv.RevokeCalls())
-	}
-	rawStored, _ := st.GetAccount(ctx, contribAcc.ID)
-	if rawStored.EncryptedRefreshToken != "" || rawStored.EncryptedAccessToken != "" {
-		t.Fatal("expected encrypted OAuth tokens to be permanently wiped on RevokeContribution")
-	}
-	if rawStored.Health != models.HealthRevokedByUser {
-		t.Fatalf("expected HealthRevokedByUser, got %s", rawStored.Health)
-	}
-	stoppedSess, _ := st.GetSession(ctx, "sess_contrib_vm1")
-	if stoppedSess.Status != models.SessionStopped {
-		t.Fatalf("expected active session to be marked STOPPED on revoke, got %s", stoppedSess.Status)
-	}
-
-	// 7. Verify revoked contributor balance is excluded from QuotaSummary rollups
-	postRevokeSummary, err := svc.GetQuotaSummary(ctx)
-	if err != nil {
-		t.Fatalf("GetQuotaSummary after revoke failed: %v", err)
-	}
-	if postRevokeSummary.TotalAvailableCU != 0 || postRevokeSummary.SchedulableCU != 0 || postRevokeSummary.AccountsContributor != 0 || postRevokeSummary.AccountsTotal != 0 {
-		t.Fatalf("revoked contributor leaked into QuotaSummary: %+v", postRevokeSummary)
+	// 4. Paused guardrail -> rejected!
+	g.Paused = true
+	acc, _ = svc.UpdateAccount(ctx, acc.ID, models.AccountPatch{Guardrails: &g})
+	if ok, _ := svc.CanScheduleAccount(acc, models.AcceleratorG4); ok {
+		t.Fatal("expected paused account to be rejected")
 	}
 }
 
@@ -759,167 +675,28 @@ func TestMaxConcurrencyCooldownOmittedTPUsMidnightResetAndExternalRollup(t *test
 	}
 }
 
-func TestCompleteCredentialContributionSecurityOwnerGuardAndRevokeDrain(t *testing.T) {
+func TestDeleteAccountDrainsActiveSessions(t *testing.T) {
 	ctx := context.Background()
+	st, svc, _ := setupTestPool(t, nil)
 
-	var failRevoke atomic.Bool
-	st, err := store.OpenSQLite(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	mockSrv := mockcolab.NewServer()
-	defer mockSrv.Close()
-
-	revokeProxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if failRevoke.Load() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"error":"upstream_503"}`))
-			return
-		}
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":"invalid_token"}`))
-	}))
-	defer revokeProxySrv.Close()
-
-	cfg := mockSrv.PoolConfig("contrib-security-test")
-	cfg.GoogleRevokeURI = revokeProxySrv.URL + "/revoke"
-	svc := pool.NewConcreteService(st, events.NewHub(), cfg)
-
-	// 1. Seed a real Owner account (`IsContributor: false`).
 	ownerPending, _ := svc.StartOAuth(ctx, models.OAuthStartRequest{Alias: "Owner Ultra"})
 	ownerAcc, err := svc.CompleteOAuth(ctx, ownerPending.State, "4/0A_ultra_01")
 	if err != nil {
 		t.Fatalf("CompleteOAuth owner: %v", err)
 	}
-	if ownerAcc.IsContributor {
-		t.Fatal("expected owner account IsContributor=false")
-	}
 
-	// 2. Create single-use contributor invite (`MaxUses: 1`).
-	inv, err := svc.CreateInvite(ctx, models.CreateInviteRequest{
-		PoolTitle: "Security Test Pool",
-		MaxUses:   1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// 3. Invalid invite code MUST be rejected on CompleteCredentialContribution.
-	validDonorCred := []byte(`{"refresh_token":"1//0contrib_refresh_alice","access_token":"ya29.contrib_access_alice"}`)
-	if _, err := svc.CompleteCredentialContribution(ctx, "ch_inv_nonexistent", models.ContributorGuardrails{}, validDonorCred); err == nil {
-		t.Fatal("expected fake invite code to be rejected")
-	}
-
-	// 4. Attempting to overwrite the existing Owner account via credential donation OR OAuth MUST be rejected!
-	ownerCredAttempt := []byte(`{"email":"lab-ultra-01@stanford-ai.org","refresh_token":"1//0ultra_refresh_01","access_token":"ya29.ultra_access_01"}`)
-	if _, err := svc.CompleteCredentialContribution(ctx, inv.Code, models.ContributorGuardrails{}, ownerCredAttempt); err == nil || !strings.Contains(err.Error(), "cannot overwrite an owner account") {
-		t.Fatalf("expected owner overwrite via CompleteCredentialContribution to be rejected, got: %v", err)
-	}
-	contribOAuthPending, err := svc.StartContribution(ctx, inv.Code, models.ContributorGuardrails{}, models.OAuthModeRemoteCopyPaste)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.CompleteContribution(ctx, inv.Code, contribOAuthPending.State, "4/0A_ultra_01"); err == nil || !strings.Contains(err.Error(), "cannot overwrite an owner account") {
-		t.Fatalf("expected owner overwrite via CompleteContribution OAuth to be rejected, got: %v", err)
-	}
-	ownerReloaded, _ := svc.GetAccount(ctx, ownerAcc.ID)
-	if ownerReloaded.IsContributor {
-		t.Fatal("owner account was mutated to IsContributor=true")
-	}
-
-	// 5. Concurrent MaxUses=1 race: out of 6 concurrent donations, at most 1 succeeds!
-	mockSrv.RegisterAccount(mockcolab.MockAccount{
-		Email:            "donor-race@uni.edu",
-		SubscriptionTier: "SUBSCRIPTION_TIER_PRO",
-		PaidCUBalance:    100,
-		MaxVMs:           2,
-		EligibleGPUs:     []string{"G4", "T4"},
-		RefreshToken:     "1//0donor_race_rt",
-		AccessToken:      "ya29.donor_race_at",
-	})
-	raceCred := []byte(`{"refresh_token":"1//0donor_race_rt","access_token":"ya29.donor_race_at"}`)
-	var wg sync.WaitGroup
-	var successes atomic.Int32
-	var winningReceipt *models.ContributionReceipt
-	var winMu sync.Mutex
-	for i := 0; i < 6; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			rcpt, cErr := svc.CompleteCredentialContribution(ctx, inv.Code, models.ContributorGuardrails{
-				MinReserveCU:    20,
-				AllowPaidCUBurn: true,
-			}, raceCred)
-			if cErr == nil && rcpt != nil {
-				successes.Add(1)
-				winMu.Lock()
-				winningReceipt = rcpt
-				winMu.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-	if successes.Load() != 1 || winningReceipt == nil {
-		t.Fatalf("expected exactly 1 redemption on MaxUses=1 invite, got %d", successes.Load())
-	}
-
-	// Verify working ManageURL receipt lookup + contributor security flags!
-	rcptStatus, err := svc.GetContributionByReceipt(ctx, winningReceipt.ReceiptToken)
-	if err != nil || !rcptStatus.Guardrails.BlockDrivePropagation {
-		t.Fatalf("GetContributionByReceipt failed after CompleteCredentialContribution: %+v (%v)", rcptStatus, err)
-	}
-	donatedAcc, _ := st.GetAccount(ctx, rcptStatus.AccountID)
-	if !donatedAcc.IsContributor || donatedAcc.ReceiptTokenHash == "" {
-		t.Fatalf("expected IsContributor=true & persisted ReceiptTokenHash, got %+v", donatedAcc)
-	}
-
-	// 6. Wire SetSessionDrainer & verify RevokeContribution drains BEFORE revoking, preserves token on 503, and wipes on 400 invalid_token!
 	var drainedAccounts []string
-	var sawTokenDuringDrain bool
-	svc.SetSessionDrainer(func(dCtx context.Context, accountID string) error {
+	svc.SetSessionDrainer(func(_ context.Context, accountID string) error {
 		drainedAccounts = append(drainedAccounts, accountID)
-		tok, _, tErr := svc.AcquireAccessTokenForTeardown(dCtx, accountID)
-		if tErr == nil && tok != "" {
-			sawTokenDuringDrain = true
-		}
 		return nil
 	})
 
-	failRevoke.Store(true)
-	if err := svc.RevokeContribution(ctx, winningReceipt.ReceiptToken); err == nil {
-		t.Fatal("expected RevokeContribution to return error when Google /revoke returns HTTP 503")
-	}
-	afterFailedRevoke, _ := st.GetAccount(ctx, donatedAcc.ID)
-	if afterFailedRevoke.Health != models.HealthRevokedByUser || afterFailedRevoke.Enabled {
-		t.Fatalf("expected immediate scheduling block even when Google /revoke fails: %+v", afterFailedRevoke)
-	}
-	if afterFailedRevoke.EncryptedRefreshToken == "" {
-		t.Fatal("EncryptedRefreshToken must NOT be wiped before Google confirms revocation")
-	}
-	if !sawTokenDuringDrain || len(drainedAccounts) == 0 {
-		t.Fatal("expected sessionDrainer to run with valid teardown access token before OAuth revoke")
-	}
-
-	// Retry once Google returns 400 invalid_token -> succeeds & wipes EncryptedRefreshToken!
-	failRevoke.Store(false)
-	if err := svc.RevokeContribution(ctx, winningReceipt.ReceiptToken); err != nil {
-		t.Fatalf("expected RevokeContribution retry to succeed on HTTP 400 invalid_token, got: %v", err)
-	}
-	afterConfirmedRevoke, _ := st.GetAccount(ctx, donatedAcc.ID)
-	if afterConfirmedRevoke.EncryptedRefreshToken != "" || afterConfirmedRevoke.EncryptedAccessToken != "" {
-		t.Fatal("expected OAuth tokens wiped after confirmed Google revocation")
-	}
-
-	// 7. DeleteAccount invokes sessionDrainer and marks active sessions STOPPED.
 	_ = st.SaveSession(ctx, &models.RuntimeSession{
 		ID:        "sess_owner_del",
 		Name:      "owner-del",
 		AccountID: ownerAcc.ID,
 		Status:    models.SessionIdle,
 	})
-	drainedAccounts = nil
 	if err := svc.DeleteAccount(ctx, ownerAcc.ID); err != nil {
 		t.Fatalf("DeleteAccount failed: %v", err)
 	}
@@ -932,66 +709,224 @@ func TestCompleteCredentialContributionSecurityOwnerGuardAndRevokeDrain(t *testi
 	}
 }
 
-func TestContributorMismatchedTokenPairAndOwnerReceiptClear(t *testing.T) {
+type saveCountSpyStore struct {
+	models.Store
+	saveAccountCalls atomic.Int32
+}
+
+func (s *saveCountSpyStore) SaveAccount(ctx context.Context, acc *models.Account) error {
+	s.saveAccountCalls.Add(1)
+	return s.Store.SaveAccount(ctx, acc)
+}
+
+func TestRefreshAccountQuotaNonColabReadOnlyNoOp(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.OpenSQLite(":memory:")
+	rawSt, err := store.OpenSQLite(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer rawSt.Close()
 
-	mockSrv := mockcolab.NewServer()
-	defer mockSrv.Close()
-	svc := pool.NewConcreteService(st, events.NewHub(), mockSrv.PoolConfig("pair-check-secret"))
+	origPolledAt := time.Date(2026, 11, 20, 7, 30, 0, 0, time.UTC)
+	const origCiphertext = "v1:encrypted-legacy-secret-must-never-change"
 
-	ownerPending, _ := svc.StartOAuth(ctx, models.OAuthStartRequest{Alias: "Owner Main"})
-	ownerAcc, err := svc.CompleteOAuth(ctx, ownerPending.State, "4/0A_ultra_01")
+	legacyAcc := &models.Account{
+		ID:                      "acc_legacy_ro_01",
+		Email:                   "ro-legacy@external.pool",
+		Alias:                   "Legacy Non-Colab Row",
+		Provider:                models.ProviderType("legacy_external"),
+		SubscriptionTier:        models.TierFree,
+		Health:                  models.HealthAuthExpired,
+		HealthReason:            "manual auth expired marker",
+		Enabled:                 true,
+		MaxConcurrentVMs:        2,
+		EncryptedProviderSecret: origCiphertext,
+		LastPolledAt:            &origPolledAt,
+	}
+	if err := rawSt.SaveAccount(ctx, legacyAcc); err != nil {
+		t.Fatalf("SaveAccount(legacy): %v", err)
+	}
+	beforeRefresh, err := rawSt.GetAccount(ctx, legacyAcc.ID)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("GetAccount(before): %v", err)
 	}
 
-	mockSrv.RegisterAccount(mockcolab.MockAccount{
-		Email:            "attacker-donor@uni.edu",
-		SubscriptionTier: "SUBSCRIPTION_TIER_NONE",
-		RefreshToken:     "1//0attacker_rt",
-		AccessToken:      "ya29.attacker_at",
-	})
+	spySt := &saveCountSpyStore{Store: rawSt}
+	svc := pool.NewConcreteService(spySt, events.NewHub(), pool.Config{MasterSecret: "non-colab-ro-test"})
 
-	inv, err := svc.CreateInvite(ctx, models.CreateInviteRequest{PoolTitle: "Pair Guard Pool", MaxUses: 5})
+	got, err := svc.RefreshAccountQuota(ctx, legacyAcc.ID)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("RefreshAccountQuota(non-colab): %v", err)
+	}
+	if got == nil || got.Health != models.HealthAuthExpired {
+		t.Fatalf("RefreshAccountQuota MUST NOT flip non-Colab Health; got %+v", got)
+	}
+	if spySt.saveAccountCalls.Load() != 0 {
+		t.Fatalf("RefreshAccountQuota must be strictly read-only for non-Colab, got %d SaveAccount writes!", spySt.saveAccountCalls.Load())
 	}
 
-	// 1. Mismatched (OwnerRefreshToken, AttackerAccessToken) MUST be rejected!
-	mismatched := []byte(`{"email":"attacker-donor@uni.edu","refresh_token":"1//0ultra_refresh_01","access_token":"ya29.attacker_at"}`)
-	if _, mErr := svc.CompleteCredentialContribution(ctx, inv.Code, models.ContributorGuardrails{}, mismatched); mErr == nil {
-		t.Fatal("SECURITY FAILURE: CompleteCredentialContribution accepted mismatched (OwnerRefreshToken, AttackerAccessToken)!")
+	// Verify DB row was NEVER rewritten: EncryptedProviderSecret, Health, HealthReason, UpdatedAt, LastPolledAt intact!
+	persisted, err := rawSt.GetAccount(ctx, legacyAcc.ID)
+	if err != nil {
+		t.Fatalf("GetAccount(legacy): %v", err)
+	}
+	if persisted.EncryptedProviderSecret != origCiphertext {
+		t.Fatalf("EncryptedProviderSecret mutated: got %q, want %q", persisted.EncryptedProviderSecret, origCiphertext)
+	}
+	if persisted.Health != models.HealthAuthExpired || persisted.HealthReason != "manual auth expired marker" {
+		t.Fatalf("Health mutated in DB: health=%s reason=%q", persisted.Health, persisted.HealthReason)
+	}
+	if !persisted.UpdatedAt.Equal(beforeRefresh.UpdatedAt) || persisted.LastPolledAt == nil || !persisted.LastPolledAt.Equal(origPolledAt) {
+		t.Fatalf("RefreshAccountQuota modified timestamps on non-Colab account: updatedAt=%v (was %v) lastPolledAt=%v",
+			persisted.UpdatedAt, beforeRefresh.UpdatedAt, persisted.LastPolledAt)
 	}
 
-	// 2. Valid donor succeeds; if that account later completes Owner OAuth, ReceiptTokenHash MUST be cleared and receipt endpoints MUST return not found!
-	validDonor := []byte(`{"refresh_token":"1//0attacker_rt","access_token":"ya29.attacker_at"}`)
-	rcpt, err := svc.CompleteCredentialContribution(ctx, inv.Code, models.ContributorGuardrails{}, validDonor)
+	// RefreshAllQuotas must also skip non-Colab accounts cleanly with ZERO writes!
+	if _, err := svc.RefreshAllQuotas(ctx); err != nil {
+		t.Fatalf("RefreshAllQuotas: %v", err)
+	}
+	if spySt.saveAccountCalls.Load() != 0 {
+		t.Fatalf("RefreshAllQuotas must never write non-Colab accounts, got %d SaveAccount writes!", spySt.saveAccountCalls.Load())
+	}
+	persistedAfterAll, _ := rawSt.GetAccount(ctx, legacyAcc.ID)
+	if persistedAfterAll.Health != models.HealthAuthExpired || persistedAfterAll.EncryptedProviderSecret != origCiphertext || !persistedAfterAll.UpdatedAt.Equal(beforeRefresh.UpdatedAt) {
+		t.Fatalf("RefreshAllQuotas mutated non-Colab account: %+v", persistedAfterAll)
+	}
+}
+
+func TestQuotaSummaryExcludesLegacyNonColabRows(t *testing.T) {
+	ctx := context.Background()
+	st, svc, _ := setupTestPool(t, nil)
+
+	now := time.Now().UTC()
+	colabAcc := &models.Account{
+		ID:               "acc_colab_cap_1",
+		Email:            "colab-cap@example.com",
+		Provider:         models.ProviderColab,
+		SubscriptionTier: models.TierPro,
+		Health:           models.HealthHealthy,
+		Enabled:          true,
+		MaxConcurrentVMs: 2,
+		PaidCUBalance:    100.0,
+		SchedulableCU:    100.0,
+		FreeQuota:        &models.FreeQuotaInfo{RemainingMilliCCU: 2000, RemainingFreeCU: 2.0},
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	legacyExt := &models.Account{
+		ID:               "acc_legacy_ext_cap_1",
+		Email:            "ext-cap@legacy.pool",
+		Provider:         models.ProviderType("legacy_external"),
+		SubscriptionTier: models.TierFree,
+		Health:           models.HealthHealthy,
+		Enabled:          true,
+		MaxConcurrentVMs: 4,
+		FreeQuota:        &models.FreeQuotaInfo{RemainingMilliCCU: 58800, RemainingFreeCU: 58.8},
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+
+	for _, acc := range []*models.Account{colabAcc, legacyExt} {
+		if err := st.SaveAccount(ctx, acc); err != nil {
+			t.Fatalf("SaveAccount(%s): %v", acc.ID, err)
+		}
+	}
+
+	summary, err := svc.GetQuotaSummary(ctx)
 	if err != nil {
-		t.Fatalf("valid donor failed: %v", err)
+		t.Fatalf("GetQuotaSummary: %v", err)
 	}
-	mockSrv.RegisterAccount(mockcolab.MockAccount{
-		Email:            "attacker-donor@uni.edu",
-		SubscriptionTier: "SUBSCRIPTION_TIER_PRO",
-		AuthCode:         "4/0A_promote_owner",
-		RefreshToken:     "1//0promoted_owner_rt",
-		AccessToken:      "ya29.promoted_owner_at",
-	})
-	promotePending, _ := svc.StartOAuth(ctx, models.OAuthStartRequest{Alias: "Promoted Owner"})
-	promoted, err := svc.CompleteOAuth(ctx, promotePending.State, "4/0A_promote_owner")
+	if summary.AccountsTotal != 1 || summary.AccountsHealthy != 1 {
+		t.Fatalf("expected only Colab account counted in QuotaSummary, got total=%d healthy=%d",
+			summary.AccountsTotal, summary.AccountsHealthy)
+	}
+	if summary.TotalVMSlots != 2 {
+		t.Fatalf("expected TotalVMSlots=2 (Colab only), got %d", summary.TotalVMSlots)
+	}
+	if summary.FreeT4WindowsReady != 1 {
+		t.Fatalf("expected FreeT4WindowsReady=1 (Colab only), got %d", summary.FreeT4WindowsReady)
+	}
+	t4Eq := summary.GPUEquivalence[models.AcceleratorT4]
+	if t4Eq.EligibleAccounts != 1 || t4Eq.MaxParallelSlots != 2 || t4Eq.FreeWindowsReady != 1 {
+		t.Fatalf("expected T4 GPUEquivalence strictly Colab-only, got %+v", t4Eq)
+	}
+
+	// CanScheduleAccount must reject legacy non-Colab accounts directly too.
+	if ok, _ := svc.CanScheduleAccount(legacyExt, models.AcceleratorT4); ok {
+		t.Fatalf("expected CanScheduleAccount(%s) == false for non-Colab provider %s", legacyExt.ID, legacyExt.Provider)
+	}
+
+	// ListAccounts (`/api/v1/accounts`) still loads both rows without error for DB compatibility.
+	listed, err := svc.ListAccounts(ctx)
+	if err != nil || len(listed) != 2 {
+		t.Fatalf("expected 2 accounts visible in ListAccounts, got len=%d err=%v", len(listed), err)
+	}
+}
+
+func TestReconcileAccountSessionRollupLiftsMaxConcurrencyWhenSlotFreed(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	st, svc, _ := setupTestPool(t, nil)
+	cooldownUntil := now.Add(10 * time.Minute)
+	acc := &models.Account{
+		ID:                "acc_412_release",
+		Email:             "slots@example.com",
+		Provider:          models.ProviderColab,
+		SubscriptionTier:  models.TierProPlus,
+		PaidCUBalance:     65.0,
+		SchedulableCU:     65.0,
+		MaxConcurrentVMs:  4,
+		ActiveAssignments: 2,
+		Health:            models.HealthMaxConcurrency,
+		HealthReason:      "HTTP 412 TooManyAssignments",
+		CooldownUntil:     &cooldownUntil,
+		Enabled:           true,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	if err := st.SaveAccount(ctx, acc); err != nil {
+		t.Fatalf("SaveAccount: %v", err)
+	}
+
+	// Only 1 active session remains (the user just stopped the 2nd session in the Workbench).
+	if err := st.SaveSession(ctx, &models.RuntimeSession{
+		ID:           "sess_still_busy",
+		Name:         "w2_mech",
+		AccountID:    acc.ID,
+		Accelerator:  models.AcceleratorL4,
+		Status:       models.SessionBusy,
+		BurnRateCUHr: 1.94,
+		CreatedAt:    now.Add(-5 * time.Minute),
+	}); err != nil {
+		t.Fatalf("SaveSession busy: %v", err)
+	}
+	if err := st.SaveSession(ctx, &models.RuntimeSession{
+		ID:           "sess_just_stopped",
+		Name:         "appbd_idle",
+		AccountID:    acc.ID,
+		Accelerator:  models.AcceleratorL4,
+		Status:       models.SessionStopped,
+		BurnRateCUHr: 1.94,
+		CreatedAt:    now.Add(-10 * time.Minute),
+	}); err != nil {
+		t.Fatalf("SaveSession stopped: %v", err)
+	}
+
+	updated, err := svc.ReconcileAccountSessionRollup(ctx, acc.ID, nil, now.Add(10*time.Second))
 	if err != nil {
-		t.Fatalf("owner promotion CompleteOAuth failed: %v", err)
+		t.Fatalf("ReconcileAccountSessionRollup: %v", err)
 	}
-	reloadedPromoted, _ := st.GetAccount(ctx, promoted.ID)
-	if reloadedPromoted.IsContributor || reloadedPromoted.ReceiptTokenHash != "" {
-		t.Fatalf("expected owner CompleteOAuth to clear IsContributor & ReceiptTokenHash, got %+v", reloadedPromoted)
+	if updated.ActiveAssignments != 1 {
+		t.Fatalf("expected ActiveAssignments=1, got %d", updated.ActiveAssignments)
 	}
-	if _, gErr := svc.GetContributionByReceipt(ctx, rcpt.ReceiptToken); gErr == nil || !strings.Contains(gErr.Error(), "not found") {
-		t.Fatalf("expected GetContributionByReceipt on promoted owner to fail with not found, got %v", gErr)
+	if updated.Health != models.HealthActiveWorking {
+		t.Fatalf("expected MAX_CONCURRENCY lifted immediately to ACTIVE_WORKING when slot freed, got %s (%s)", updated.Health, updated.HealthReason)
 	}
-	_ = ownerAcc
+	if updated.CooldownUntil != nil {
+		t.Fatalf("expected CooldownUntil cleared after freeing GPU slot, got %v", updated.CooldownUntil)
+	}
+	if ok, reason := svc.CanScheduleAccount(updated, models.AcceleratorT4); !ok {
+		t.Fatalf("expected T4 scheduling allowed immediately after freeing GPU slot, got false (%s)", reason)
+	}
 }

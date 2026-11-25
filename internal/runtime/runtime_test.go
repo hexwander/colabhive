@@ -122,16 +122,6 @@ func (s *testStore) GetProxy(_ context.Context, _ string) (*models.ProxyConfig, 
 }
 func (s *testStore) ListProxies(_ context.Context) ([]*models.ProxyConfig, error) { return nil, nil }
 func (s *testStore) DeleteProxy(_ context.Context, _ string) error                { return nil }
-func (s *testStore) SaveInvite(_ context.Context, _ *models.ContributorInvite) error {
-	return nil
-}
-func (s *testStore) GetInvite(_ context.Context, _ string) (*models.ContributorInvite, error) {
-	return nil, nil
-}
-func (s *testStore) ListInvites(_ context.Context) ([]*models.ContributorInvite, error) {
-	return nil, nil
-}
-func (s *testStore) DeleteInvite(_ context.Context, _ string) error { return nil }
 
 func (s *testStore) SaveSession(_ context.Context, sess *models.RuntimeSession) error {
 	s.mu.Lock()
@@ -367,6 +357,15 @@ func newFakeColabServer(t *testing.T) *fakeColabServer {
 				var req jupyterWireMsg
 				if err := conn.ReadJSON(&req); err != nil {
 					return
+				}
+				if asString(req.Header["msg_type"]) == "kernel_info_request" {
+					_ = conn.WriteJSON(jupyterWireMsg{
+						Channel:      "shell",
+						Header:       map[string]any{"msg_type": "kernel_info_reply"},
+						ParentHeader: req.Header,
+						Content:      map[string]any{"status": "ok"},
+					})
+					continue
 				}
 				if asString(req.Header["msg_type"]) != "execute_request" {
 					continue
@@ -1090,6 +1089,15 @@ func TestCrossAccountRedundancyFailoverMidCallDeadVMRecoveryAndRealPIDWatchdog(t
 				if conn.ReadJSON(&req) != nil {
 					return
 				}
+				if asString(req.Header["msg_type"]) == "kernel_info_request" {
+					_ = conn.WriteJSON(jupyterWireMsg{
+						Channel:      "shell",
+						Header:       map[string]any{"msg_type": "kernel_info_reply"},
+						ParentHeader: req.Header,
+						Content:      map[string]any{"status": "ok"},
+					})
+					continue
+				}
 				if asString(req.Header["msg_type"]) != "execute_request" {
 					continue
 				}
@@ -1449,6 +1457,15 @@ func TestRuntimeAuditRegressionsLifecycleIsolationAndJupyterSafety(t *testing.T)
 			var req jupyterWireMsg
 			if conn.ReadJSON(&req) != nil {
 				return
+			}
+			if asString(req.Header["msg_type"]) == "kernel_info_request" {
+				_ = conn.WriteJSON(jupyterWireMsg{
+					Channel:      "shell",
+					Header:       map[string]any{"msg_type": "kernel_info_reply"},
+					ParentHeader: req.Header,
+					Content:      map[string]any{"status": "ok"},
+				})
+				continue
 			}
 			if asString(req.Header["msg_type"]) != "execute_request" {
 				continue
@@ -1833,5 +1850,362 @@ func TestRuntimeAuditRegressionsLifecycleIsolationAndJupyterSafety(t *testing.T)
 	}
 	if expAutoDone.Status != models.ExperimentCompleted || expAutoDone.CompletedShards != 1 || expAutoDone.Shards[0].Status != "COMPLETED_AND_UNASSIGNED" || expAutoDone.SyncedRecordsTotal != 10 {
 		t.Fatalf("expected real non-demo experiment to auto-transition to COMPLETED / COMPLETED_AND_UNASSIGNED with 10 records, got %+v", expAutoDone)
+	}
+}
+
+func TestExecuteCodePreAcceptWS1006AutoReconnectAndIdempotency(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	var (
+		mode             atomic.Int32 // 0=normal, 1=drop-first-probe-1006, 2=drop-first-dial-503, 3=drop-after-exec-1006
+		wsDialCount      atomic.Int32
+		execAttemptCount atomic.Int32
+	)
+
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/token", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"access_token":"tok-ws-1006","expires_in":3600}`))
+	})
+	mux.HandleFunc("/tun/m/assign", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(models.ColabXSSIPrefix + `{"acc":"G4","token":"xsrf-1006"}`))
+			return
+		}
+		_, _ = w.Write([]byte(models.ColabXSSIPrefix + fmt.Sprintf(
+			`{"accelerator":"G4","endpoint":"gpu-g4-ws1006","machineShape":1,"runtimeProxyInfo":{"token":"ptok-1006","tokenExpiresInSeconds":3600,"url":%q}}`,
+			srv.URL,
+		)))
+	})
+	mux.HandleFunc("/tun/m/assignments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(models.ColabXSSIPrefix + fmt.Sprintf(
+			`{"assignments":[{"endpoint":"gpu-g4-ws1006","accelerator":"G4","runtimeProxyInfo":{"token":"ptok-1006","tokenExpiresInSeconds":3600,"url":%q}}]}`,
+			srv.URL,
+		)))
+	})
+	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"js-1006","kernel":{"id":"kern-1006"}}`))
+	})
+	mux.HandleFunc("/api/colab/resources", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(models.ColabXSSIPrefix + `{"memory":{"totalBytes":16000000000,"freeBytes":12000000000},"gpus":[]}`))
+	})
+	mux.HandleFunc("/api/kernels/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/channels") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		dialNum := wsDialCount.Add(1)
+		curMode := mode.Load()
+		if curMode == 2 && dialNum == 1 {
+			http.Error(w, "transient upstream 503", http.StatusServiceUnavailable)
+			return
+		}
+		conn, uErr := upgrader.Upgrade(w, r, nil)
+		if uErr != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			var req jupyterWireMsg
+			if conn.ReadJSON(&req) != nil {
+				return
+			}
+			mType := asString(req.Header["msg_type"])
+			if mType == "kernel_info_request" {
+				if curMode == 1 && dialNum == 1 {
+					// Simulate Colab reverse proxy closing fresh WS with 1006 unexpected EOF
+					// BEFORE execute_request is ever sent!
+					_ = conn.UnderlyingConn().Close()
+					return
+				}
+				_ = conn.WriteJSON(jupyterWireMsg{
+					Channel:      "shell",
+					Header:       map[string]any{"msg_type": "kernel_info_reply"},
+					ParentHeader: req.Header,
+					Content:      map[string]any{"status": "ok"},
+				})
+				continue
+			}
+			if mType != "execute_request" {
+				continue
+			}
+			code := asString(req.Content["code"])
+			if !strings.Contains(code, "os.makedirs('/content'") {
+				execAttemptCount.Add(1)
+			}
+			if curMode == 3 {
+				// Simulate post-write drop AFTER execute_request was already transmitted to kernel!
+				_ = conn.UnderlyingConn().Close()
+				return
+			}
+			_ = conn.WriteJSON(jupyterWireMsg{
+				Channel:      "iopub",
+				Header:       map[string]any{"msg_type": "status"},
+				ParentHeader: req.Header,
+				Content:      map[string]any{"execution_state": "busy"},
+			})
+			_ = conn.WriteJSON(jupyterWireMsg{
+				Channel:      "iopub",
+				Header:       map[string]any{"msg_type": "stream"},
+				ParentHeader: req.Header,
+				Content:      map[string]any{"name": "stdout", "text": "ws_ok\n"},
+			})
+			_ = conn.WriteJSON(jupyterWireMsg{
+				Channel:      "iopub",
+				Header:       map[string]any{"msg_type": "status"},
+				ParentHeader: req.Header,
+				Content:      map[string]any{"execution_state": "idle"},
+			})
+			_ = conn.WriteJSON(jupyterWireMsg{
+				Channel:      "shell",
+				Header:       map[string]any{"msg_type": "execute_reply"},
+				ParentHeader: req.Header,
+				Content:      map[string]any{"status": "ok", "execution_count": 1},
+			})
+		}
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	hub := &testHub{}
+	poolSvc := pool.NewConcreteService(st, hub, pool.Config{
+		MasterSecret:      "ws1006-secret",
+		GoogleTokenURI:    srv.URL + "/oauth/token",
+		ColabTunnelDomain: srv.URL,
+		ColabGAPIDomain:   srv.URL,
+		ColabPublicDomain: srv.URL,
+	})
+	rtr := router.NewService(st, poolSvc, hub)
+	eng := NewConcreteEngine(st, poolSvc, rtr, hub, Options{
+		TunnelBaseURL:          srv.URL,
+		WSPreAcceptRetryDelay:  15 * time.Millisecond,
+		WSProbeTimeout:         2 * time.Second,
+		ArtifactsDir:           t.TempDir(),
+		DisableBackgroundLoops: true,
+	})
+	defer eng.Close()
+
+	_, err = poolSvc.SeedAccountCredentials(ctx, &models.Account{
+		ID:               "acc_ws1006",
+		Email:            "ws1006@example.com",
+		SubscriptionTier: models.TierAIUltra,
+		Health:           models.HealthHealthy,
+		Enabled:          true,
+		PaidCUBalance:    500,
+		SchedulableCU:    500,
+		MaxConcurrentVMs: 2,
+	}, "rt-ws1006", "tok-ws-1006", time.Hour)
+	if err != nil {
+		t.Fatalf("SeedAccountCredentials: %v", err)
+	}
+
+	sess, err := eng.CreateSession(ctx, models.SessionAllocRequest{
+		Name:        "ws1006-vm",
+		Accelerator: models.AcceleratorG4,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Case A: First WS drops with 1006 unexpected EOF during pre-exec kernel_info probe ->
+	// MUST transparently reconnect once and execute user code EXACTLY ONCE!
+	wsDialCount.Store(0)
+	execAttemptCount.Store(0)
+	mode.Store(1)
+	resA, err := eng.ExecuteCode(ctx, models.KernelExecRequest{
+		SessionID: sess.ID,
+		Code:      "print('first_exec_after_create')",
+	})
+	if err != nil || resA == nil || resA.Status != "ok" || !strings.Contains(resA.Stdout, "ws_ok") {
+		t.Fatalf("expected transparent auto-reconnect on pre-accept 1006 EOF, got res=%+v err=%v", resA, err)
+	}
+	if wsDialCount.Load() != 2 {
+		t.Fatalf("expected exactly 2 WS dials (1 dropped probe + 1 healthy reconnect), got %d", wsDialCount.Load())
+	}
+	if execAttemptCount.Load() != 1 {
+		t.Fatalf("expected execute_request sent EXACTLY ONCE, got %d", execAttemptCount.Load())
+	}
+	reloadedA, _ := eng.GetSession(ctx, sess.ID)
+	if reloadedA.ZMQReconnectCount < 1 {
+		t.Fatalf("expected ZMQReconnectCount >= 1 after seamless reconnect, got %d", reloadedA.ZMQReconnectCount)
+	}
+
+	// Case B: First WS dial gets transient HTTP 503 -> MUST transparently reconnect once and succeed!
+	wsDialCount.Store(0)
+	execAttemptCount.Store(0)
+	mode.Store(2)
+	resB, err := eng.ExecuteCode(ctx, models.KernelExecRequest{
+		SessionID: sess.ID,
+		Code:      "print('after_dial_503')",
+	})
+	if err != nil || resB == nil || resB.Status != "ok" {
+		t.Fatalf("expected transparent auto-reconnect on transient dial 503, got res=%+v err=%v", resB, err)
+	}
+	if execAttemptCount.Load() != 1 {
+		t.Fatalf("expected execute_request sent EXACTLY ONCE after dial 503 retry, got %d", execAttemptCount.Load())
+	}
+
+	// Case C: WS passes probe, receives execute_request, and THEN closes with 1006 ->
+	// MUST NOT retry (preserves strict idempotency!) and MUST keep healthy VM SessionIdle!
+	wsDialCount.Store(0)
+	execAttemptCount.Store(0)
+	mode.Store(3)
+	_, errC := eng.ExecuteCode(ctx, models.KernelExecRequest{
+		SessionID: sess.ID,
+		Code:      "mutate_once()",
+	})
+	if errC == nil {
+		t.Fatal("expected error when WS drops after execute_request was already written")
+	}
+	if execAttemptCount.Load() != 1 {
+		t.Fatalf("IDEMPOTENCY VIOLATION: execute_request replayed %d times after post-write drop (want 1)", execAttemptCount.Load())
+	}
+	reloadedC, _ := eng.GetSession(ctx, sess.ID)
+	if reloadedC.Status == models.SessionLost {
+		t.Fatal("expected healthy VM present in /tun/m/assignments to stay SessionIdle after post-write WS drop")
+	}
+}
+
+func TestCreateSessionFastFallbackProbeTimeout(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer st.Close()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	var g4PostAttempts, l4PostAttempts atomic.Int32
+
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/token", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"access_token":"tok-fast-fb","expires_in":3600}`))
+	})
+	mux.HandleFunc("/tun/m/assign", func(w http.ResponseWriter, r *http.Request) {
+		accParam := strings.ToUpper(r.URL.Query().Get("accelerator"))
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(models.ColabXSSIPrefix + fmt.Sprintf(`{"acc":%q,"token":"xsrf-%s"}`, accParam, accParam)))
+			return
+		}
+		if accParam == "G4" {
+			g4PostAttempts.Add(1)
+			// Simulate out-of-stock G4 hanging far longer than FallbackAssignTimeout!
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(10 * time.Second):
+				http.Error(w, "slow upstream 503", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		if accParam == "L4" {
+			l4PostAttempts.Add(1)
+			_, _ = w.Write([]byte(models.ColabXSSIPrefix + fmt.Sprintf(
+				`{"accelerator":"L4","endpoint":"gpu-l4-fastfb","machineShape":1,"runtimeProxyInfo":{"token":"ptok-l4","tokenExpiresInSeconds":3600,"url":%q}}`,
+				srv.URL,
+			)))
+			return
+		}
+		http.Error(w, "out of stock", http.StatusServiceUnavailable)
+	})
+	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"js-l4","kernel":{"id":"kern-l4"}}`))
+	})
+	mux.HandleFunc("/api/colab/resources", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(models.ColabXSSIPrefix + `{"memory":{"totalBytes":16000000000,"freeBytes":12000000000},"gpus":[]}`))
+	})
+	mux.HandleFunc("/api/kernels/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/channels") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		conn, uErr := upgrader.Upgrade(w, r, nil)
+		if uErr != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			var req jupyterWireMsg
+			if conn.ReadJSON(&req) != nil {
+				return
+			}
+			switch asString(req.Header["msg_type"]) {
+			case "kernel_info_request":
+				_ = conn.WriteJSON(jupyterWireMsg{Channel: "shell", Header: map[string]any{"msg_type": "kernel_info_reply"}, ParentHeader: req.Header, Content: map[string]any{"status": "ok"}})
+			case "execute_request":
+				_ = conn.WriteJSON(jupyterWireMsg{Channel: "iopub", Header: map[string]any{"msg_type": "status"}, ParentHeader: req.Header, Content: map[string]any{"execution_state": "idle"}})
+				_ = conn.WriteJSON(jupyterWireMsg{Channel: "shell", Header: map[string]any{"msg_type": "execute_reply"}, ParentHeader: req.Header, Content: map[string]any{"status": "ok", "execution_count": 1}})
+			}
+		}
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	hub := &testHub{}
+	poolSvc := pool.NewConcreteService(st, hub, pool.Config{
+		MasterSecret:      "fastfb-secret",
+		GoogleTokenURI:    srv.URL + "/oauth/token",
+		ColabTunnelDomain: srv.URL,
+		ColabGAPIDomain:   srv.URL,
+		ColabPublicDomain: srv.URL,
+	})
+	rtr := router.NewService(st, poolSvc, hub)
+	eng := NewConcreteEngine(st, poolSvc, rtr, hub, Options{
+		TunnelBaseURL:          srv.URL,
+		FallbackAssignTimeout:  220 * time.Millisecond,
+		AssignTimeout:          5 * time.Second,
+		ArtifactsDir:           t.TempDir(),
+		DisableBackgroundLoops: true,
+	})
+	defer eng.Close()
+
+	// Single healthy account: G4 hang MUST NOT poison account as HealthProxyError;
+	// it MUST fall back onto L4 on this same account rapidly!
+	_, err = poolSvc.SeedAccountCredentials(ctx, &models.Account{
+		ID:               "acc_fastfb_1",
+		Email:            "fastfb@example.com",
+		SubscriptionTier: models.TierAIUltra,
+		Health:           models.HealthHealthy,
+		Enabled:          true,
+		PaidCUBalance:    500,
+		SchedulableCU:    500,
+		MaxConcurrentVMs: 2,
+	}, "rt-fastfb", "tok-fast-fb", time.Hour)
+	if err != nil {
+		t.Fatalf("SeedAccountCredentials: %v", err)
+	}
+
+	start := time.Now()
+	sess, err := eng.CreateSession(ctx, models.SessionAllocRequest{
+		Name:          "fast-fb-vm",
+		Accelerator:   models.AcceleratorG4,
+		AutoFallback:  true,
+		FallbackChain: []models.AcceleratorType{models.AcceleratorG4, models.AcceleratorL4},
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("CreateSession fast fallback failed: %v", err)
+	}
+	if sess.Accelerator != models.AcceleratorL4 || !sess.FallbackApplied {
+		t.Fatalf("expected fallback G4 -> L4, got %+v", sess)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("expected fast fallback probe timeout (~220ms), took %v", elapsed)
+	}
+	if g4PostAttempts.Load() != 1 || l4PostAttempts.Load() != 1 {
+		t.Fatalf("expected 1 G4 attempt + 1 L4 attempt, got G4=%d L4=%d", g4PostAttempts.Load(), l4PostAttempts.Load())
+	}
+	accAfter, _ := poolSvc.GetAccount(ctx, "acc_fastfb_1")
+	if accAfter.Health == models.HealthProxyError {
+		t.Fatalf("out-of-stock POST timeout must NOT mark healthy account as HealthProxyError: %+v", accAfter)
 	}
 }

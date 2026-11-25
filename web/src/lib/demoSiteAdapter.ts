@@ -1,6 +1,5 @@
 import {
   DEFAULT_HARDWARE_CATALOG,
-  type AcceleratorType,
   type Account,
   type AccountPatch,
   type AccountVerifyRequest,
@@ -10,13 +9,7 @@ import {
   type AgentClientID,
   type AgentInjectRequest,
   type CellMutationRequest,
-  type ContributionReceipt,
-  type ContributorGuardrails,
-  type ContributorGuardrailsPatch,
-  type ContributorInvite,
-  type ContributorReceiptStatus,
   type CreateAPIKeyRequest,
-  type CreateInviteRequest,
   type CredentialBundle,
   type CredentialImportRequest,
   type DaemonHealthStatus,
@@ -37,6 +30,7 @@ import {
   type RouteBinding,
   type RouterPolicy,
   type RuntimeSession,
+  type SavingsReceiptStats,
   type SessionAllocRequest,
   type SystemSelfTestResult,
   type ToolTraceEvent,
@@ -276,7 +270,7 @@ function createInitialAccounts(): Account[] {
       gpu_equivalence: buildEquivalenceForCu(128.0, true, 0),
       public_api_supported: false,
       tunnel_api_supported: true,
-      is_contributor: true,
+      is_contributor: false,
       invite_code: 'ch_inv_demo2026',
       guardrails: {
         min_reserve_cu: 40,
@@ -1013,45 +1007,6 @@ function createInitialTraces(): ToolTraceEvent[] {
   ];
 }
 
-function createInitialInvites(): ContributorInvite[] {
-  return [
-    {
-      code: 'ch_inv_demo2026',
-      pool_title: 'ICML 2027 Open Reasoning Sharded Pool',
-      maintainer_name: 'Systems & Alignment Lab',
-      welcome_note:
-        'Donate idle 90-day expiring Colab CUs to accelerate 4x-8x parallel benchmark sweeps. Your personal safety floor & Drive firewall are cryptographically enforced.',
-      target_groups: ['lab-contributors'],
-      default_proxy_id: 'prx_us_iad_02',
-      default_guardrails: {
-        min_reserve_cu: 40,
-        max_donated_cu_total: 160,
-        max_donated_cu_daily: 45,
-        donated_cu_used_total: 0,
-        donated_cu_used_today: 0,
-        allow_paid_cu_burn: true,
-        allowed_gpus: ['G4', 'A100', 'L4', 'T4'],
-        max_concurrent_vms: 2,
-        block_drive_propagation: true,
-        mask_email_in_dashboard: false,
-        paused: false,
-      },
-      max_uses: 12,
-      used_count: 3,
-      supported_modes: ['remote_copy_paste', 'cli_donate'],
-      required_scopes: [
-        'openid',
-        'https://www.googleapis.com/auth/userinfo.profile',
-        'https://www.googleapis.com/auth/userinfo.email',
-        'https://www.googleapis.com/auth/colaboratory',
-      ],
-      revoked: false,
-      expires_at: futureIso(14 * 24),
-      created_at: pastIso(86400),
-    },
-  ];
-}
-
 interface DemoStoreState {
   accounts: Account[];
   sessions: RuntimeSession[];
@@ -1062,7 +1017,6 @@ interface DemoStoreState {
   traces: ToolTraceEvent[];
   apiKeys: AgentAPIKey[];
   proxies: ProxyConfig[];
-  invites: ContributorInvite[];
   filesBySession: Map<string, RemoteFileEntry[]>;
   autostart: boolean;
   savedWasteCu: number;
@@ -1081,7 +1035,6 @@ const store: DemoStoreState = {
   traces: createInitialTraces(),
   apiKeys: DEMO_API_KEYS.map((k) => ({ ...k })),
   proxies: DEMO_PROXIES.map((p) => ({ ...p })),
-  invites: createInitialInvites(),
   filesBySession: new Map<string, RemoteFileEntry[]>(),
   autostart: true,
   savedWasteCu: 348.6,
@@ -1464,7 +1417,7 @@ export async function handleDemoApiRequest<T>(
     );
     const res: DaemonHealthStatus = {
       healthy: true,
-      version: '1.0.0',
+      version: '1.1.0',
       deployment_mode: 'local',
       auth_required: false,
       uptime_sec: 86420 + store.tickSeq * 3,
@@ -1718,7 +1671,11 @@ export async function handleDemoApiRequest<T>(
         source_type: 'colab_token_json',
         source_path: '~/.config/colab/credentials.json',
         environment: 'host',
-        email_preview: 'alex.chen@stanford-ai.example',
+        email: 'alex.chen@stanford-ai.example',
+        email_preview: 'ale***@stanford-ai.example',
+        display_name: 'Alex Chen',
+        already_in_pool: false,
+        status: 'ready',
         token_preview: '1//0gX9d...7kQa',
         scopes: ['openid', 'email', 'colaboratory'],
       },
@@ -1727,7 +1684,12 @@ export async function handleDemoApiRequest<T>(
         source_type: 'gcloud_adc',
         source_path: '\\\\wsl.localhost\\Ubuntu\\home\\researcher\\.config\\gcloud\\application_default_credentials.json',
         environment: 'wsl2',
-        email_preview: 'lab-ultra@research.example',
+        email: 'lab-ultra@research.example',
+        email_preview: 'lab***@research.example',
+        display_name: 'Lab Ultra',
+        source_label: 'WSL2 · Ubuntu (researcher)',
+        already_in_pool: true,
+        status: 'in_pool',
         token_preview: '1//0eR4m...2pLw',
         scopes: ['openid', 'email', 'colaboratory'],
       },
@@ -1802,163 +1764,6 @@ export async function handleDemoApiRequest<T>(
     const id = decodeURIComponent(proxyDelMatch[1]);
     store.proxies = store.proxies.filter((p) => p.id !== id);
     return undefined as unknown as T;
-  }
-
-  // 5. Contributor Invites & Public Guest Portal
-  if (pathname === '/api/v1/contribute/invites') {
-    if (method === 'GET') {
-      return store.invites.map((i) => ({ ...i })) as unknown as T;
-    }
-    if (method === 'POST') {
-      const body = parseJsonBody<CreateInviteRequest>(init.body);
-      const created: ContributorInvite = {
-        code: `ch_inv_${Math.random().toString(36).slice(2, 10)}`,
-        pool_title: body.pool_title || 'Shared Lab GPU Pool',
-        maintainer_name: body.maintainer_name || 'Research Lead',
-        welcome_note: body.welcome_note,
-        target_groups: body.target_groups || ['lab-contributors'],
-        default_proxy_id: body.default_proxy_id,
-        default_guardrails: body.default_guardrails,
-        max_uses: body.max_uses || 10,
-        used_count: 0,
-        supported_modes: ['remote_copy_paste', 'cli_donate'],
-        required_scopes: [
-          'openid',
-          'https://www.googleapis.com/auth/userinfo.profile',
-          'https://www.googleapis.com/auth/userinfo.email',
-          'https://www.googleapis.com/auth/colaboratory',
-        ],
-        revoked: false,
-        expires_at: futureIso(body.ttl_hours || 168),
-        created_at: new Date().toISOString(),
-      };
-      store.invites = [created, ...store.invites];
-      return created as unknown as T;
-    }
-  }
-
-  const invRevokeMatch = pathname.match(/^\/api\/v1\/contribute\/invites\/([^/]+)$/);
-  if (invRevokeMatch && method === 'DELETE') {
-    const code = decodeURIComponent(invRevokeMatch[1]);
-    store.invites = store.invites.filter((i) => i.code !== code);
-    return undefined as unknown as T;
-  }
-
-  const pubManageRevoke = pathname.match(/^\/api\/public\/contribute\/manage\/([^/]+)\/revoke$/);
-  if (pubManageRevoke && method === 'POST') {
-    await delay(180);
-    store.accounts = store.accounts.map((a) =>
-      a.is_contributor
-        ? {
-            ...a,
-            health: 'REVOKED_BY_USER',
-            enabled: false,
-            active_assignments: 0,
-            live_burn_rate_cu_hr: 0,
-          }
-        : a,
-    );
-    notifyStateChanged();
-    return { revoked: true } as unknown as T;
-  }
-
-  const pubManageMatch = pathname.match(/^\/api\/public\/contribute\/manage\/([^/]+)$/);
-  if (pubManageMatch) {
-    const contribAcc =
-      store.accounts.find((a) => a.is_contributor) ?? store.accounts[2] ?? store.accounts[0];
-    if (method === 'PATCH') {
-      const patch = parseJsonBody<ContributorGuardrailsPatch>(init.body);
-      contribAcc.guardrails = {
-        ...contribAcc.guardrails,
-        ...patch,
-      };
-      contribAcc.schedulable_cu = Math.max(
-        0,
-        contribAcc.paid_cu_balance - (contribAcc.guardrails.min_reserve_cu ?? 40),
-      );
-      notifyStateChanged();
-    }
-    const receiptStatus: ContributorReceiptStatus = {
-      account_id: contribAcc.id,
-      masked_email: 'may***@mit-vision.example',
-      subscription_tier: contribAcc.subscription_tier,
-      health: contribAcc.health,
-      paid_cu_balance: contribAcc.paid_cu_balance,
-      schedulable_cu: contribAcc.schedulable_cu,
-      live_burn_rate_cu_hr: contribAcc.live_burn_rate_cu_hr,
-      guardrails: { ...contribAcc.guardrails },
-      active_vms: store.sessions
-        .filter((s) => s.account_id === contribAcc.id && s.status !== 'STOPPED')
-        .map((s) => ({
-          session_id: s.id,
-          accelerator: s.accelerator,
-          burn_rate_cu_hr: s.burn_rate_cu_hr,
-          uptime_sec: s.uptime_sec,
-          started_at: s.created_at,
-        })),
-      last_polled_at: new Date().toISOString(),
-    };
-    return receiptStatus as unknown as T;
-  }
-
-  const pubStartMatch = pathname.match(/^\/api\/public\/contribute\/([^/]+)\/start$/);
-  if (pubStartMatch && method === 'POST') {
-    const code = decodeURIComponent(pubStartMatch[1]);
-    const body = parseJsonBody<{ guardrails: ContributorGuardrails; mode?: OAuthAuthMode }>(
-      init.body,
-    );
-    const stateId = `ch_contrib_demo_${Math.random().toString(36).slice(2, 10)}`;
-    const sess: OAuthPendingSession = {
-      state: stateId,
-      code_challenge: 'S256',
-      auth_url: `https://accounts.google.com/o/oauth2/auth?client_id=764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com&redirect_uri=${encodeURIComponent(
-        'https://sdk.cloud.google.com/applicationdefaultauthcode.html',
-      )}&response_type=code&scope=${encodeURIComponent(
-        'openid https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/colaboratory',
-      )}&access_type=offline&prompt=consent&token_usage=remote&state=${stateId}`,
-      redirect_uri: 'https://sdk.cloud.google.com/applicationdefaultauthcode.html',
-      mode: body.mode || 'remote_copy_paste',
-      scopes: ['openid', 'email', 'colaboratory'],
-      is_contributor: true,
-      invite_code: code,
-      guardrails: body.guardrails,
-      expires_at: futureIso(0.25),
-      created_at: new Date().toISOString(),
-    };
-    return sess as unknown as T;
-  }
-
-  const pubCompleteMatch = pathname.match(/^\/api\/public\/contribute\/([^/]+)\/complete$/);
-  if (pubCompleteMatch && method === 'POST') {
-    await delay(200);
-    const contribAcc = store.accounts.find((a) => a.is_contributor) ?? store.accounts[2];
-    const receipt: ContributionReceipt = {
-      receipt_token: 'ch_rcpt_demo_maya2026',
-      manage_url: '/contribute/manage/ch_rcpt_demo_maya2026',
-      status: {
-        account_id: contribAcc.id,
-        masked_email: 'may***@mit-vision.example',
-        subscription_tier: contribAcc.subscription_tier,
-        health: contribAcc.health,
-        paid_cu_balance: contribAcc.paid_cu_balance,
-        schedulable_cu: contribAcc.schedulable_cu,
-        live_burn_rate_cu_hr: contribAcc.live_burn_rate_cu_hr,
-        guardrails: { ...contribAcc.guardrails },
-        active_vms: [],
-        last_polled_at: new Date().toISOString(),
-      },
-    };
-    return receipt as unknown as T;
-  }
-
-  const pubInviteMatch = pathname.match(/^\/api\/public\/contribute\/([^/]+)$/);
-  if (pubInviteMatch && method === 'GET') {
-    const code = decodeURIComponent(pubInviteMatch[1]);
-    const found = store.invites.find((i) => i.code === code) ?? {
-      ...store.invites[0],
-      code,
-    };
-    return { ...found } as unknown as T;
   }
 
   // 6. Sessions & Remote Execution Workbench
@@ -2480,6 +2285,38 @@ export async function handleDemoApiRequest<T>(
       autostart: store.autostart,
       autostart_enabled: store.autostart,
     } as unknown as T;
+  }
+
+  // 10. v1.1 Savings Receipt
+  if (
+    (pathname === '/api/v1/stats/savings-card' || pathname === '/api/v1/savings/receipt') &&
+    method === 'GET'
+  ) {
+    const receipt: SavingsReceiptStats = {
+      generated_at: new Date().toISOString(),
+      pool_title: 'ColabHive 私人聚合算力池',
+      total_accounts: store.accounts.length,
+      providers_connected: ['Google Colab'],
+      total_gpu_hours: 186.4,
+      free_gpu_hours_harvested: 94.5,
+      g4_equivalent_hours: 142.8,
+      total_cu_burned: 412.6,
+      saved_idle_waste_cu: store.savedWasteCu,
+      waste_zero_efficiency_pct: 98.4,
+      auto_resume_relays: 7,
+      auto_teardowns: store.autoTeardownsCount,
+      zombie_aborts: store.zombieAbortsCount,
+      estimated_saved_usd: 268.5,
+      estimated_saved_cny: 1933.2,
+      top_gpus_used: ['G4 96GB', 'A100 80GB', 'T4 16GB'],
+      rank_badge_en: '🏆 Free Compute Grandmaster',
+      rank_badge_zh: '🏆 算力白嫖宗师',
+      share_copy_en:
+        'Pooled Google Colab accounts with ColabHive — 186.4h cloud GPU runtime (94.5h free tier, ~$269 at Vast.ai/RunPod avg rates) with zero idle waste! github.com/hexwander/colabhive',
+      share_copy_zh:
+        '我用开源神器 ColabHive 把多个 Google Colab 账号汇成了私人算力池：累计运行 186.4 小时云端显卡（含 94.5 小时免费卡），等效云端租卡价值约 ¥1,933（按 Vast.ai/RunPod 均价）！→ github.com/hexwander/colabhive',
+    };
+    return receipt as unknown as T;
   }
 
   // Graceful fallback so no unexpected route ever throws a 404 in Demo Sandbox Mode
