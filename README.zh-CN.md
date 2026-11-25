@@ -256,6 +256,7 @@ with client.session(gpu="G4") as sess:
 - **从源码构筑**：Windows `.\scripts\build-release.ps1` ｜ macOS / Linux `./scripts/build-release.sh`
 - **路线图**：`v1.2` 规划 Unsloth GGUF 一键直推本地 LLM 部署、日语/韩语/繁体中文多语言包及更多区域算力源适配。
 - **特别致谢**：[**WanGP (DeepBeepMeep)**](https://github.com/deepbeepmeep/Wan2GP)（*Powered by WanGP*）、[**ComfyUI**](https://github.com/comfyanonymous/ComfyUI)、[**Unsloth**](https://github.com/unslothai/unsloth)、`google-colab-cli`、`sub2api`、`magpie`、`cc-switch`。
+- **友情链接与社区**：[**LINUX DO**](https://linux.do/) — 新的理想型技术社区。
 
 <div align="center">
   <a href="https://star-history.com/#hexwander/colabhive&Date">

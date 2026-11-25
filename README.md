@@ -256,6 +256,7 @@ with client.session(gpu="G4") as sess:
 - **Build From Source**: Windows `.\scripts\build-release.ps1` ｜ macOS / Linux `./scripts/build-release.sh`
 - **Roadmap**: `v1.2` plans 1-click Unsloth GGUF → Local LLM handoff, multi-language packs (**日本語 · 한국어 · 繁體中文**), and additional regional GPU adapters.
 - **Acknowledgments**: [**WanGP (DeepBeepMeep)**](https://github.com/deepbeepmeep/Wan2GP) (*Powered by WanGP*), [**ComfyUI**](https://github.com/comfyanonymous/ComfyUI), [**Unsloth**](https://github.com/unslothai/unsloth), `google-colab-cli`, `sub2api`, `magpie`, and `cc-switch`.
+- **Community & Friendly Links**: [**LINUX DO**](https://linux.do/) — Open-source & developer community.
 
 <div align="center">
   <a href="https://star-history.com/#hexwander/colabhive&Date">
